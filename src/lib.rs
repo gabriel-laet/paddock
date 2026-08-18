@@ -1000,6 +1000,198 @@ url = "https://example.com/feed.xml"
         assert!(abs.exists());
     }
 
+
+    #[test]
+    fn admit_reply_resolves_parent() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let parent = admit(
+            &store,
+            &cfg,
+            NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "p.md".into(),
+                title: "parent".into(),
+                body: "first".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let child = admit(
+            &store,
+            &cfg,
+            NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "c.md".into(),
+                title: "re: parent".into(),
+                body: "second".into(),
+                in_reply_to: Some("p.md".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(store.get(child).unwrap().in_reply_to, Some(parent));
+    }
+
+    #[test]
+    fn admit_reply_before_parent_stitches() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let child = admit(
+            &store,
+            &cfg,
+            NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "c.md".into(),
+                title: "re: parent".into(),
+                body: "second".into(),
+                in_reply_to: Some("p.md".into()),
+                cite_excerpt: Some("first".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(store.get(child).unwrap().in_reply_to.is_none());
+        assert_eq!(
+            store.get(child).unwrap().cite_excerpt.as_deref(),
+            Some("first")
+        );
+        let parent = admit(
+            &store,
+            &cfg,
+            NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "p.md".into(),
+                title: "parent".into(),
+                body: "first".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(store.get(child).unwrap().in_reply_to, Some(parent));
+    }
+
+    #[test]
+    fn admit_forward_resolves() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let src = admit(
+            &store,
+            &cfg,
+            NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "orig.md".into(),
+                title: "orig".into(),
+                body: "hello".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let fwd = admit(
+            &store,
+            &cfg,
+            NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "fwd.md".into(),
+                title: "fwd".into(),
+                body: "hello".into(),
+                forward_of: Some("orig.md".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(store.get(fwd).unwrap().forward_of, Some(src));
+    }
+
+    #[test]
+    fn readmit_updates_item_keeps_labels_and_read() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let id = admit(
+            &store,
+            &cfg,
+            NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "n.md".into(),
+                title: "old".into(),
+                body: "hello".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store.add_label(id, "keep").unwrap();
+        store.set_read(id, true).unwrap();
+        let id2 = admit(
+            &store,
+            &cfg,
+            NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "n.md".into(),
+                title: "new".into(),
+                body: "hello todo".into(),
+                thread: Some("incoming:n.md".into()),
+                start: Some("2026-08-18T12:00:00Z".into()),
+                end: Some("2026-08-18T13:00:00Z".into()),
+                from: Some(Actor {
+                    id: "ann@x".into(),
+                    name: Some("Ann".into()),
+                    kind: ActorKind::Person,
+                }),
+                to: vec![Actor {
+                    id: "eng".into(),
+                    name: Some("eng".into()),
+                    kind: ActorKind::List,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(id, id2);
+        let item = store.get(id).unwrap();
+        assert_eq!(item.title, "new");
+        assert_eq!(item.body, "hello todo");
+        assert_eq!(item.thread.as_deref(), Some("incoming:n.md"));
+        assert_eq!(item.start.as_deref(), Some("2026-08-18T12:00:00Z"));
+        assert_eq!(item.end.as_deref(), Some("2026-08-18T13:00:00Z"));
+        assert_eq!(item.from.as_ref().map(|a| a.id.as_str()), Some("ann@x"));
+        assert_eq!(item.to.len(), 1);
+        assert_eq!(item.to[0].id, "eng");
+        assert!(item.read);
+        assert!(item.labels.contains(&"keep".into()));
+        assert!(item.labels.contains(&"todo".into()));
+    }
+
+    #[test]
+    fn send_draft_keeps_source_foreign_id() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let id = send_draft(
+            &store,
+            &cfg,
+            &paths,
+            Draft {
+                source_id: String::new(),
+                title: "note".into(),
+                body: "x".into(),
+                foreign_id: Some("mid-1".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(store.get(id).unwrap().foreign_id, "mid-1");
+    }
+
     static PATH_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
+
 

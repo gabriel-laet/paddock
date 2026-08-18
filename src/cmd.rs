@@ -214,6 +214,7 @@ pub fn run_verb(
                 body: body.clone(),
                 thread,
                 reply_to: *reply_to,
+                foreign_id: None,
                 parts: vec![],
                 to: vec![],
             };

@@ -195,8 +195,12 @@ impl Store {
         ensure_column(&conn, "items", "cite_actor_id", "TEXT")?;
         ensure_column(&conn, "items", "cite_actor_name", "TEXT")?;
         ensure_column(&conn, "items", "cite_actor_kind", "TEXT")?;
+        ensure_column(&conn, "items", "in_reply_to_foreign", "TEXT")?;
+        ensure_column(&conn, "items", "forward_of_foreign", "TEXT")?;
         conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_items_thread ON items(thread);",
+            "CREATE INDEX IF NOT EXISTS idx_items_thread ON items(thread);
+             CREATE INDEX IF NOT EXISTS idx_items_reply_foreign ON items(source_id, in_reply_to_foreign);
+             CREATE INDEX IF NOT EXISTS idx_items_fwd_foreign ON items(source_id, forward_of_foreign);",
         )?;
         backfill_parts(&conn)?;
         Ok(Self {
@@ -213,51 +217,141 @@ impl Store {
 
     /// Insert if new. Returns Some(id) when a row was created.
     pub fn insert_new(&self, item: &NewItem) -> Result<Option<i64>> {
-        let created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let (id, created) = self.upsert(item)?;
+        if created {
+            Ok(Some(id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Insert or refresh on `(source_id, foreign_id)`. The bool is true when created.
+    pub fn upsert(&self, item: &NewItem) -> Result<(i64, bool)> {
         let body = preview_body(item);
         let thread = trim_thread(item.thread.as_deref());
         let to_write = parts_to_insert(item);
         let (from_id, from_name, from_kind) = actor_cols(item.from.as_ref());
         let (cite_id, cite_name, cite_kind) = actor_cols(item.cite_actor.as_ref());
+        let reply_f = trim_opt(item.in_reply_to.as_deref());
+        let fwd_f = trim_opt(item.forward_of.as_deref());
+        let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT OR IGNORE INTO items
-                (source_id, foreign_id, title, body, href, start, end, thread, created_at, read,
-                 from_id, from_name, from_kind, in_reply_to, forward_of, cite_excerpt,
-                 cite_actor_id, cite_actor_name, cite_actor_kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
-            params![
-                item.source_id,
-                item.foreign_id,
-                item.title,
-                body,
-                item.href,
-                item.start,
-                item.end,
-                thread,
-                created,
-                from_id,
-                from_name,
-                from_kind,
-                item.in_reply_to,
-                item.forward_of,
-                trim_opt(item.cite_excerpt.as_deref()),
-                cite_id,
-                cite_name,
-                cite_kind
-            ],
-        )?;
-        if tx.changes() == 0 {
-            return Ok(None);
-        }
-        let id = tx.last_insert_rowid();
-        for (seq, part) in to_write.iter().enumerate() {
-            insert_part_row(&tx, &self.data_dir, id, seq as i64, part)?;
-        }
-        insert_to_rows(&tx, id, &item.to)?;
+        let reply_id = match reply_f.as_deref() {
+            Some(f) => lookup_id(&tx, &item.source_id, f)?,
+            None => None,
+        };
+        let fwd_id = match fwd_f.as_deref() {
+            Some(f) => lookup_id(&tx, &item.source_id, f)?,
+            None => None,
+        };
+        let existing = lookup_id(&tx, &item.source_id, &item.foreign_id)?;
+        let (id, created) = if let Some(id) = existing {
+            tx.execute(
+                "UPDATE items SET title = ?1, body = ?2, href = ?3 WHERE id = ?4",
+                params![item.title, body, item.href, id],
+            )?;
+            if thread.is_some() {
+                tx.execute(
+                    "UPDATE items SET thread = ?1 WHERE id = ?2",
+                    params![thread, id],
+                )?;
+            }
+            if item.start.is_some() {
+                tx.execute(
+                    "UPDATE items SET start = ?1 WHERE id = ?2",
+                    params![item.start, id],
+                )?;
+            }
+            if item.end.is_some() {
+                tx.execute(
+                    "UPDATE items SET end = ?1 WHERE id = ?2",
+                    params![item.end, id],
+                )?;
+            }
+            if item.from.is_some() {
+                tx.execute(
+                    "UPDATE items SET from_id = ?1, from_name = ?2, from_kind = ?3 WHERE id = ?4",
+                    params![from_id, from_name, from_kind, id],
+                )?;
+            }
+            if reply_f.is_some() {
+                tx.execute(
+                    "UPDATE items SET in_reply_to_foreign = ?1, in_reply_to = ?2 WHERE id = ?3",
+                    params![reply_f, reply_id, id],
+                )?;
+            }
+            if fwd_f.is_some() {
+                tx.execute(
+                    "UPDATE items SET forward_of_foreign = ?1, forward_of = ?2 WHERE id = ?3",
+                    params![fwd_f, fwd_id, id],
+                )?;
+            }
+            if trim_opt(item.cite_excerpt.as_deref()).is_some() {
+                tx.execute(
+                    "UPDATE items SET cite_excerpt = ?1 WHERE id = ?2",
+                    params![trim_opt(item.cite_excerpt.as_deref()), id],
+                )?;
+            }
+            if item.cite_actor.is_some() {
+                tx.execute(
+                    "UPDATE items SET cite_actor_id = ?1, cite_actor_name = ?2, cite_actor_kind = ?3 WHERE id = ?4",
+                    params![cite_id, cite_name, cite_kind, id],
+                )?;
+            }
+            if !to_write.is_empty() {
+                tx.execute("DELETE FROM parts WHERE item_id = ?1", params![id])?;
+                for (seq, part) in to_write.iter().enumerate() {
+                    insert_part_row(&tx, &self.data_dir, id, seq as i64, part)?;
+                }
+            }
+            if !item.to.is_empty() {
+                tx.execute("DELETE FROM item_to WHERE item_id = ?1", params![id])?;
+                insert_to_rows(&tx, id, &item.to)?;
+            }
+            (id, false)
+        } else {
+            tx.execute(
+                "INSERT INTO items
+                    (source_id, foreign_id, title, body, href, start, end, thread, created_at, read,
+                     from_id, from_name, from_kind, in_reply_to, forward_of, cite_excerpt,
+                     cite_actor_id, cite_actor_name, cite_actor_kind,
+                     in_reply_to_foreign, forward_of_foreign)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                params![
+                    item.source_id,
+                    item.foreign_id,
+                    item.title,
+                    body,
+                    item.href,
+                    item.start,
+                    item.end,
+                    thread,
+                    created_at,
+                    from_id,
+                    from_name,
+                    from_kind,
+                    reply_id,
+                    fwd_id,
+                    trim_opt(item.cite_excerpt.as_deref()),
+                    cite_id,
+                    cite_name,
+                    cite_kind,
+                    reply_f,
+                    fwd_f
+                ],
+            )?;
+            let id = tx.last_insert_rowid();
+            for (seq, part) in to_write.iter().enumerate() {
+                insert_part_row(&tx, &self.data_dir, id, seq as i64, part)?;
+            }
+            insert_to_rows(&tx, id, &item.to)?;
+            (id, true)
+        };
+        stitch_cites(&tx, &item.source_id, &item.foreign_id, id)?;
         tx.commit()?;
-        Ok(Some(id))
+        Ok((id, created))
     }
 
     pub fn update_body(&self, source_id: &str, foreign_id: &str, title: &str, body: &str, href: Option<&str>) -> Result<bool> {
@@ -757,6 +851,31 @@ fn backfill_parts(conn: &Connection) -> Result<()> {
          WHERE body != ''
            AND NOT EXISTS (SELECT 1 FROM parts WHERE parts.item_id = items.id)",
         [],
+    )?;
+    Ok(())
+}
+
+fn lookup_id(conn: &Connection, source_id: &str, foreign_id: &str) -> Result<Option<i64>> {
+    let id = conn
+        .query_row(
+            "SELECT id FROM items WHERE source_id = ?1 AND foreign_id = ?2",
+            params![source_id, foreign_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
+fn stitch_cites(conn: &Connection, source_id: &str, foreign_id: &str, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE items SET in_reply_to = ?1
+         WHERE source_id = ?2 AND in_reply_to_foreign = ?3",
+        params![id, source_id, foreign_id],
+    )?;
+    conn.execute(
+        "UPDATE items SET forward_of = ?1
+         WHERE source_id = ?2 AND forward_of_foreign = ?3",
+        params![id, source_id, foreign_id],
     )?;
     Ok(())
 }

@@ -17,8 +17,10 @@ pub struct NewItem {
     pub parts: Vec<NewPart>,
     pub from: Option<Actor>,
     pub to: Vec<Actor>,
-    pub in_reply_to: Option<i64>,
-    pub forward_of: Option<i64>,
+    /// Foreign id on the same source. Resolved to a local id on admit.
+    pub in_reply_to: Option<String>,
+    /// Foreign id on the same source. Resolved to a local id on admit.
+    pub forward_of: Option<String>,
     pub cite_excerpt: Option<String>,
     pub cite_actor: Option<Actor>,
 }
@@ -31,6 +33,7 @@ pub struct Draft {
     pub body: String,
     pub thread: Option<String>,
     pub reply_to: Option<i64>,
+    pub foreign_id: Option<String>,
     pub parts: Vec<NewPart>,
     pub to: Vec<Actor>,
 }

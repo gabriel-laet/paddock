@@ -23,13 +23,11 @@ pub fn gen() -> u64 {
     GEN.load(Ordering::Relaxed)
 }
 
-pub fn admit(store: &Store, config: &Config, item: NewItem) -> Result<Option<i64>> {
-    let Some(id) = store.insert_new(&item)? else {
-        return Ok(None);
-    };
+pub fn admit(store: &Store, config: &Config, item: NewItem) -> Result<i64> {
+    let (id, _) = store.upsert(&item)?;
     classify_item(store, config, id)?;
     bump();
-    Ok(Some(id))
+    Ok(id)
 }
 
 pub fn admit_file(store: &Store, config: &Config, source_id: &str, path: &Path) -> Result<Option<i64>> {
@@ -45,25 +43,7 @@ pub fn admit_file(store: &Store, config: &Config, source_id: &str, path: &Path) 
         return Ok(None);
     }
     let new = item_from_file(source_id, path)?;
-    if let Some(id) = store.insert_new(&new)? {
-        classify_item(store, config, id)?;
-        bump();
-        return Ok(Some(id));
-    }
-    store.update_body(
-        &new.source_id,
-        &new.foreign_id,
-        &new.title,
-        &new.body,
-        new.href.as_deref(),
-    )?;
-    if let Some(id) = store.id_by_foreign(&new.source_id, &new.foreign_id)? {
-        classify_item(store, config, id)?;
-        bump();
-        return Ok(Some(id));
-    }
-    bump();
-    Ok(None)
+    Ok(Some(admit(store, config, new)?))
 }
 
 /// Toggle (or add/remove) a label, then classify so child inboxes can fire.
@@ -138,7 +118,11 @@ pub fn pull_all(store: &Store, config: &Config) -> Result<usize> {
             }
         };
         for item in batch {
-            if admit(store, config, item)?.is_some() {
+            let existed = store
+                .id_by_foreign(&item.source_id, &item.foreign_id)?
+                .is_some();
+            admit(store, config, item)?;
+            if !existed {
                 n += 1;
             }
         }
@@ -329,8 +313,10 @@ pub fn send_draft(store: &Store, config: &Config, paths: &Paths, draft: Draft) -
     }
 
     let mut thread = draft.thread.clone();
+    let mut reply_foreign = None;
     if let Some(pid) = draft.reply_to {
         let parent = store.get(pid)?;
+        reply_foreign = Some(parent.foreign_id.clone());
         let th = thread
             .clone()
             .or(parent.thread.clone())
@@ -347,23 +333,24 @@ pub fn send_draft(store: &Store, config: &Config, paths: &Paths, draft: Draft) -
             let stem = sanitize_filename(&draft.title);
             let dest = unique_path(&paths.incoming_dir.join(format!("{stem}.md")));
             std::fs::write(&dest, draft.body.as_bytes())?;
-            let id = admit_file(store, config, &source_id, &dest)?
-                .ok_or_else(|| anyhow::anyhow!("admit failed"))?;
-            if let Some(ref th) = thread {
-                store.set_thread(id, Some(th))?;
+            let mut new = item_from_file(&source_id, &dest)?;
+            new.thread = thread;
+            new.in_reply_to = reply_foreign;
+            new.to = draft.to.clone();
+            if let Some(fid) = draft.foreign_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                new.foreign_id = fid.to_string();
             }
-            if draft.reply_to.is_some() {
-                store.set_in_reply_to(id, draft.reply_to)?;
-            }
-            if !draft.to.is_empty() {
-                store.set_to(id, &draft.to)?;
-            }
-            bump();
-            Ok(id)
+            Ok(admit(store, config, new)?)
         }
         _ => {
             let stamp = chrono::Utc::now().timestamp_millis();
-            let foreign = format!("{}-{stamp}", sanitize_filename(&draft.title));
+            let foreign = draft
+                .foreign_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}-{stamp}", sanitize_filename(&draft.title)));
             let new = NewItem {
                 source_id,
                 foreign_id: foreign,
@@ -380,12 +367,12 @@ pub fn send_draft(store: &Store, config: &Config, paths: &Paths, draft: Draft) -
                 parts: draft.parts.clone(),
                 from: None,
                 to: draft.to.clone(),
-                in_reply_to: draft.reply_to,
+                in_reply_to: reply_foreign,
                 forward_of: None,
                 cite_excerpt: None,
                 cite_actor: None,
             };
-            admit(store, config, new)?.ok_or_else(|| anyhow::anyhow!("admit failed"))
+            Ok(admit(store, config, new)?)
         }
     }
 }
