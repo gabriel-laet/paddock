@@ -466,6 +466,38 @@ path = "/tmp"
     }
 
     #[test]
+    fn opens_legacy_db_without_thread_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE items (
+                    id INTEGER PRIMARY KEY,
+                    source_id TEXT NOT NULL,
+                    foreign_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    href TEXT,
+                    created_at TEXT NOT NULL,
+                    read INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(source_id, foreign_id)
+                );
+                INSERT INTO items (source_id, foreign_id, title, body, created_at, read)
+                VALUES ('incoming', 'a.md', 'a', 'hello', '2026-01-01T00:00:00Z', 0);
+                "#,
+            )
+            .unwrap();
+        }
+        let store = Store::open(&db).unwrap();
+        let items = store.list_all().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].thread.is_none());
+        assert_eq!(items[0].body, "hello");
+    }
+
+    #[test]
     fn store_roundtrip_start_end() {
         let (_tmp, paths) = temp_paths();
         init(&paths).unwrap();

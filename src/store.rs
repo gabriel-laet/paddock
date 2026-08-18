@@ -180,7 +180,6 @@ impl Store {
                 FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_parts_item ON parts(item_id);
-            CREATE INDEX IF NOT EXISTS idx_items_thread ON items(thread);
             CREATE INDEX IF NOT EXISTS idx_item_to_item ON item_to(item_id);
             "#,
         )?;
@@ -196,6 +195,9 @@ impl Store {
         ensure_column(&conn, "items", "cite_actor_id", "TEXT")?;
         ensure_column(&conn, "items", "cite_actor_name", "TEXT")?;
         ensure_column(&conn, "items", "cite_actor_kind", "TEXT")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_items_thread ON items(thread);",
+        )?;
         backfill_parts(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
