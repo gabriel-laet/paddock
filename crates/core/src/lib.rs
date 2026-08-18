@@ -66,10 +66,10 @@ mod tests {
     #[test]
     fn inbox_is_a_question_not_an_account() {
         let inbox = Inbox {
-            name: "people".into(),
-            labels: vec![Label("people".into())],
+            name: "later".into(),
+            labels: vec![Label("later".into())],
             sources: vec![],
         };
-        assert_eq!(inbox.name, "people");
+        assert_eq!(inbox.name, "later");
     }
 }
