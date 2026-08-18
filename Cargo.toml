@@ -2,9 +2,28 @@
 name = "paddock"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 license = "MIT"
+description = "An open-source inbox host"
 repository = "https://github.com/gabriel-laet/paddock"
 homepage = "https://github.com/gabriel-laet/paddock"
-description = "An inbox host. Sources admit items. Organizers label. You work an inbox."
 
 [dependencies]
+anyhow = "1.0.95"
+axum = "=0.8.1"
+chrono = { version = "0.4.39", default-features = false, features = ["clock", "std"] }
+clap = { version = "=4.5.28", features = ["derive"] }
+crossterm = "=0.28.1"
+dirs = "5.0"
+notify = "=6.1.1"
+ratatui = "=0.28.1"
+regex = "1.11"
+reqwest = { version = "=0.12.12", default-features = false, features = ["blocking", "rustls-tls"] }
+rss = "=2.0.12"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+serde = { version = "1.0.217", features = ["derive"] }
+tokio = { version = "=1.43.0", features = ["macros", "rt-multi-thread", "net", "signal"] }
+toml = "0.8.19"
+
+[dev-dependencies]
+tempfile = "3.15"
