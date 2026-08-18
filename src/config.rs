@@ -16,9 +16,38 @@ pub struct Paths {
 
 impl Paths {
     pub fn from_env() -> Self {
+        let start = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::discover(&start)
+    }
+
+    /// PADDOCK_DIR, then walk up from `start` for `.paddock/`, else XDG.
+    pub fn discover(start: &Path) -> Self {
+        if let Ok(v) = std::env::var("PADDOCK_DIR") {
+            if !v.is_empty() {
+                return Self::from_root(expand_path(&v));
+            }
+        }
+        if let Some(root) = find_paddock_dir(start) {
+            return Self::from_root(root);
+        }
         let config_dir = xdg_dir("XDG_CONFIG_HOME", ".config").join("paddock");
         let data_dir = xdg_dir("XDG_DATA_HOME", ".local/share").join("paddock");
         Self::from_dirs(config_dir, data_dir)
+    }
+
+    /// Host root is `.paddock/` or `$PADDOCK_DIR`: config, db, incoming, themes live together.
+    pub fn from_root(root: PathBuf) -> Self {
+        Self {
+            config_file: root.join("config.toml"),
+            incoming_dir: root.join("incoming"),
+            db_path: root.join("paddock.db"),
+            config_dir: root.clone(),
+            data_dir: root,
+        }
+    }
+
+    pub fn here(cwd: &Path) -> Self {
+        Self::from_root(cwd.join(".paddock"))
     }
 
     pub fn from_dirs(config_dir: PathBuf, data_dir: PathBuf) -> Self {
@@ -28,6 +57,25 @@ impl Paths {
             db_path: data_dir.join("paddock.db"),
             config_dir,
             data_dir,
+        }
+    }
+}
+
+fn find_paddock_dir(start: &Path) -> Option<PathBuf> {
+    let mut cur = start.to_path_buf();
+    if let Ok(c) = cur.canonicalize() {
+        cur = c;
+    }
+    loop {
+        if cur.file_name().is_some_and(|n| n == ".paddock") && cur.is_dir() {
+            return Some(cur);
+        }
+        let candidate = cur.join(".paddock");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        if !cur.pop() {
+            return None;
         }
     }
 }
@@ -76,10 +124,38 @@ pub struct InboxConfig {
     pub labels: Vec<String>,
     #[serde(default)]
     pub sources: Vec<String>,
+    /// "list" | "calendar" | "board". Missing/unknown → list.
+    #[serde(default)]
+    pub view: Option<String>,
+    /// Board columns (label names). Ignored unless view = "board".
+    #[serde(default)]
+    pub columns: Vec<String>,
     #[serde(default)]
     pub classifier: Vec<ClassifierConfig>,
     #[serde(default)]
     pub inbox: Vec<InboxConfig>,
+}
+
+impl InboxConfig {
+    /// Kernel view: list, calendar, or board.
+    pub fn view_kind(&self) -> &str {
+        match self.view.as_deref().map(str::trim) {
+            Some("calendar") => "calendar",
+            Some("board") => "board",
+            _ => "list",
+        }
+    }
+
+    /// First configured board column whose label the item has.
+    pub fn board_column<'a>(&'a self, item: &Item) -> Option<&'a str> {
+        if self.view_kind() != "board" {
+            return None;
+        }
+        self.columns
+            .iter()
+            .find(|c| item.labels.iter().any(|l| l == *c))
+            .map(|s| s.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -90,6 +166,21 @@ pub struct ClassifierConfig {
     pub pattern: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
+    /// Rhai script. Required for kind = "script".
+    #[serde(default)]
+    pub script: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// "ollama" | "openai". Default: openai if a key is set, else ollama.
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Allow-list for kind = "llm". Model must pick one or NONE.
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

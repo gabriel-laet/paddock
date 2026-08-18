@@ -11,7 +11,7 @@ mod source;
 mod store;
 pub mod theme;
 
-pub use classify::{build_classifier, Classifier, RegexClassifier, StubClassifier};
+pub use classify::{build_classifier, Classifier, LlmClassifier, RegexClassifier, ScriptClassifier};
 pub use cmd::{run_verb, Outcome, VerbCtx};
 pub use config::{expand_path, inbox_matches, ClassifierConfig, Config, InboxConfig, Paths, SourceConfig, TreeNode};
 pub use engine::{admit, admit_file, classify_item, items_in_chain, pull_all, relabel, spawn_fs_watch, stamp, WatchGuard};
@@ -170,6 +170,8 @@ mod tests {
             title: "a".into(),
             body: String::new(),
             href: None,
+            start: None,
+            end: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             read: false,
             labels: vec![],
@@ -195,6 +197,8 @@ mod tests {
             title: "a".into(),
             body: String::new(),
             href: None,
+            start: None,
+            end: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             read: false,
             labels: vec![],
@@ -221,6 +225,8 @@ mod tests {
             title: "note".into(),
             body: "hi".into(),
             href: Some("/tmp/note.md".into()),
+            start: None,
+            end: None,
         };
         let a = store.insert_new(&n).unwrap();
         let b = store.insert_new(&n).unwrap();
@@ -236,6 +242,7 @@ mod tests {
             kind: "regex".into(),
             pattern: Some("(?i)rfc".into()),
             label: Some("rfc".into()),
+            ..Default::default()
         };
         let item = Item {
             id: 1,
@@ -244,6 +251,8 @@ mod tests {
             title: "Please review RFC 9110".into(),
             body: String::new(),
             href: None,
+            start: None,
+            end: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             read: false,
             labels: vec![],
@@ -254,30 +263,6 @@ mod tests {
             ..item.clone()
         };
         assert_eq!(run_classifier(&cfg, &miss).unwrap(), None);
-    }
-
-    #[test]
-    fn script_and_llm_are_stubs() {
-        let item = Item {
-            id: 1,
-            source_id: "s".into(),
-            foreign_id: "f".into(),
-            title: "todo".into(),
-            body: "todo".into(),
-            href: None,
-            created_at: "2026-01-01T00:00:00Z".into(),
-            read: false,
-            labels: vec![],
-        };
-        for kind in ["script", "llm"] {
-            let cfg = ClassifierConfig {
-                id: kind.into(),
-                kind: kind.into(),
-                pattern: None,
-                label: Some("x".into()),
-            };
-            assert_eq!(run_classifier(&cfg, &item).unwrap(), None);
-        }
     }
 
     #[test]
@@ -292,6 +277,8 @@ mod tests {
                 title: "note".into(),
                 body: "contains todo in the body".into(),
                 href: None,
+                start: None,
+                end: None,
             })
             .unwrap()
             .unwrap();
@@ -341,6 +328,8 @@ path = "/tmp"
                 title: "note".into(),
                 body: "this is urgent".into(),
                 href: None,
+                start: None,
+                end: None,
             })
             .unwrap()
             .unwrap();
@@ -432,6 +421,8 @@ path = "/tmp"
             title: "t".into(),
             body: String::new(),
             href: None,
+            start: None,
+            end: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             read: false,
             labels: vec!["x".into(), "y".into()],
@@ -449,4 +440,134 @@ path = "/tmp"
         assert!(p.is_absolute() || !p.starts_with("~"));
         assert!(p.ends_with(PathBuf::from("incoming")));
     }
+
+    #[test]
+    fn store_roundtrip_start_end() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let id = store
+            .insert_new(&NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "meet.md".into(),
+                title: "meet".into(),
+                body: "sync".into(),
+                href: None,
+                start: Some("2026-08-18T15:00:00Z".into()),
+                end: Some("2026-08-18T16:00:00Z".into()),
+            })
+            .unwrap()
+            .unwrap();
+        let item = store.get(id).unwrap();
+        assert_eq!(item.start.as_deref(), Some("2026-08-18T15:00:00Z"));
+        assert_eq!(item.end.as_deref(), Some("2026-08-18T16:00:00Z"));
+    }
+
+    #[test]
+    fn inbox_view_defaults_list_and_parses_board() {
+        let list: InboxConfig = toml::from_str(r#"name = "all""#).unwrap();
+        assert_eq!(list.view_kind(), "list");
+        assert!(list.columns.is_empty());
+        let board: InboxConfig = toml::from_str(
+            r#"
+name = "work"
+view = "board"
+columns = ["todo", "doing", "done"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(board.view_kind(), "board");
+        assert_eq!(board.columns, vec!["todo", "doing", "done"]);
+        let item = Item {
+            id: 1,
+            source_id: "incoming".into(),
+            foreign_id: "a".into(),
+            title: "a".into(),
+            body: String::new(),
+            href: None,
+            start: None,
+            end: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            read: false,
+            labels: vec!["doing".into()],
+        };
+        assert_eq!(board.board_column(&item), Some("doing"));
+    }
+
+    #[test]
+    fn default_init_stays_regex_list() {
+        let toml = default_config_toml("/tmp/incoming");
+        assert!(!toml.contains("kind = \"script\""));
+        assert!(!toml.contains("kind = \"llm\""));
+        assert!(!toml.contains("view ="));
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        assert_eq!(cfg.inbox[0].view_kind(), "list");
+    }
+
+    #[test]
+    fn discover_walks_up_to_dot_paddock() {
+        let _g = PATH_ENV.lock().unwrap();
+        std::env::remove_var("PADDOCK_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        let child = proj.join("a").join("b");
+        fs::create_dir_all(&child).unwrap();
+        let root = proj.join(".paddock");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("config.toml"), "\n").unwrap();
+        let paths = Paths::discover(&child);
+        assert_eq!(paths.config_dir, root);
+        assert_eq!(paths.config_file, root.join("config.toml"));
+        assert_eq!(paths.db_path, root.join("paddock.db"));
+        assert_eq!(paths.incoming_dir, root.join("incoming"));
+        assert_eq!(paths.data_dir, root);
+    }
+
+    #[test]
+    fn discover_paddock_dir_env_wins() {
+        let _g = PATH_ENV.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let env_root = dir.path().join("host");
+        fs::create_dir_all(&env_root).unwrap();
+        let other = dir.path().join("proj");
+        fs::create_dir_all(other.join(".paddock")).unwrap();
+        std::env::set_var("PADDOCK_DIR", &env_root);
+        let paths = Paths::discover(&other);
+        std::env::remove_var("PADDOCK_DIR");
+        assert_eq!(paths.config_dir, env_root);
+        assert_eq!(paths.db_path, env_root.join("paddock.db"));
+    }
+
+    #[test]
+    fn discover_falls_back_to_xdg() {
+        let _g = PATH_ENV.lock().unwrap();
+        std::env::remove_var("PADDOCK_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        let start = dir.path().join("empty");
+        fs::create_dir_all(&start).unwrap();
+        let xdg_cfg = dir.path().join("xdg-cfg");
+        let xdg_data = dir.path().join("xdg-data");
+        std::env::set_var("XDG_CONFIG_HOME", &xdg_cfg);
+        std::env::set_var("XDG_DATA_HOME", &xdg_data);
+        let paths = Paths::discover(&start);
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("XDG_DATA_HOME");
+        assert_eq!(paths.config_dir, xdg_cfg.join("paddock"));
+        assert_eq!(paths.data_dir, xdg_data.join("paddock"));
+        assert_eq!(paths.incoming_dir, xdg_data.join("paddock").join("incoming"));
+    }
+
+    #[test]
+    fn init_here_creates_dot_paddock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::here(dir.path());
+        init(&paths).unwrap();
+        assert!(dir.path().join(".paddock/config.toml").exists());
+        assert!(dir.path().join(".paddock/incoming").is_dir());
+        assert!(dir.path().join(".paddock/paddock.db").exists());
+        assert!(dir.path().join(".paddock/themes/carbon.toml").exists());
+        assert_eq!(paths.db_path, dir.path().join(".paddock/paddock.db"));
+    }
+
+    static PATH_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

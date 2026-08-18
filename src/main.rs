@@ -15,7 +15,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Create config, data dir, and incoming directory
-    Init,
+    Init {
+        /// Create ./.paddock in the current directory (instead of XDG)
+        #[arg(long)]
+        here: bool,
+    },
     /// Pull every source, classify new items, persist
     Pull,
     /// HTTP on 127.0.0.1:4736
@@ -33,7 +37,13 @@ fn main() -> Result<()> {
             load_or_init(&paths)?;
             tui::run(paths)?;
         }
-        Some(Cmd::Init) => {
+        Some(Cmd::Init { here }) => {
+            let paths = if here {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                Paths::here(&cwd)
+            } else {
+                paths
+            };
             init(&paths)?;
             println!("config  {}", paths.config_file.display());
             println!("data    {}", paths.data_dir.display());

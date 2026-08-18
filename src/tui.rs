@@ -742,26 +742,44 @@ fn draw_items(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             Style::default().fg(rgb(th.c_dim())),
         )))]
     } else {
-        app.items
-            .iter()
-            .map(|it| {
-                let mark = if it.read { " " } else { "*" };
-                let when = short_time(&it.created_at);
-                let style = if it.read {
-                    Style::default().fg(rgb(th.c_dim()))
-                } else {
-                    Style::default().fg(rgb(th.c_unread()))
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("{mark} "), style),
-                    Span::styled(trunc(&it.title, 42), style.add_modifier(Modifier::BOLD)),
-                    Span::styled(
-                        format!("  {}  {when}", it.source_id),
-                        Style::default().fg(rgb(th.c_dim())),
-                    ),
-                ]))
-            })
-            .collect()
+        {
+            let inbox = app.chain().last().copied();
+            app.items
+                .iter()
+                .map(|it| {
+                    let mark = if it.read { " " } else { "*" };
+                    let when = short_time(&it.created_at);
+                    let style = if it.read {
+                        Style::default().fg(rgb(th.c_dim()))
+                    } else {
+                        Style::default().fg(rgb(th.c_unread()))
+                    };
+                    let prefix = match inbox.map(|ib| ib.view_kind()) {
+                        Some("board") => format!(
+                            "[{}] ",
+                            inbox.and_then(|ib| ib.board_column(it)).unwrap_or("—")
+                        ),
+                        Some("calendar") => it
+                            .start
+                            .as_deref()
+                            .map(|s| format!("{} ", s.chars().take(10).collect::<String>()))
+                            .unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("{mark} "), style),
+                        Span::styled(
+                            format!("{prefix}{}", trunc(&it.title, 42)),
+                            style.add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("  {}  {when}", it.source_id),
+                            Style::default().fg(rgb(th.c_dim())),
+                        ),
+                    ]))
+                })
+                .collect()
+        }
     };
     let list = List::new(items)
         .block(

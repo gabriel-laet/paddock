@@ -13,6 +13,8 @@ pub struct Item {
     pub title: String,
     pub body: String,
     pub href: Option<String>,
+    pub start: Option<String>,
+    pub end: Option<String>,
     pub created_at: String,
     pub read: bool,
     pub labels: Vec<String>,
@@ -41,6 +43,8 @@ impl Store {
                 title TEXT NOT NULL,
                 body TEXT NOT NULL,
                 href TEXT,
+                start TEXT,
+                end TEXT,
                 created_at TEXT NOT NULL,
                 read INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(source_id, foreign_id)
@@ -53,6 +57,8 @@ impl Store {
             );
             "#,
         )?;
+        ensure_column(&conn, "items", "start", "TEXT")?;
+        ensure_column(&conn, "items", "end", "TEXT")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -70,14 +76,16 @@ impl Store {
         let conn = self.lock()?;
         conn.execute(
             "INSERT OR IGNORE INTO items
-                (source_id, foreign_id, title, body, href, created_at, read)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                (source_id, foreign_id, title, body, href, start, end, created_at, read)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
             params![
                 item.source_id,
                 item.foreign_id,
                 item.title,
                 item.body,
                 item.href,
+                item.start,
+                item.end,
                 created
             ],
         )?;
@@ -100,7 +108,7 @@ impl Store {
     pub fn get(&self, id: i64) -> Result<Item> {
         let conn = self.lock()?;
         let mut item = conn.query_row(
-            "SELECT id, source_id, foreign_id, title, body, href, created_at, read
+            "SELECT id, source_id, foreign_id, title, body, href, start, end, created_at, read
              FROM items WHERE id = ?1",
             params![id],
             row_item,
@@ -112,7 +120,7 @@ impl Store {
     pub fn list_all(&self) -> Result<Vec<Item>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, source_id, foreign_id, title, body, href, created_at, read
+            "SELECT id, source_id, foreign_id, title, body, href, start, end, created_at, read
              FROM items ORDER BY created_at DESC, id DESC",
         )?;
         let mut items: Vec<Item> = stmt
@@ -207,8 +215,10 @@ fn row_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
         title: row.get(3)?,
         body: row.get(4)?,
         href: row.get(5)?,
-        created_at: row.get(6)?,
-        read: row.get::<_, i64>(7)? != 0,
+        start: row.get(6)?,
+        end: row.get(7)?,
+        created_at: row.get(8)?,
+        read: row.get::<_, i64>(9)? != 0,
         labels: Vec::new(),
     })
 }
@@ -221,4 +231,18 @@ fn labels_for(conn: &Connection, id: i64) -> Result<Vec<String>> {
         out.push(r?);
     }
     Ok(out)
+}
+
+fn ensure_column(conn: &Connection, table: &str, name: &str, decl: &str) -> Result<()> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&sql)?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|n| n == name);
+    drop(stmt);
+    if !exists {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {name} {decl}"), [])?;
+    }
+    Ok(())
 }

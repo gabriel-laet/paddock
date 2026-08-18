@@ -219,10 +219,23 @@ fn render_inbox(st: &AppState, cfg: &Config, path: &str, msg: Option<&str>, only
             let cls = if it.read { "read" } else { "unread" };
             let cur = if n == 0 { " cur" } else { "" };
             let when = short_time(&it.created_at);
+            let prefix = chain
+                .as_ref()
+                .and_then(|c| c.last())
+                .map(|ib| match ib.view_kind() {
+                    "board" => format!("[{}] ", ib.board_column(it).unwrap_or("—")),
+                    "calendar" => it
+                        .start
+                        .as_deref()
+                        .map(|s| format!("{} ", s.chars().take(10).collect::<String>()))
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                })
+                .unwrap_or_default();
             rows.push_str(&format!(
                 "<tr class=\"{cls}{cur}\" data-id=\"{id}\"><td class=\"mark\">{mark}</td><td><a href=\"/item/{id}\">{title}</a></td><td class=\"dim\">{src}</td><td class=\"dim\">{when}</td><td><a href=\"/i/{path}?toggle={id}\">read</a></td></tr>",
                 id = it.id,
-                title = esc(&it.title),
+                title = esc(&format!("{prefix}{}", it.title)),
                 src = esc(&it.source_id),
                 path = esc(path),
             ));

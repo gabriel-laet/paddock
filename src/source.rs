@@ -9,6 +9,8 @@ pub struct NewItem {
     pub title: String,
     pub body: String,
     pub href: Option<String>,
+    pub start: Option<String>,
+    pub end: Option<String>,
 }
 
 /// Non-recursive. Skips dotfiles and directories.
@@ -53,6 +55,8 @@ pub fn item_from_file(source_id: &str, path: &Path) -> Result<NewItem> {
         title,
         body,
         href: Some(path.display().to_string()),
+        start: None,
+        end: None,
     })
 }
 
@@ -88,6 +92,8 @@ pub fn pull_rss(source_id: &str, url: &str) -> Result<Vec<NewItem>> {
             title,
             body,
             href,
+            start: None,
+            end: None,
         });
     }
     Ok(out)
