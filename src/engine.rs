@@ -57,8 +57,29 @@ pub fn admit_file(store: &Store, config: &Config, source_id: &str, path: &Path) 
         &new.body,
         new.href.as_deref(),
     )?;
+    if let Some(id) = store.id_by_foreign(&new.source_id, &new.foreign_id)? {
+        classify_item(store, config, id)?;
+        bump();
+        return Ok(Some(id));
+    }
     bump();
-    Ok(store.id_by_foreign(&new.source_id, &new.foreign_id)?)
+    Ok(None)
+}
+
+/// Toggle (or add/remove) a label, then classify so child inboxes can fire.
+pub fn relabel(store: &Store, config: &Config, id: i64, label: &str) -> Result<bool> {
+    let on = store.toggle_label(id, label)?;
+    classify_item(store, config, id)?;
+    bump();
+    Ok(on)
+}
+
+/// Add a label if missing, then classify.
+pub fn stamp(store: &Store, config: &Config, id: i64, label: &str) -> Result<()> {
+    store.add_label(id, label)?;
+    classify_item(store, config, id)?;
+    bump();
+    Ok(())
 }
 
 /// admit → enter root → classify → match children → classify → recurse.

@@ -64,6 +64,9 @@ pub struct Config {
     /// Classifiers on the implicit root (the whole pile).
     #[serde(default)]
     pub classifier: Vec<ClassifierConfig>,
+    /// Theme name. File lives at `$config_dir/themes/<name>.toml`.
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

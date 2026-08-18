@@ -3,16 +3,22 @@
 //! Four nouns: item, source, label, inbox.
 
 mod classify;
+pub mod cmd;
 mod config;
 pub mod engine;
+pub mod keys;
 mod source;
 mod store;
+pub mod theme;
 
 pub use classify::{build_classifier, Classifier, RegexClassifier, StubClassifier};
+pub use cmd::{run_verb, Outcome, VerbCtx};
 pub use config::{expand_path, inbox_matches, ClassifierConfig, Config, InboxConfig, Paths, SourceConfig, TreeNode};
-pub use engine::{admit, admit_file, classify_item, items_in_chain, pull_all, spawn_fs_watch, WatchGuard};
+pub use engine::{admit, admit_file, classify_item, items_in_chain, pull_all, relabel, spawn_fs_watch, stamp, WatchGuard};
+pub use keys::{parse_colon, Verb, HELP};
 pub use source::{pull_fs, pull_rss, NewItem};
 pub use store::{Item, Store};
+pub use theme::{load_theme, Theme};
 
 use anyhow::{Context, Result};
 use std::fs;
@@ -37,6 +43,8 @@ pub fn init(paths: &Paths) -> Result<()> {
         f.write_all(text.as_bytes())?;
     }
 
+    crate::theme::install_bundled(&paths.config_dir.join("themes"))?;
+
     let _store = Store::open(&paths.db_path)?;
     Ok(())
 }
@@ -45,6 +53,7 @@ pub fn default_config_toml(incoming: &str) -> String {
     format!(
         r#"# paddock — inboxes nest. a child is a tighter question over its parent.
 # classifiers belong to an inbox and run when an item enters it.
+# a label change re-runs classify so children can fire (classify-on-enter).
 
 [[inbox]]
 name = "all"
@@ -55,15 +64,19 @@ kind = "regex"
 pattern = "(?i)rfc"
 label = "rfc"
 
+[[inbox.classifier]]
+id = "flag-todo"
+kind = "regex"
+pattern = "(?i)todo"
+label = "todo"
+
 [[inbox.inbox]]
 name = "later"
 labels = ["later"]
 
-[[inbox.inbox.classifier]]
-id = "note"
-kind = "regex"
-pattern = "(?i)todo"
-label = "todo"
+[[inbox.inbox]]
+name = "todo"
+labels = ["todo"]
 
 [[source]]
 id = "incoming"
@@ -122,6 +135,8 @@ mod tests {
         assert!(paths.config_file.exists());
         assert!(paths.incoming_dir.exists());
         assert!(paths.db_path.exists());
+        assert!(paths.config_dir.join("themes/phosphor.toml").exists());
+        assert!(paths.config_dir.join("themes/carbon.toml").exists());
     }
 
     #[test]
@@ -130,11 +145,15 @@ mod tests {
         let cfg: Config = toml::from_str(&toml).unwrap();
         assert_eq!(cfg.inbox.len(), 1);
         assert_eq!(cfg.inbox[0].name, "all");
-        assert_eq!(cfg.inbox[0].classifier.len(), 1);
-        assert_eq!(cfg.inbox[0].inbox.len(), 1);
+        assert_eq!(cfg.inbox[0].classifier.len(), 2);
+        assert_eq!(cfg.inbox[0].classifier[0].id, "flag-rfc");
+        assert_eq!(cfg.inbox[0].classifier[1].id, "flag-todo");
+        assert_eq!(cfg.inbox[0].inbox.len(), 2);
         assert_eq!(cfg.inbox[0].inbox[0].name, "later");
         assert_eq!(cfg.inbox[0].inbox[0].labels, vec!["later"]);
-        assert_eq!(cfg.inbox[0].inbox[0].classifier[0].id, "note");
+        assert!(cfg.inbox[0].inbox[0].classifier.is_empty());
+        assert_eq!(cfg.inbox[0].inbox[1].name, "todo");
+        assert_eq!(cfg.inbox[0].inbox[1].labels, vec!["todo"]);
         assert_eq!(cfg.source[0].kind, "fs");
     }
 
@@ -262,16 +281,16 @@ mod tests {
     }
 
     #[test]
-    fn classify_walks_into_matching_children() {
+    fn classify_todo_regex_enters_todo_inbox() {
         let (_tmp, paths) = temp_paths();
         init(&paths).unwrap();
         let store = Store::open(&paths.db_path).unwrap();
         let id = store
             .insert_new(&NewItem {
                 source_id: "incoming".into(),
-                foreign_id: "rfc.md".into(),
-                title: "rfc draft".into(),
-                body: "todo: ship this".into(),
+                foreign_id: "t.md".into(),
+                title: "note".into(),
+                body: "contains todo in the body".into(),
                 href: None,
             })
             .unwrap()
@@ -279,14 +298,85 @@ mod tests {
         let cfg = Config::load(&paths.config_file).unwrap();
         classify_item(&store, &cfg, id).unwrap();
         let item = store.get(id).unwrap();
-        assert!(item.labels.contains(&"rfc".into()), "root inbox classifier");
-        // later requires label later — not auto-applied, so child classifier should not run
-        assert!(!item.labels.contains(&"todo".into()));
+        assert!(item.labels.contains(&"todo".into()), "root flag-todo regex");
+        let chain = cfg.find_chain(&["all", "todo"]).unwrap();
+        let listed = items_in_chain(&store, &chain).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+    }
 
-        store.add_label(id, "later").unwrap();
+    #[test]
+    fn relabel_enters_todo_and_runs_child_classifier() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        fs::write(
+            &paths.config_file,
+            r#"
+[[inbox]]
+name = "all"
+
+[[inbox.inbox]]
+name = "todo"
+labels = ["todo"]
+
+[[inbox.inbox.classifier]]
+id = "flag-child"
+kind = "regex"
+pattern = "(?i)urgent"
+label = "urgent"
+
+[[source]]
+id = "incoming"
+kind = "fs"
+path = "/tmp"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let id = store
+            .insert_new(&NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "x.md".into(),
+                title: "note".into(),
+                body: "this is urgent".into(),
+                href: None,
+            })
+            .unwrap()
+            .unwrap();
         classify_item(&store, &cfg, id).unwrap();
         let item = store.get(id).unwrap();
-        assert!(item.labels.contains(&"todo".into()), "child classifier after match");
+        assert!(!item.labels.contains(&"todo".into()));
+        assert!(!item.labels.contains(&"urgent".into()));
+
+        relabel(&store, &cfg, id, "todo").unwrap();
+        let item = store.get(id).unwrap();
+        assert!(item.labels.contains(&"todo".into()));
+        assert!(
+            item.labels.contains(&"urgent".into()),
+            "child classifier after enter"
+        );
+        let chain = cfg.find_chain(&["all", "todo"]).unwrap();
+        assert!(items_in_chain(&store, &chain)
+            .unwrap()
+            .iter()
+            .any(|i| i.id == id));
+    }
+
+    #[test]
+    fn admit_file_reclassifies_on_update() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let p = paths.incoming_dir.join("note.md");
+        fs::write(&p, "hello").unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let id = admit_file(&store, &cfg, "incoming", &p).unwrap().unwrap();
+        assert!(!store.get(id).unwrap().labels.contains(&"todo".into()));
+        fs::write(&p, "hello todo").unwrap();
+        let id2 = admit_file(&store, &cfg, "incoming", &p).unwrap().unwrap();
+        assert_eq!(id, id2);
+        assert!(store.get(id).unwrap().labels.contains(&"todo".into()));
     }
 
     #[test]

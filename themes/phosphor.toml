@@ -1,0 +1,11 @@
+# paddock-theme 1
+name = "phosphor"
+
+[colors]
+bg = "#0b120b"
+fg = "#3cff6a"
+accent = "#7dff9a"
+dim = "#2f6b3a"
+unread = "#b6ffc4"
+border = "#1c3d22"
+select = "#132616"

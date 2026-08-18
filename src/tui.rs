@@ -1,11 +1,14 @@
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use paddock::cmd::{run_verb, VerbCtx};
+use paddock::keys::{feed, parse_colon, Feed, KeySeq, Verb, HELP};
+use paddock::theme::{load_theme, Theme};
 use paddock::{
-    items_in_chain, load_or_init, pull_all, spawn_fs_watch, Config, InboxConfig, Item, Paths, Store,
+    items_in_chain, load_or_init, spawn_fs_watch, Config, InboxConfig, Item, Paths, Store,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -26,38 +29,59 @@ enum Mode {
     Read,
     Label,
     Help,
+    Search,
+    Command,
 }
 
 struct App {
     paths: Paths,
     store: Store,
     config: Config,
-    tree: Vec<(Vec<String>, usize, InboxConfig)>, // path, depth, cfg
+    theme: Theme,
+    tree: Vec<(Vec<String>, usize, InboxConfig)>,
     tree_state: ListState,
     items: Vec<Item>,
     item_state: ListState,
     pane: Pane,
     mode: Mode,
+    from_read: bool,
     label_buf: String,
+    search_buf: String,
+    search_hits: Vec<usize>,
+    search_at: usize,
+    cmd_buf: String,
     status: String,
     last_gen: u64,
+    keys: KeySeq,
+    unread_only: bool,
+    list_height: usize,
 }
 
 impl App {
     fn new(paths: Paths, store: Store, config: Config) -> Self {
+        let theme = load_theme(&config, &paths);
         let mut app = Self {
             paths,
             store,
             config,
+            theme,
             tree: Vec::new(),
             tree_state: ListState::default().with_selected(Some(0)),
             items: Vec::new(),
             item_state: ListState::default(),
             pane: Pane::Items,
             mode: Mode::List,
+            from_read: false,
             label_buf: String::new(),
-            status: "r pull   space read   l label   ? help   q quit".into(),
+            search_buf: String::new(),
+            search_hits: Vec::new(),
+            search_at: 0,
+            cmd_buf: String::new(),
+            status: ":  /  ?  q".into(),
             last_gen: paddock::engine::gen(),
+            keys: KeySeq::default(),
+            unread_only: false,
+            list_height: 12,
         };
         app.reload_tree();
         app.reload_items();
@@ -86,14 +110,23 @@ impl App {
             .collect();
         if self.tree.is_empty() {
             self.tree_state.select(None);
-        } else if self.tree_state.selected().map(|i| i >= self.tree.len()).unwrap_or(true) {
+        } else if self
+            .tree_state
+            .selected()
+            .map(|i| i >= self.tree.len())
+            .unwrap_or(true)
+        {
             self.tree_state.select(Some(0));
         }
     }
 
     fn reload_items(&mut self) {
         let chain = self.chain();
-        self.items = items_in_chain(&self.store, &chain).unwrap_or_default();
+        let mut items = items_in_chain(&self.store, &chain).unwrap_or_default();
+        if self.unread_only {
+            items.retain(|i| !i.read);
+        }
+        self.items = items;
         if self.items.is_empty() {
             self.item_state.select(None);
         } else {
@@ -119,7 +152,7 @@ impl App {
         }
         let i = self.tree_state.selected().unwrap_or(0) as isize;
         let n = self.tree.len() as isize;
-        let i = (i + delta).rem_euclid(n) as usize;
+        let i = (i + delta).clamp(0, n - 1) as usize;
         self.tree_state.select(Some(i));
         self.reload_items();
     }
@@ -130,8 +163,37 @@ impl App {
         }
         let i = self.item_state.selected().unwrap_or(0) as isize;
         let n = self.items.len() as isize;
-        let i = (i + delta).rem_euclid(n) as usize;
+        let i = (i + delta).clamp(0, n - 1) as usize;
         self.item_state.select(Some(i));
+    }
+
+    fn move_current(&mut self, delta: isize) {
+        match self.pane {
+            Pane::Inboxes => self.move_tree(delta),
+            Pane::Items => self.move_items(delta),
+        }
+    }
+
+    fn jump_current(&mut self, index: usize) {
+        match self.pane {
+            Pane::Inboxes => {
+                if !self.tree.is_empty() {
+                    self.tree_state
+                        .select(Some(index.min(self.tree.len() - 1)));
+                    self.reload_items();
+                }
+            }
+            Pane::Items => {
+                if !self.items.is_empty() {
+                    self.item_state
+                        .select(Some(index.min(self.items.len() - 1)));
+                }
+            }
+        }
+    }
+
+    fn page(&self) -> isize {
+        self.list_height.max(1) as isize
     }
 
     fn current_item_id(&self) -> Option<i64> {
@@ -141,30 +203,47 @@ impl App {
             .map(|i| i.id)
     }
 
-    fn pull(&mut self) {
-        match Config::load(&self.paths.config_file) {
-            Ok(c) => self.config = c,
-            Err(e) => {
-                self.status = format!("config: {e}");
-                return;
+    fn ctx(&self) -> VerbCtx {
+        VerbCtx {
+            item_id: self.current_item_id(),
+            inbox_path: self.selected_path(),
+            unread_only: self.unread_only,
+        }
+    }
+
+    fn apply_outcome(&mut self, out: paddock::Outcome) {
+        if !out.status.is_empty() {
+            self.status = out.status;
+        }
+        if let Some(u) = out.unread_only {
+            self.unread_only = u;
+        }
+        if out.reload_config {
+            if let Ok(c) = Config::load(&self.paths.config_file) {
+                self.config = c;
+                self.reload_tree();
             }
         }
-        self.reload_tree();
-        match pull_all(&self.store, &self.config) {
-            Ok(n) => self.status = format!("admitted {n}"),
-            Err(e) => self.status = format!("pull: {e}"),
+        if let Some(name) = out.theme_name {
+            self.theme = paddock::theme::load_named(&name, &self.paths);
+        }
+        if out.overlay.is_some() {
+            self.mode = Mode::Help;
         }
         self.reload_items();
     }
 
-    fn toggle_read(&mut self) {
-        let Some(id) = self.current_item_id() else { return };
-        match self.store.toggle_read(id) {
-            Ok(read) => {
-                self.status = if read { "read".into() } else { "unread".into() };
-                self.reload_items();
+    fn exec(&mut self, verb: &Verb) -> bool {
+        match run_verb(&self.store, &self.config, &self.paths, &self.ctx(), verb) {
+            Ok(out) => {
+                let quit = out.quit;
+                self.apply_outcome(out);
+                quit
             }
-            Err(e) => self.status = format!("{e}"),
+            Err(e) => {
+                self.status = format!("{e}");
+                false
+            }
         }
     }
 
@@ -175,18 +254,110 @@ impl App {
         if label.is_empty() {
             return;
         }
-        let Some(id) = self.current_item_id() else { return };
-        match self.store.toggle_label(id, &label) {
-            Ok(on) => {
-                self.status = if on {
-                    format!("+{label}")
-                } else {
-                    format!("-{label}")
-                };
-                self.reload_items();
-            }
-            Err(e) => self.status = format!("{e}"),
+        self.exec(&Verb::Relabel { label });
+    }
+
+    fn run_colon(&mut self) -> bool {
+        let raw = self.cmd_buf.trim().to_string();
+        self.cmd_buf.clear();
+        self.mode = if self.from_read {
+            Mode::Read
+        } else {
+            Mode::List
+        };
+        self.from_read = false;
+        if raw.is_empty() {
+            return false;
         }
+        match parse_colon(&raw) {
+            Ok(verb) => {
+                if verb.is_local() && !matches!(verb, Verb::Help | Verb::Quit) {
+                    return apply_local(self, verb);
+                }
+                self.exec(&verb)
+            }
+            Err(e) => {
+                self.status = e;
+                false
+            }
+        }
+    }
+
+    fn commit_search(&mut self) {
+        self.rebuild_hits();
+        self.mode = if self.from_read {
+            Mode::Read
+        } else {
+            Mode::List
+        };
+        self.from_read = false;
+        if self.search_hits.is_empty() {
+            self.status = format!("/{0}  0", self.search_buf);
+            return;
+        }
+        self.search_at = 0;
+        if let Some(&i) = self.search_hits.first() {
+            self.item_state.select(Some(i));
+            self.pane = Pane::Items;
+        }
+        self.status = format!(
+            "/{}  {}/{}",
+            self.search_buf,
+            self.search_at + 1,
+            self.search_hits.len()
+        );
+    }
+
+    fn rebuild_hits(&mut self) {
+        let q = self.search_buf.to_lowercase();
+        self.search_hits = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| {
+                it.title.to_lowercase().contains(&q) || it.body.to_lowercase().contains(&q)
+            })
+            .map(|(i, _)| i)
+            .collect();
+    }
+
+    fn search_step(&mut self, dir: isize) {
+        if self.search_buf.is_empty() {
+            return;
+        }
+        self.rebuild_hits();
+        if self.search_hits.is_empty() {
+            self.status = format!("/{}  0", self.search_buf);
+            return;
+        }
+        let cur = self.item_state.selected().unwrap_or(0);
+        let next = if dir > 0 {
+            self.search_hits
+                .iter()
+                .copied()
+                .find(|&i| i > cur)
+                .unwrap_or(self.search_hits[0])
+        } else {
+            self.search_hits
+                .iter()
+                .copied()
+                .rev()
+                .find(|&i| i < cur)
+                .unwrap_or(*self.search_hits.last().unwrap())
+        };
+        self.search_at = self
+            .search_hits
+            .iter()
+            .position(|&i| i == next)
+            .unwrap_or(0);
+        self.item_state.select(Some(next));
+        self.pane = Pane::Items;
+        self.status = format!(
+            "/{}  {}/{}",
+            self.search_buf,
+            self.search_at + 1,
+            self.search_hits.len()
+        );
     }
 
     fn poll_watch(&mut self) {
@@ -232,7 +403,7 @@ fn loop_ui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                if handle_key(app, key.code) {
+                if handle_key(app, key) {
                     break;
                 }
             }
@@ -242,110 +413,236 @@ fn loop_ui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
     Ok(())
 }
 
-fn handle_key(app: &mut App, code: KeyCode) -> bool {
+fn key_part(key: &KeyEvent) -> Option<String> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char(c) if ctrl => Some(format!("C-{}", c.to_ascii_lowercase())),
+        KeyCode::Char(c) => Some(c.to_string()),
+        KeyCode::Enter => Some("Enter".into()),
+        KeyCode::Esc => Some("Esc".into()),
+        KeyCode::Tab => Some("Tab".into()),
+        KeyCode::Backspace => Some("Backspace".into()),
+        KeyCode::Up => Some("Up".into()),
+        KeyCode::Down => Some("Down".into()),
+        KeyCode::Left => Some("Left".into()),
+        KeyCode::Right => Some("Right".into()),
+        _ => None,
+    }
+}
+
+fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     match app.mode {
         Mode::Help => {
-            app.mode = Mode::List;
-            return false;
-        }
-        Mode::Read => {
-            match code {
-                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Enter => {
-                    app.mode = Mode::List;
-                }
-                KeyCode::Char('q') => return true,
-                KeyCode::Char(' ') => app.toggle_read(),
-                KeyCode::Char('j') | KeyCode::Down => {
-                    app.move_items(1);
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    app.move_items(-1);
-                }
-                _ => {}
+            if key_part(&key).as_deref() == Some("Esc") || key.code == KeyCode::Char('q') {
+                app.mode = Mode::List;
+            } else if key_part(&key).as_deref() != Some("q") {
+                app.mode = Mode::List;
             }
             return false;
         }
-        Mode::Label => {
-            match code {
-                KeyCode::Esc => {
-                    app.label_buf.clear();
-                    app.mode = Mode::List;
-                }
-                KeyCode::Enter => app.submit_label(),
-                KeyCode::Backspace => {
-                    app.label_buf.pop();
-                }
-                KeyCode::Char(c) if !c.is_control() => app.label_buf.push(c),
-                _ => {}
-            }
-            return false;
-        }
-        Mode::List => {}
+        Mode::Label => return handle_line(app, key, LineKind::Label),
+        Mode::Search => return handle_line(app, key, LineKind::Search),
+        Mode::Command => return handle_line(app, key, LineKind::Command),
+        Mode::Read | Mode::List => {}
     }
 
-    match code {
-        KeyCode::Char('q') => return true,
-        KeyCode::Char('?') => app.mode = Mode::Help,
-        KeyCode::Char('r') => app.pull(),
-        KeyCode::Char(' ') => app.toggle_read(),
-        KeyCode::Char('l') => {
-            if app.current_item_id().is_some() {
-                app.mode = Mode::Label;
-                app.label_buf.clear();
+    let Some(part) = key_part(&key) else {
+        return false;
+    };
+    if part == "Esc" && !app.keys.pending.is_empty() {
+        app.keys.clear();
+        return false;
+    }
+    match feed(&mut app.keys, &part) {
+        Feed::Pending => false,
+        Feed::None => false,
+        Feed::Verb(v) => apply_verb(app, v),
+    }
+}
+
+enum LineKind {
+    Label,
+    Search,
+    Command,
+}
+
+fn handle_line(app: &mut App, key: KeyEvent, kind: LineKind) -> bool {
+    match key.code {
+        KeyCode::Esc => {
+            match kind {
+                LineKind::Label => app.label_buf.clear(),
+                LineKind::Search => app.search_buf.clear(),
+                LineKind::Command => app.cmd_buf.clear(),
+            }
+            app.mode = if app.from_read {
+                Mode::Read
+            } else {
+                Mode::List
+            };
+            app.from_read = false;
+        }
+        KeyCode::Enter => match kind {
+            LineKind::Label => app.submit_label(),
+            LineKind::Search => app.commit_search(),
+            LineKind::Command => return app.run_colon(),
+        },
+        KeyCode::Backspace => {
+            match kind {
+                LineKind::Label => {
+                    app.label_buf.pop();
+                }
+                LineKind::Search => {
+                    app.search_buf.pop();
+                }
+                LineKind::Command => {
+                    app.cmd_buf.pop();
+                }
+            };
+        }
+        KeyCode::Char(c) if !c.is_control() => match kind {
+            LineKind::Label => app.label_buf.push(c),
+            LineKind::Search => app.search_buf.push(c),
+            LineKind::Command => app.cmd_buf.push(c),
+        },
+        _ => {}
+    }
+    false
+}
+
+fn read_ok(v: &Verb) -> bool {
+    matches!(
+        v,
+        Verb::Down
+            | Verb::Up
+            | Verb::Escape
+            | Verb::PaneTree
+            | Verb::Command
+            | Verb::Quit
+            | Verb::Help
+            | Verb::ToggleRead
+            | Verb::Eat
+            | Verb::Unread
+            | Verb::Bury
+            | Verb::Todo
+            | Verb::Again
+            | Verb::Why
+            | Verb::Yank
+            | Verb::Open
+            | Verb::Only
+            | Verb::Spill
+            | Verb::Pull
+            | Verb::Theme { .. }
+            | Verb::Themes
+            | Verb::Which
+            | Verb::Db
+            | Verb::New { .. }
+            | Verb::Relabel { .. }
+    )
+}
+
+fn apply_verb(app: &mut App, v: Verb) -> bool {
+    if matches!(app.mode, Mode::Read) && !read_ok(&v) {
+        return false;
+    }
+    if v.is_local() && !matches!(v, Verb::Help | Verb::Quit) {
+        return apply_local(app, v);
+    }
+    app.exec(&v)
+}
+
+fn apply_local(app: &mut App, v: Verb) -> bool {
+    match v {
+        Verb::Down => {
+            if matches!(app.mode, Mode::Read) {
+                app.move_items(1);
+            } else {
+                app.move_current(1);
             }
         }
-        KeyCode::Tab => {
+        Verb::Up => {
+            if matches!(app.mode, Mode::Read) {
+                app.move_items(-1);
+            } else {
+                app.move_current(-1);
+            }
+        }
+        Verb::Top => app.jump_current(0),
+        Verb::Bottom => {
+            let n = match app.pane {
+                Pane::Inboxes => app.tree.len(),
+                Pane::Items => app.items.len(),
+            };
+            if n > 0 {
+                app.jump_current(n - 1);
+            }
+        }
+        Verb::HalfPageDown => app.move_current(app.page() / 2),
+        Verb::HalfPageUp => app.move_current(-(app.page() / 2)),
+        Verb::PageDown => app.move_current(app.page()),
+        Verb::PageUp => app.move_current(-app.page()),
+        Verb::PaneTree | Verb::Escape => {
+            if matches!(app.mode, Mode::Read) {
+                app.mode = Mode::List;
+            } else {
+                app.pane = Pane::Inboxes;
+            }
+        }
+        Verb::PaneItems => app.pane = Pane::Items,
+        Verb::SwapPane => {
             app.pane = match app.pane {
                 Pane::Inboxes => Pane::Items,
                 Pane::Items => Pane::Inboxes,
             };
         }
-        KeyCode::Enter => {
+        Verb::OpenRead => {
             if matches!(app.pane, Pane::Inboxes) {
                 app.pane = Pane::Items;
             } else if app.current_item_id().is_some() {
                 app.mode = Mode::Read;
             }
         }
-        KeyCode::Char('j') | KeyCode::Down => match app.pane {
-            Pane::Inboxes => app.move_tree(1),
-            Pane::Items => app.move_items(1),
-        },
-        KeyCode::Char('k') | KeyCode::Up => match app.pane {
-            Pane::Inboxes => app.move_tree(-1),
-            Pane::Items => app.move_items(-1),
-        },
-        KeyCode::Char('g') => match app.pane {
-            Pane::Inboxes => {
-                if !app.tree.is_empty() {
-                    app.tree_state.select(Some(0));
-                    app.reload_items();
-                }
+        Verb::NextInbox => app.move_tree(1),
+        Verb::PrevInbox => app.move_tree(-1),
+        Verb::Search => {
+            app.from_read = matches!(app.mode, Mode::Read);
+            app.mode = Mode::Search;
+            app.search_buf.clear();
+        }
+        Verb::SearchNext => app.search_step(1),
+        Verb::SearchPrev => app.search_step(-1),
+        Verb::Command => {
+            app.from_read = matches!(app.mode, Mode::Read);
+            app.mode = Mode::Command;
+            app.cmd_buf.clear();
+        }
+        Verb::LabelPrompt => {
+            if app.current_item_id().is_some() && matches!(app.mode, Mode::List) {
+                app.mode = Mode::Label;
+                app.label_buf.clear();
             }
-            Pane::Items => {
-                if !app.items.is_empty() {
-                    app.item_state.select(Some(0));
-                }
-            }
-        },
-        KeyCode::Char('G') => match app.pane {
-            Pane::Inboxes => {
-                if !app.tree.is_empty() {
-                    app.tree_state.select(Some(app.tree.len() - 1));
-                    app.reload_items();
-                }
-            }
-            Pane::Items => {
-                if !app.items.is_empty() {
-                    app.item_state.select(Some(app.items.len() - 1));
-                }
-            }
-        },
-        KeyCode::Left | KeyCode::Char('h') => app.pane = Pane::Inboxes,
-        KeyCode::Right => app.pane = Pane::Items,
+        }
+        Verb::Help => {
+            app.mode = Mode::Help;
+        }
+        Verb::Quit => return true,
         _ => {}
     }
     false
+}
+
+fn rgb(c: (u8, u8, u8)) -> Color {
+    Color::Rgb(c.0, c.1, c.2)
+}
+
+fn sel_style(theme: &Theme, active: bool) -> Style {
+    if active {
+        Style::default()
+            .bg(rgb(theme.c_select()))
+            .fg(rgb(theme.c_unread()))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(rgb(theme.c_fg()))
+    }
 }
 
 fn draw(f: &mut ratatui::Frame, app: &mut App) {
@@ -359,6 +656,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         .constraints([Constraint::Length(28), Constraint::Min(20)])
         .split(chunks[0]);
 
+    app.list_height = body[1].height.saturating_sub(2) as usize;
+
     draw_tree(f, app, body[0]);
     match app.mode {
         Mode::Read => draw_read(f, app, body[1]),
@@ -367,31 +666,25 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     draw_status(f, app, chunks[1]);
 
     if matches!(app.mode, Mode::Help) {
-        draw_help(f);
+        draw_help(f, app);
     }
     if matches!(app.mode, Mode::Label) {
         draw_label(f, app);
     }
 }
 
-fn sel_style(active: bool) -> Style {
-    if active {
-        Style::default()
-            .bg(Color::Rgb(40, 40, 40))
-            .fg(Color::Rgb(230, 230, 220))
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Rgb(200, 200, 190))
-    }
-}
-
 fn draw_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let th = &app.theme;
     let active = matches!(app.pane, Pane::Inboxes) && matches!(app.mode, Mode::List);
-    let border = if active { Color::Rgb(180, 160, 80) } else { Color::Rgb(50, 50, 50) };
+    let border = if active {
+        rgb(th.c_accent())
+    } else {
+        rgb(th.c_border())
+    };
     let items: Vec<ListItem> = if app.tree.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "  (no inboxes)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(rgb(th.c_dim())),
         )))]
     } else {
         app.tree
@@ -404,7 +697,7 @@ fn draw_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Span::raw(format!("{pad}{name}")),
                     Span::styled(
                         format!("  {unread}/{total}"),
-                        Style::default().fg(Color::Rgb(110, 110, 110)),
+                        Style::default().fg(rgb(th.c_dim())),
                     ),
                 ])
                 .into()
@@ -418,25 +711,35 @@ fn draw_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 .title(" inbox ")
                 .border_style(Style::default().fg(border)),
         )
-        .highlight_style(sel_style(active));
+        .highlight_style(sel_style(th, active));
     f.render_stateful_widget(list, area, &mut app.tree_state);
 }
 
 fn draw_items(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let th = &app.theme;
     let active = matches!(app.pane, Pane::Items) && matches!(app.mode, Mode::List);
-    let border = if active { Color::Rgb(180, 160, 80) } else { Color::Rgb(50, 50, 50) };
+    let border = if active {
+        rgb(th.c_accent())
+    } else {
+        rgb(th.c_border())
+    };
     let title = {
         let p = app.selected_path();
-        if p.is_empty() {
-            " items ".into()
+        let name = if p.is_empty() {
+            "items".into()
         } else {
-            format!(" {} ", p.join("/"))
+            p.join("/")
+        };
+        if app.unread_only {
+            format!(" {name}  unread ")
+        } else {
+            format!(" {name} ")
         }
     };
     let items: Vec<ListItem> = if app.items.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "  empty",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(rgb(th.c_dim())),
         )))]
     } else {
         app.items
@@ -445,16 +748,16 @@ fn draw_items(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 let mark = if it.read { " " } else { "*" };
                 let when = short_time(&it.created_at);
                 let style = if it.read {
-                    Style::default().fg(Color::Rgb(90, 90, 90))
+                    Style::default().fg(rgb(th.c_dim()))
                 } else {
-                    Style::default().fg(Color::Rgb(220, 220, 210))
+                    Style::default().fg(rgb(th.c_unread()))
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(format!("{mark} "), style),
                     Span::styled(trunc(&it.title, 42), style.add_modifier(Modifier::BOLD)),
                     Span::styled(
                         format!("  {}  {when}", it.source_id),
-                        Style::default().fg(Color::Rgb(100, 100, 100)),
+                        Style::default().fg(rgb(th.c_dim())),
                     ),
                 ]))
             })
@@ -467,11 +770,12 @@ fn draw_items(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 .title(title)
                 .border_style(Style::default().fg(border)),
         )
-        .highlight_style(sel_style(active));
+        .highlight_style(sel_style(th, active));
     f.render_stateful_widget(list, area, &mut app.item_state);
 }
 
 fn draw_read(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let th = &app.theme;
     let Some(i) = app.item_state.selected() else {
         f.render_widget(
             Paragraph::new("empty").block(Block::default().borders(Borders::ALL).title(" item ")),
@@ -479,7 +783,9 @@ fn draw_read(f: &mut ratatui::Frame, app: &App, area: Rect) {
         );
         return;
     };
-    let Some(it) = app.items.get(i) else { return };
+    let Some(it) = app.items.get(i) else {
+        return;
+    };
     let labels = if it.labels.is_empty() {
         "—".into()
     } else {
@@ -493,55 +799,50 @@ fn draw_read(f: &mut ratatui::Frame, app: &App, area: Rect) {
         it.href.as_deref().unwrap_or(""),
     );
     let text = format!("{head}\n{}", it.body);
-    let p = Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" item  esc back ")
-                .border_style(Style::default().fg(Color::Rgb(180, 160, 80))),
-        );
+    let p = Paragraph::new(text).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" item  esc back ")
+            .border_style(Style::default().fg(rgb(th.c_accent()))),
+    );
     f.render_widget(p, area);
 }
 
 fn draw_status(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let th = &app.theme;
     let msg = match app.mode {
         Mode::Label => format!("label: {}_", app.label_buf),
+        Mode::Search => format!("/{}_", app.search_buf),
+        Mode::Command => format!(":{}_", app.cmd_buf),
         _ => app.status.clone(),
     };
     f.render_widget(
-        Paragraph::new(msg).style(Style::default().fg(Color::Rgb(140, 140, 130)).bg(Color::Rgb(10, 10, 10))),
+        Paragraph::new(msg).style(
+            Style::default()
+                .fg(rgb(th.c_dim()))
+                .bg(rgb(th.c_bg())),
+        ),
         area,
     );
 }
 
-fn draw_help(f: &mut ratatui::Frame) {
-    let area = centered(f.area(), 50, 16);
-    let text = "\
- j/k  ↑↓     move
- tab  h/l    pane
- enter       read
- space       toggle read
- l           toggle label
- r           pull
- g / G       top / bottom
- ?           help
- q           quit
- esc         close
-";
+fn draw_help(f: &mut ratatui::Frame, app: &App) {
+    let th = &app.theme;
+    let area = centered(f.area(), 52, 24);
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(text).block(
+        Paragraph::new(HELP).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" keys ")
-                .border_style(Style::default().fg(Color::Rgb(180, 160, 80))),
+                .border_style(Style::default().fg(rgb(th.c_accent()))),
         ),
         area,
     );
 }
 
 fn draw_label(f: &mut ratatui::Frame, app: &App) {
+    let th = &app.theme;
     let area = centered(f.area(), 40, 3);
     f.render_widget(Clear, area);
     f.render_widget(
@@ -549,7 +850,7 @@ fn draw_label(f: &mut ratatui::Frame, app: &App) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" label (enter toggle) ")
-                .border_style(Style::default().fg(Color::Rgb(180, 160, 80))),
+                .border_style(Style::default().fg(rgb(th.c_accent()))),
         ),
         area,
     );
@@ -568,7 +869,11 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 
 fn short_time(rfc: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(rfc)
-        .map(|t| t.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
         .unwrap_or_else(|_| rfc.chars().take(16).collect())
 }
 
@@ -577,6 +882,11 @@ fn trunc(s: &str, n: usize) -> String {
     if c.len() <= n {
         s.to_string()
     } else {
-        format!("{}…", c.into_iter().take(n.saturating_sub(1)).collect::<String>())
+        format!(
+            "{}…",
+            c.into_iter()
+                .take(n.saturating_sub(1))
+                .collect::<String>()
+        )
     }
 }
