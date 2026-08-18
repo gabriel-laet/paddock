@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/gabriel-laet/paddock"
+homepage = "https://github.com/gabriel-laet/paddock"
+
+[workspace.dependencies]
+paddock-core = { path = "crates/core" }
