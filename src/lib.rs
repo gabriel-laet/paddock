@@ -14,10 +14,13 @@ pub mod theme;
 pub use classify::{build_classifier, Classifier, LlmClassifier, RegexClassifier, ScriptClassifier};
 pub use cmd::{run_verb, Outcome, VerbCtx};
 pub use config::{expand_path, inbox_matches, ClassifierConfig, Config, InboxConfig, Paths, SourceConfig, TreeNode};
-pub use engine::{admit, admit_file, classify_item, items_in_chain, pull_all, relabel, spawn_fs_watch, stamp, WatchGuard};
+pub use engine::{
+    admit, admit_file, classify_item, items_in_chain, pull_all, relabel, reply_title, send_draft,
+    spawn_fs_watch, stamp, WatchGuard,
+};
 pub use keys::{parse_colon, Verb, HELP};
-pub use source::{pull_fs, pull_rss, NewItem};
-pub use store::{Item, NewPart, Part, PartKind, Store};
+pub use source::{pull_fs, pull_rss, Draft, NewItem};
+pub use store::{Actor, ActorKind, Item, NewPart, Part, PartKind, Store};
 pub use theme::{load_theme, Theme};
 
 use anyhow::{Context, Result};
@@ -177,6 +180,7 @@ mod tests {
             read: false,
             labels: vec![],
             parts: vec![],
+            ..Default::default()
         };
         assert!(inbox_matches(&ib, &item));
     }
@@ -206,6 +210,7 @@ mod tests {
             read: false,
             labels: vec![],
             parts: vec![],
+            ..Default::default()
         };
         assert!(inbox_matches(&parent, &item));
         assert!(!inbox_matches(&child, &item));
@@ -233,6 +238,7 @@ mod tests {
             end: None,
             thread: None,
             parts: vec![],
+            ..Default::default()
         };
         let a = store.insert_new(&n).unwrap();
         let b = store.insert_new(&n).unwrap();
@@ -264,6 +270,7 @@ mod tests {
             read: false,
             labels: vec![],
             parts: vec![],
+            ..Default::default()
         };
         assert_eq!(run_classifier(&cfg, &item).unwrap(), Some("rfc".into()));
         let miss = Item {
@@ -289,6 +296,7 @@ mod tests {
                 end: None,
                 thread: None,
                 parts: vec![],
+                ..Default::default()
             })
             .unwrap()
             .unwrap();
@@ -342,6 +350,7 @@ path = "/tmp"
                 end: None,
                 thread: None,
                 parts: vec![],
+                ..Default::default()
             })
             .unwrap()
             .unwrap();
@@ -440,6 +449,7 @@ path = "/tmp"
             read: false,
             labels: vec!["x".into(), "y".into()],
             parts: vec![],
+            ..Default::default()
         };
         assert!(!inbox_matches(&ib, &item));
         item.source_id = "a".into();
@@ -471,6 +481,7 @@ path = "/tmp"
                 end: Some("2026-08-18T16:00:00Z".into()),
                 thread: None,
                 parts: vec![],
+                ..Default::default()
             })
             .unwrap()
             .unwrap();
@@ -508,6 +519,7 @@ columns = ["todo", "doing", "done"]
             read: false,
             labels: vec!["doing".into()],
             parts: vec![],
+            ..Default::default()
         };
         assert_eq!(board.board_column(&item), Some("doing"));
     }
@@ -603,6 +615,7 @@ columns = ["todo", "doing", "done"]
                 end: None,
                 thread: None,
                 parts: vec![],
+                ..Default::default()
             })
             .unwrap()
             .unwrap();
@@ -647,6 +660,7 @@ columns = ["todo", "doing", "done"]
                         src: None,
                     },
                 ],
+                ..Default::default()
             })
             .unwrap()
             .unwrap();
@@ -700,6 +714,7 @@ columns = ["todo", "doing", "done"]
                 end: None,
                 thread: Some("conv-1".into()),
                 parts: vec![],
+                ..Default::default()
             })
             .unwrap()
             .unwrap();
@@ -714,6 +729,7 @@ columns = ["todo", "doing", "done"]
                 end: None,
                 thread: None,
                 parts: vec![],
+                ..Default::default()
             })
             .unwrap()
             .unwrap();
@@ -729,6 +745,7 @@ columns = ["todo", "doing", "done"]
                 end: None,
                 thread: Some("other".into()),
                 parts: vec![],
+                ..Default::default()
             })
             .unwrap()
             .unwrap();
@@ -769,5 +786,188 @@ columns = ["todo", "doing", "done"]
         assert_eq!(again.parts.len(), 1);
     }
 
+    #[test]
+    fn send_draft_fs_writes_file_and_text_part() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let id = send_draft(
+            &store,
+            &cfg,
+            &paths,
+            Draft {
+                source_id: "incoming".into(),
+                title: "Hello World".into(),
+                body: "the body".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let dest = paths.incoming_dir.join("Hello-World.md");
+        assert!(dest.exists(), "{}", dest.display());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "the body");
+        let item = store.get(id).unwrap();
+        assert_eq!(item.body, "the body");
+        assert_eq!(item.parts.len(), 1);
+        assert_eq!(item.parts[0].kind, PartKind::Text);
+        assert_eq!(item.parts[0].text.as_deref(), Some("the body"));
+        assert!(item.thread.is_none());
+        assert!(item.in_reply_to.is_none());
+    }
+
+    #[test]
+    fn reply_shares_thread_and_sets_in_reply_to() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let parent = store
+            .insert_new(&NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "p.md".into(),
+                title: "parent".into(),
+                body: "first".into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert!(store.get(parent).unwrap().thread.is_none());
+        let id = send_draft(
+            &store,
+            &cfg,
+            &paths,
+            Draft {
+                source_id: "incoming".into(),
+                title: "re: parent".into(),
+                body: "second".into(),
+                reply_to: Some(parent),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let parent_item = store.get(parent).unwrap();
+        let child = store.get(id).unwrap();
+        let th = parent_item.thread.clone().expect("parent thread");
+        assert_eq!(child.thread.as_deref(), Some(th.as_str()));
+        assert_eq!(th, "incoming:p.md");
+        assert_eq!(child.in_reply_to, Some(parent));
+        let in_th = store.items_in_thread(&th).unwrap();
+        let ids: Vec<i64> = in_th.iter().map(|i| i.id).collect();
+        assert_eq!(in_th.len(), 2);
+        assert!(ids.contains(&parent));
+        assert!(ids.contains(&id));
+    }
+
+    #[test]
+    fn rss_source_cannot_send() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        std::fs::write(
+            &paths.config_file,
+            r#"
+[[inbox]]
+name = "all"
+
+[[source]]
+id = "feed"
+kind = "rss"
+url = "https://example.com/feed.xml"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let err = send_draft(
+            &store,
+            &cfg,
+            &paths,
+            Draft {
+                source_id: "feed".into(),
+                title: "nope".into(),
+                body: "x".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("source cannot send"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn insert_from_to_actors() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let id = store
+            .insert_new(&NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "m.md".into(),
+                title: "note".into(),
+                body: "hi".into(),
+                from: Some(Actor {
+                    id: "ann@x".into(),
+                    name: Some("Ann".into()),
+                    kind: ActorKind::Person,
+                }),
+                to: vec![
+                    Actor {
+                        id: "eng".into(),
+                        name: Some("eng".into()),
+                        kind: ActorKind::List,
+                    },
+                    Actor {
+                        id: "g1".into(),
+                        name: None,
+                        kind: ActorKind::Group,
+                    },
+                ],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        let item = store.get(id).unwrap();
+        let from = item.from.expect("from");
+        assert_eq!(from.id, "ann@x");
+        assert_eq!(from.name.as_deref(), Some("Ann"));
+        assert_eq!(from.kind, ActorKind::Person);
+        assert_eq!(item.to.len(), 2);
+        assert_eq!(item.to[0].id, "eng");
+        assert_eq!(item.to[0].kind, ActorKind::List);
+        assert_eq!(item.to[1].id, "g1");
+        assert_eq!(item.to[1].kind, ActorKind::Group);
+        let listed = store.list_all().unwrap();
+        assert_eq!(listed[0].to.len(), 2);
+        assert!(listed[0].from.is_some());
+    }
+
+    #[test]
+    fn fs_video_part() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let p = paths.incoming_dir.join("clip.mp4");
+        std::fs::write(&p, b"ftyp").unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let id = admit_file(&store, &cfg, "incoming", &p).unwrap().unwrap();
+        let item = store.get(id).unwrap();
+        assert_eq!(item.body, "clip.mp4");
+        assert_eq!(item.parts.len(), 1);
+        assert_eq!(item.parts[0].kind, PartKind::Video);
+        assert_eq!(item.parts[0].mime, "video/mp4");
+        assert!(item.parts[0]
+            .path
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("parts/"));
+        let part = store.get_part(item.parts[0].id).unwrap();
+        assert_eq!(part.kind, PartKind::Video);
+        let abs = store.part_abs_path(&part).unwrap();
+        assert!(abs.exists());
+    }
+
     static PATH_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
+

@@ -38,6 +38,13 @@ pub enum Verb {
     Yank,
     Open,
     New { title: String },
+    Compose,
+    Reply,
+    Send {
+        title: String,
+        body: String,
+        reply_to: Option<i64>,
+    },
     Which,
     Db,
     Only,
@@ -83,6 +90,9 @@ impl Verb {
             Verb::Yank => "yank",
             Verb::Open => "open",
             Verb::New { .. } => "new",
+            Verb::Compose => "compose",
+            Verb::Reply => "reply",
+            Verb::Send { .. } => "send",
             Verb::Which => "which",
             Verb::Db => "db",
             Verb::Only => "only",
@@ -160,6 +170,13 @@ impl Verb {
             "new" => Verb::New {
                 title: arg.unwrap_or("").to_string(),
             },
+            "compose" => Verb::Compose,
+            "reply" => Verb::Reply,
+            "send" => Verb::Send {
+                title: arg.unwrap_or("").to_string(),
+                body: String::new(),
+                reply_to: None,
+            },
             "which" => Verb::Which,
             "db" => Verb::Db,
             "only" => Verb::Only,
@@ -214,6 +231,8 @@ const BINDINGS: &[Binding] = &[
     Binding { seq: "gT", verb: "prev-inbox", local: true },
     Binding { seq: ":", verb: "command", local: true },
     Binding { seq: "L", verb: "label-prompt", local: true },
+    Binding { seq: "c", verb: "compose", local: false },
+    Binding { seq: "R", verb: "reply", local: false },
 ];
 
 #[derive(Clone, Copy)]
@@ -221,6 +240,7 @@ enum ColonSpec {
     Unit(&'static str),
     Theme,
     New,
+    Send,
 }
 
 const COLONS: &[(&str, ColonSpec)] = &[
@@ -238,6 +258,10 @@ const COLONS: &[(&str, ColonSpec)] = &[
     ("yank", ColonSpec::Unit("yank")),
     ("open", ColonSpec::Unit("open")),
     ("new", ColonSpec::New),
+    ("compose", ColonSpec::Unit("compose")),
+    ("reply", ColonSpec::Unit("reply")),
+    ("send", ColonSpec::Send),
+    ("w", ColonSpec::Send),
     ("which", ColonSpec::Unit("which")),
     ("db", ColonSpec::Unit("db")),
     ("only", ColonSpec::Unit("only")),
@@ -262,6 +286,8 @@ dd             eat (mark read)
 L              label (toggle + classify)
 :              command
 ?              help
+c              compose
+R              reply
 esc            back
 q              quit
 
@@ -269,6 +295,7 @@ q              quit
 :theme NAME  :themes
 :why  :again  :eat  :bury  :todo
 :yank  :open  :new TITLE
+:compose  :reply  :send  :w
 :which  :db  :only  :spill
 ";
 
@@ -331,6 +358,11 @@ pub fn parse_colon(s: &str) -> Result<Verb, String> {
                 ColonSpec::New => Verb::New {
                     title: rest.to_string(),
                 },
+                ColonSpec::Send => Verb::Send {
+                    title: rest.to_string(),
+                    body: String::new(),
+                    reply_to: None,
+                },
             });
         }
     }
@@ -367,6 +399,7 @@ pub fn bindings_json() -> String {
             ColonSpec::Unit(id) => (*id, false),
             ColonSpec::Theme => ("theme", true),
             ColonSpec::New => ("new", true),
+            ColonSpec::Send => ("send", true),
         };
         cmds.push_str(&format!(
             "{{\"name\":{},\"verb\":{},\"arg\":{}}}",
@@ -451,6 +484,24 @@ mod tests {
                 title: "Hello World".into()
             })
         );
+        assert_eq!(parse_colon("compose"), Ok(Verb::Compose));
+        assert_eq!(parse_colon("reply"), Ok(Verb::Reply));
+        assert_eq!(
+            parse_colon("send Hello"),
+            Ok(Verb::Send {
+                title: "Hello".into(),
+                body: String::new(),
+                reply_to: None,
+            })
+        );
+        assert_eq!(
+            parse_colon("w"),
+            Ok(Verb::Send {
+                title: String::new(),
+                body: String::new(),
+                reply_to: None,
+            })
+        );
         assert_eq!(
             parse_colon("nope"),
             Err("not an editor command: nope".into())
@@ -463,6 +514,8 @@ mod tests {
         assert!(j.contains("\"seq\":\"gg\""));
         assert!(j.contains("\"verb\":\"todo\""));
         assert!(j.contains("\"name\":\"bury\""));
+        assert!(j.contains("\"verb\":\"compose\""));
+        assert!(j.contains("\"seq\":\"R\""));
         assert!(j.contains("unknown_prefix"));
     }
 }

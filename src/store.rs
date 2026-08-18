@@ -12,6 +12,7 @@ pub enum PartKind {
     File,
     Image,
     Audio,
+    Video,
 }
 
 impl PartKind {
@@ -21,6 +22,7 @@ impl PartKind {
             Self::File => "file",
             Self::Image => "image",
             Self::Audio => "audio",
+            Self::Video => "video",
         }
     }
 
@@ -30,9 +32,47 @@ impl PartKind {
             "file" => Self::File,
             "image" => Self::Image,
             "audio" => Self::Audio,
+            "video" => Self::Video,
             _ => Self::File,
         }
     }
+
+    pub fn is_media(self) -> bool {
+        matches!(self, Self::Image | Self::Audio | Self::Video)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActorKind {
+    #[default]
+    Person,
+    Group,
+    List,
+}
+
+impl ActorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::Group => "group",
+            Self::List => "list",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "group" => Self::Group,
+            "list" => Self::List,
+            _ => Self::Person,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Actor {
+    pub id: String,
+    pub name: Option<String>,
+    pub kind: ActorKind,
 }
 
 #[derive(Debug, Clone)]
@@ -54,7 +94,7 @@ pub struct NewPart {
     pub src: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Item {
     pub id: i64,
     pub source_id: String,
@@ -69,10 +109,16 @@ pub struct Item {
     pub read: bool,
     pub labels: Vec<String>,
     pub parts: Vec<Part>,
+    pub from: Option<Actor>,
+    pub to: Vec<Actor>,
+    pub in_reply_to: Option<i64>,
+    pub forward_of: Option<i64>,
+    pub cite_excerpt: Option<String>,
+    pub cite_actor: Option<Actor>,
 }
 
 const ITEM_COLS: &str =
-    "id, source_id, foreign_id, title, body, href, start, end, created_at, read, thread";
+    "id, source_id, foreign_id, title, body, href, start, end, created_at, read, thread,      from_id, from_name, from_kind, in_reply_to, forward_of, cite_excerpt,      cite_actor_id, cite_actor_name, cite_actor_kind";
 
 #[derive(Clone)]
 pub struct Store {
@@ -125,13 +171,31 @@ impl Store {
                 path TEXT,
                 FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS item_to (
+                item_id INTEGER NOT NULL,
+                actor_id TEXT NOT NULL,
+                name TEXT,
+                kind TEXT NOT NULL,
+                PRIMARY KEY (item_id, actor_id),
+                FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+            );
             CREATE INDEX IF NOT EXISTS idx_parts_item ON parts(item_id);
             CREATE INDEX IF NOT EXISTS idx_items_thread ON items(thread);
+            CREATE INDEX IF NOT EXISTS idx_item_to_item ON item_to(item_id);
             "#,
         )?;
         ensure_column(&conn, "items", "start", "TEXT")?;
         ensure_column(&conn, "items", "end", "TEXT")?;
         ensure_column(&conn, "items", "thread", "TEXT")?;
+        ensure_column(&conn, "items", "from_id", "TEXT")?;
+        ensure_column(&conn, "items", "from_name", "TEXT")?;
+        ensure_column(&conn, "items", "from_kind", "TEXT")?;
+        ensure_column(&conn, "items", "in_reply_to", "INTEGER")?;
+        ensure_column(&conn, "items", "forward_of", "INTEGER")?;
+        ensure_column(&conn, "items", "cite_excerpt", "TEXT")?;
+        ensure_column(&conn, "items", "cite_actor_id", "TEXT")?;
+        ensure_column(&conn, "items", "cite_actor_name", "TEXT")?;
+        ensure_column(&conn, "items", "cite_actor_kind", "TEXT")?;
         backfill_parts(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -151,12 +215,16 @@ impl Store {
         let body = preview_body(item);
         let thread = trim_thread(item.thread.as_deref());
         let to_write = parts_to_insert(item);
+        let (from_id, from_name, from_kind) = actor_cols(item.from.as_ref());
+        let (cite_id, cite_name, cite_kind) = actor_cols(item.cite_actor.as_ref());
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT OR IGNORE INTO items
-                (source_id, foreign_id, title, body, href, start, end, thread, created_at, read)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
+                (source_id, foreign_id, title, body, href, start, end, thread, created_at, read,
+                 from_id, from_name, from_kind, in_reply_to, forward_of, cite_excerpt,
+                 cite_actor_id, cite_actor_name, cite_actor_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 item.source_id,
                 item.foreign_id,
@@ -166,7 +234,16 @@ impl Store {
                 item.start,
                 item.end,
                 thread,
-                created
+                created,
+                from_id,
+                from_name,
+                from_kind,
+                item.in_reply_to,
+                item.forward_of,
+                trim_opt(item.cite_excerpt.as_deref()),
+                cite_id,
+                cite_name,
+                cite_kind
             ],
         )?;
         if tx.changes() == 0 {
@@ -176,6 +253,7 @@ impl Store {
         for (seq, part) in to_write.iter().enumerate() {
             insert_part_row(&tx, &self.data_dir, id, seq as i64, part)?;
         }
+        insert_to_rows(&tx, id, &item.to)?;
         tx.commit()?;
         Ok(Some(id))
     }
@@ -199,6 +277,7 @@ impl Store {
         )?;
         item.labels = labels_for(&conn, id)?;
         item.parts = parts_for(&conn, id)?;
+        item.to = to_for(&conn, id)?;
         ensure_text_part(&conn, &mut item)?;
         Ok(item)
     }
@@ -301,6 +380,42 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_in_reply_to(&self, item_id: i64, parent: Option<i64>) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE items SET in_reply_to = ?1 WHERE id = ?2",
+            params![parent, item_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_to(&self, item_id: i64, to: &[Actor]) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute("DELETE FROM item_to WHERE item_id = ?1", params![item_id])?;
+        insert_to_rows(&conn, item_id, to)?;
+        Ok(())
+    }
+
+    pub fn get_part(&self, id: i64) -> Result<Part> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, seq, kind, mime, text, path FROM parts WHERE id = ?1",
+            params![id],
+            row_part,
+        )
+        .with_context(|| format!("part {id}"))
+    }
+
+    pub fn part_abs_path(&self, part: &Part) -> Option<PathBuf> {
+        let p = part.path.as_ref()?;
+        let path = Path::new(p);
+        if path.is_absolute() {
+            Some(path.to_path_buf())
+        } else {
+            Some(self.data_dir.join(path))
+        }
+    }
+
     pub fn items_in_thread(&self, thread: &str) -> Result<Vec<Item>> {
         if thread.is_empty() {
             return Ok(Vec::new());
@@ -341,10 +456,65 @@ fn parts_to_insert(item: &NewItem) -> Vec<NewPart> {
 }
 
 fn trim_thread(thread: Option<&str>) -> Option<String> {
-    thread
-        .map(str::trim)
+    trim_opt(thread)
+}
+
+fn trim_opt(s: Option<&str>) -> Option<String> {
+    s.map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+fn actor_cols(actor: Option<&Actor>) -> (Option<String>, Option<String>, Option<String>) {
+    match actor {
+        Some(a) if !a.id.trim().is_empty() => (
+            Some(a.id.clone()),
+            a.name.clone().and_then(|n| trim_opt(Some(&n))),
+            Some(a.kind.as_str().to_string()),
+        ),
+        _ => (None, None, None),
+    }
+}
+
+fn actor_from_cols(id: Option<String>, name: Option<String>, kind: Option<String>) -> Option<Actor> {
+    let id = id.and_then(|s| trim_opt(Some(&s)))?;
+    Some(Actor {
+        id,
+        name: name.and_then(|s| trim_opt(Some(&s))),
+        kind: ActorKind::parse(kind.as_deref().unwrap_or("")),
+    })
+}
+
+fn insert_to_rows(conn: &Connection, item_id: i64, to: &[Actor]) -> Result<()> {
+    for a in to {
+        let id = a.id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO item_to (item_id, actor_id, name, kind) VALUES (?1, ?2, ?3, ?4)",
+            params![item_id, id, trim_opt(a.name.as_deref()), a.kind.as_str()],
+        )?;
+    }
+    Ok(())
+}
+
+fn to_for(conn: &Connection, id: i64) -> Result<Vec<Actor>> {
+    let mut stmt = conn.prepare(
+        "SELECT actor_id, name, kind FROM item_to WHERE item_id = ?1 ORDER BY actor_id",
+    )?;
+    let rows = stmt.query_map(params![id], |row| {
+        Ok(Actor {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            kind: ActorKind::parse(&row.get::<_, String>(2)?),
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
 }
 
 fn insert_part_row(
@@ -429,6 +599,17 @@ fn extension_for(part: &NewPart) -> String {
                 ".bin".into()
             }
         }
+        PartKind::Video => {
+            if part.mime.contains("webm") {
+                ".webm".into()
+            } else if part.mime.contains("quicktime") {
+                ".mov".into()
+            } else if part.mime.contains("matroska") {
+                ".mkv".into()
+            } else {
+                ".mp4".into()
+            }
+        }
         _ => String::new(),
     }
 }
@@ -446,8 +627,14 @@ fn row_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
         created_at: row.get(8)?,
         read: row.get::<_, i64>(9)? != 0,
         thread: row.get(10)?,
+        from: actor_from_cols(row.get(11)?, row.get(12)?, row.get(13)?),
+        in_reply_to: row.get(14)?,
+        forward_of: row.get(15)?,
+        cite_excerpt: row.get(16)?,
+        cite_actor: actor_from_cols(row.get(17)?, row.get(18)?, row.get(19)?),
         labels: Vec::new(),
         parts: Vec::new(),
+        to: Vec::new(),
     })
 }
 
@@ -522,9 +709,28 @@ fn hydrate(conn: &Connection, items: &mut [Item]) -> Result<()> {
     }
     drop(part_stmt);
 
+    let mut to_stmt = conn.prepare("SELECT item_id, actor_id, name, kind FROM item_to")?;
+    let to_rows = to_stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            Actor {
+                id: row.get(1)?,
+                name: row.get(2)?,
+                kind: ActorKind::parse(&row.get::<_, String>(3)?),
+            },
+        ))
+    })?;
+    let mut to_map: std::collections::HashMap<i64, Vec<Actor>> = std::collections::HashMap::new();
+    for row in to_rows {
+        let (id, actor) = row?;
+        to_map.entry(id).or_default().push(actor);
+    }
+    drop(to_stmt);
+
     for item in items {
         item.labels = lab_map.remove(&item.id).unwrap_or_default();
         item.parts = part_map.remove(&item.id).unwrap_or_default();
+        item.to = to_map.remove(&item.id).unwrap_or_default();
     }
     Ok(())
 }

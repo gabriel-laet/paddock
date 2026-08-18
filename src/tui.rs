@@ -31,6 +31,12 @@ enum Mode {
     Help,
     Search,
     Command,
+    Compose,
+}
+
+enum ComposeField {
+    Title,
+    Body,
 }
 
 struct App {
@@ -55,6 +61,11 @@ struct App {
     keys: KeySeq,
     unread_only: bool,
     list_height: usize,
+    from_compose: bool,
+    compose_reply_to: Option<i64>,
+    compose_title: String,
+    compose_body: String,
+    compose_field: ComposeField,
 }
 
 impl App {
@@ -82,6 +93,11 @@ impl App {
             keys: KeySeq::default(),
             unread_only: false,
             list_height: 12,
+            from_compose: false,
+            compose_reply_to: None,
+            compose_title: String::new(),
+            compose_body: String::new(),
+            compose_field: ComposeField::Title,
         };
         app.reload_tree();
         app.reload_items();
@@ -230,6 +246,22 @@ impl App {
         if out.overlay.is_some() {
             self.mode = Mode::Help;
         }
+        if out.open_compose {
+            self.from_read = matches!(self.mode, Mode::Read);
+            self.compose_reply_to = out.reply_to;
+            self.compose_title = out
+                .reply_to
+                .and_then(|id| self.store.get(id).ok())
+                .map(|p| paddock::reply_title(&p))
+                .unwrap_or_default();
+            self.compose_body.clear();
+            self.compose_field = ComposeField::Title;
+            self.mode = Mode::Compose;
+            self.status = match out.reply_to {
+                Some(id) => format!("reply to #{id}"),
+                None => "compose".into(),
+            };
+        }
         self.reload_items();
     }
 
@@ -260,17 +292,24 @@ impl App {
     fn run_colon(&mut self) -> bool {
         let raw = self.cmd_buf.trim().to_string();
         self.cmd_buf.clear();
-        self.mode = if self.from_read {
+        let from_compose = self.from_compose;
+        self.mode = if from_compose {
+            Mode::Compose
+        } else if self.from_read {
             Mode::Read
         } else {
             Mode::List
         };
         self.from_read = false;
+        self.from_compose = false;
         if raw.is_empty() {
             return false;
         }
         match parse_colon(&raw) {
             Ok(verb) => {
+                if from_compose && matches!(verb, Verb::Send { .. }) {
+                    return send_compose(self);
+                }
                 if verb.is_local() && !matches!(verb, Verb::Help | Verb::Quit) {
                     return apply_local(self, verb);
                 }
@@ -443,6 +482,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         Mode::Label => return handle_line(app, key, LineKind::Label),
         Mode::Search => return handle_line(app, key, LineKind::Search),
         Mode::Command => return handle_line(app, key, LineKind::Command),
+        Mode::Compose => return handle_compose(app, key),
         Mode::Read | Mode::List => {}
     }
 
@@ -474,12 +514,15 @@ fn handle_line(app: &mut App, key: KeyEvent, kind: LineKind) -> bool {
                 LineKind::Search => app.search_buf.clear(),
                 LineKind::Command => app.cmd_buf.clear(),
             }
-            app.mode = if app.from_read {
+            app.mode = if app.from_compose {
+                Mode::Compose
+            } else if app.from_read {
                 Mode::Read
             } else {
                 Mode::List
             };
             app.from_read = false;
+            app.from_compose = false;
         }
         KeyCode::Enter => match kind {
             LineKind::Label => app.submit_label(),
@@ -537,6 +580,9 @@ fn read_ok(v: &Verb) -> bool {
             | Verb::Db
             | Verb::New { .. }
             | Verb::Relabel { .. }
+            | Verb::Reply
+            | Verb::Compose
+            | Verb::Send { .. }
     )
 }
 
@@ -661,6 +707,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     draw_tree(f, app, body[0]);
     match app.mode {
         Mode::Read => draw_read(f, app, body[1]),
+        Mode::Compose => draw_compose(f, app, body[1]),
         _ => draw_items(f, app, body[1]),
     }
     draw_status(f, app, chunks[1]);
@@ -824,6 +871,14 @@ fn draw_read(f: &mut ratatui::Frame, app: &App, area: Rect) {
             .unwrap_or(1);
         head.push_str(&format!("thread {th}  {n}\n"));
     }
+    if it.from.is_some()
+        || !it.to.is_empty()
+        || it.in_reply_to.is_some()
+        || it.forward_of.is_some()
+    {
+        head.push_str(&cite_line(it));
+        head.push('\n');
+    }
     let mut text = format!("{head}\n{}", it.body);
     let show_parts = it.parts.len() > 1
         || it.parts.iter().any(|p| p.kind != paddock::PartKind::Text);
@@ -853,6 +908,13 @@ fn draw_status(f: &mut ratatui::Frame, app: &App, area: Rect) {
         Mode::Label => format!("label: {}_", app.label_buf),
         Mode::Search => format!("/{}_", app.search_buf),
         Mode::Command => format!(":{}_", app.cmd_buf),
+        Mode::Compose => {
+            if let Some(id) = app.compose_reply_to {
+                format!("reply to #{id}")
+            } else {
+                "compose".into()
+            }
+        }
         _ => app.status.clone(),
     };
     f.render_widget(
@@ -878,6 +940,123 @@ fn draw_help(f: &mut ratatui::Frame, app: &App) {
         ),
         area,
     );
+}
+
+fn send_compose(app: &mut App) -> bool {
+    let title = app.compose_title.clone();
+    let body = app.compose_body.clone();
+    let reply_to = app.compose_reply_to;
+    app.mode = Mode::List;
+    app.from_compose = false;
+    app.exec(&Verb::Send {
+        title,
+        body,
+        reply_to,
+    })
+}
+
+fn handle_compose(app: &mut App, key: KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = if app.from_read {
+                Mode::Read
+            } else {
+                Mode::List
+            };
+            app.from_read = false;
+            app.status = String::new();
+        }
+        KeyCode::Tab => {
+            app.compose_field = match app.compose_field {
+                ComposeField::Title => ComposeField::Body,
+                ComposeField::Body => ComposeField::Title,
+            };
+        }
+        KeyCode::Enter => match app.compose_field {
+            ComposeField::Title => app.compose_field = ComposeField::Body,
+            ComposeField::Body => app.compose_body.push('\n'),
+        },
+        KeyCode::Backspace => match app.compose_field {
+            ComposeField::Title => {
+                app.compose_title.pop();
+            }
+            ComposeField::Body => {
+                app.compose_body.pop();
+            }
+        },
+        KeyCode::Char('s') if ctrl => return send_compose(app),
+        KeyCode::Char(':') if !ctrl => {
+            app.from_compose = true;
+            app.mode = Mode::Command;
+            app.cmd_buf.clear();
+        }
+        KeyCode::Char(c) if !c.is_control() => match app.compose_field {
+            ComposeField::Title => app.compose_title.push(c),
+            ComposeField::Body => app.compose_body.push(c),
+        },
+        _ => {}
+    }
+    false
+}
+
+fn cite_line(it: &Item) -> String {
+    let mut bits = Vec::new();
+    if let Some(f) = &it.from {
+        bits.push(format!("from {}", f.name.as_deref().unwrap_or(&f.id)));
+    }
+    if !it.to.is_empty() {
+        let names: Vec<&str> = it
+            .to
+            .iter()
+            .map(|a| a.name.as_deref().unwrap_or(&a.id))
+            .collect();
+        bits.push(format!("to {}", names.join(", ")));
+    }
+    if let Some(id) = it.in_reply_to {
+        bits.push(format!("reply #{id}"));
+    }
+    if let Some(id) = it.forward_of {
+        bits.push(format!("fwd #{id}"));
+    }
+    bits.join("  ")
+}
+
+fn draw_compose(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let th = &app.theme;
+    let title_mark = if matches!(app.compose_field, ComposeField::Title) {
+        ">"
+    } else {
+        " "
+    };
+    let body_mark = if matches!(app.compose_field, ComposeField::Body) {
+        ">"
+    } else {
+        " "
+    };
+    let heading = if let Some(id) = app.compose_reply_to {
+        format!(" reply to #{id} ")
+    } else {
+        " compose ".into()
+    };
+    let title = if matches!(app.compose_field, ComposeField::Title) {
+        format!("{}{}_", app.compose_title, "")
+    } else {
+        app.compose_title.clone()
+    };
+    let body = if matches!(app.compose_field, ComposeField::Body) {
+        format!("{}_", app.compose_body)
+    } else {
+        app.compose_body.clone()
+    };
+    let text = format!("{title_mark} title  {title}\n{body_mark} body\n{body}");
+    let p = Paragraph::new(text).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(heading)
+            .border_style(Style::default().fg(rgb(th.c_accent()))),
+    );
+    f.render_widget(p, area);
 }
 
 fn draw_label(f: &mut ratatui::Frame, app: &App) {

@@ -6,8 +6,12 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::config::{Config, Paths};
-use crate::engine::{admit_file, classify_item, items_in_chain, pull_all, relabel, stamp};
+use crate::engine::{
+    admit_file, classify_item, default_send_source, items_in_chain, pull_all, relabel,
+    reply_title, send_draft, source_can_send, stamp, unique_path,
+};
 use crate::keys::{Verb, HELP};
+use crate::source::Draft;
 use crate::store::{Item, Store};
 use crate::theme::{list_themes, load_named, write_theme_override};
 
@@ -25,6 +29,8 @@ pub struct Outcome {
     pub unread_only: Option<bool>,
     pub theme_name: Option<String>,
     pub overlay: Option<String>,
+    pub open_compose: bool,
+    pub reply_to: Option<i64>,
 }
 
 fn ok_status(s: impl Into<String>) -> Outcome {
@@ -152,11 +158,67 @@ pub fn run_verb(
                 Ok(i) => i,
                 Err(o) => return Ok(o),
             };
-            let Some(href) = item.href.as_deref().filter(|s| !s.is_empty()) else {
+            let Some(target) = open_target(&item, paths) else {
                 return Ok(ok_status("no href"));
             };
-            try_open(href);
-            Ok(ok_status(href))
+            try_open(&target);
+            Ok(ok_status(target))
+        }
+        Verb::Compose => Ok(Outcome {
+            open_compose: true,
+            status: "compose".into(),
+            ..Outcome::default()
+        }),
+        Verb::Reply => {
+            let item = match need_item(store, ctx)? {
+                Ok(i) => i,
+                Err(o) => return Ok(o),
+            };
+            Ok(Outcome {
+                open_compose: true,
+                reply_to: Some(item.id),
+                status: format!("reply to #{}", item.id),
+                ..Outcome::default()
+            })
+        }
+        Verb::Send {
+            title,
+            body,
+            reply_to,
+        } => {
+            let mut title = title.clone();
+            let mut source_id = default_send_source(config);
+            let mut thread = None;
+            if let Some(pid) = reply_to {
+                let parent = match store.get(*pid) {
+                    Ok(p) => p,
+                    Err(_) => return Ok(ok_status("no item")),
+                };
+                if source_can_send(config, &parent.source_id) {
+                    source_id = parent.source_id.clone();
+                }
+                thread = parent
+                    .thread
+                    .clone()
+                    .or_else(|| Some(format!("{}:{}", parent.source_id, parent.foreign_id)));
+                if title.trim().is_empty() {
+                    title = reply_title(&parent);
+                }
+            }
+            if title.trim().is_empty() {
+                title = "untitled".into();
+            }
+            let draft = Draft {
+                source_id,
+                title,
+                body: body.clone(),
+                thread,
+                reply_to: *reply_to,
+                parts: vec![],
+                to: vec![],
+            };
+            let id = send_draft(store, config, paths, draft)?;
+            Ok(ok_status(format!("sent #{id}")))
         }
         Verb::New { title } => {
             let title = title.trim();
@@ -164,7 +226,7 @@ pub fn run_verb(
                 return Ok(ok_status("new TITLE"));
             }
             fs::create_dir_all(&paths.incoming_dir)?;
-            let stem = sanitize_filename(title);
+            let stem = crate::engine::sanitize_filename(title);
             let dest = unique_path(&paths.incoming_dir.join(format!("{stem}.md")));
             let body = format!("{title}\n");
             fs::write(&dest, body.as_bytes())?;
@@ -296,42 +358,25 @@ pub fn explain_why(config: &Config, item: &Item, inbox_path: &[String]) -> Strin
 }
 
 pub fn sanitize_filename(title: &str) -> String {
-    let mut s = String::new();
-    for c in title.chars() {
-        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
-            s.push(c);
-        } else if !s.ends_with('-') {
-            s.push('-');
-        }
-    }
-    let s = s.trim_matches('-').to_string();
-    if s.is_empty() {
-        "untitled".into()
-    } else {
-        s
-    }
+    crate::engine::sanitize_filename(title)
 }
 
-fn unique_path(path: &Path) -> std::path::PathBuf {
-    if !path.exists() {
-        return path.to_path_buf();
+fn open_target(item: &Item, paths: &Paths) -> Option<String> {
+    if let Some(href) = item.href.as_deref().filter(|s| !s.is_empty()) {
+        return Some(href.to_string());
     }
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("untitled");
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("md");
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    for n in 2..1000 {
-        let p = parent.join(format!("{stem}-{n}.{ext}"));
-        if !p.exists() {
-            return p;
-        }
-    }
-    path.to_path_buf()
+    item.parts
+        .iter()
+        .find(|p| p.kind.is_media())
+        .and_then(|p| p.path.as_ref())
+        .map(|p| {
+            let path = Path::new(p);
+            if path.is_absolute() {
+                p.clone()
+            } else {
+                paths.data_dir.join(p).display().to_string()
+            }
+        })
 }
 
 fn try_open(href: &str) {

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::classify::run_classifier;
 use crate::config::{chain_matches, expand_path, Config, InboxConfig, Paths};
-use crate::source::{item_from_file, pull_fs, pull_rss, NewItem};
+use crate::source::{item_from_file, pull_fs, pull_rss, Draft, NewItem};
 use crate::store::{Item, Store};
 
 /// Generation bump after store mutations from the watcher (TUI polls this).
@@ -240,4 +240,152 @@ fn source_for_path(cfg: &Config, path: &Path, paths: &Paths) -> Option<String> {
         return Some("incoming".into());
     }
     None
+}
+
+
+/// First `kind=fs` source, else "incoming".
+pub fn default_send_source(config: &Config) -> String {
+    config
+        .source
+        .iter()
+        .find(|s| s.kind == "fs")
+        .map(|s| s.id.clone())
+        .unwrap_or_else(|| "incoming".into())
+}
+
+pub fn source_can_send(config: &Config, source_id: &str) -> bool {
+    match config
+        .source
+        .iter()
+        .find(|s| s.id == source_id)
+        .map(|s| s.kind.as_str())
+    {
+        Some("rss") => false,
+        _ => true,
+    }
+}
+
+pub fn reply_title(parent: &Item) -> String {
+    let t = parent.title.trim();
+    if t.is_empty() {
+        "re:".into()
+    } else if t.to_ascii_lowercase().starts_with("re:") {
+        t.to_string()
+    } else {
+        format!("re: {t}")
+    }
+}
+
+pub fn sanitize_filename(title: &str) -> String {
+    let mut s = String::new();
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+            s.push(c);
+        } else if !s.ends_with('-') {
+            s.push('-');
+        }
+    }
+    let s = s.trim_matches('-').to_string();
+    if s.is_empty() {
+        "untitled".into()
+    } else {
+        s
+    }
+}
+
+pub fn unique_path(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("untitled");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("md");
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    for n in 2..1000 {
+        let p = parent.join(format!("{stem}-{n}.{ext}"));
+        if !p.exists() {
+            return p;
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Persist a draft. The source sends if it can (`fs` writes a file; unknown admits locally).
+pub fn send_draft(store: &Store, config: &Config, paths: &Paths, draft: Draft) -> Result<i64> {
+    let source_id = if draft.source_id.is_empty() {
+        default_send_source(config)
+    } else {
+        draft.source_id.clone()
+    };
+    let kind = config
+        .source
+        .iter()
+        .find(|s| s.id == source_id)
+        .map(|s| s.kind.as_str());
+    if kind == Some("rss") {
+        anyhow::bail!("source cannot send");
+    }
+
+    let mut thread = draft.thread.clone();
+    if let Some(pid) = draft.reply_to {
+        let parent = store.get(pid)?;
+        let th = thread
+            .clone()
+            .or(parent.thread.clone())
+            .unwrap_or_else(|| format!("{}:{}", parent.source_id, parent.foreign_id));
+        if parent.thread.is_none() {
+            store.set_thread(pid, Some(&th))?;
+        }
+        thread = Some(th);
+    }
+
+    match kind {
+        Some("fs") => {
+            std::fs::create_dir_all(&paths.incoming_dir)?;
+            let stem = sanitize_filename(&draft.title);
+            let dest = unique_path(&paths.incoming_dir.join(format!("{stem}.md")));
+            std::fs::write(&dest, draft.body.as_bytes())?;
+            let id = admit_file(store, config, &source_id, &dest)?
+                .ok_or_else(|| anyhow::anyhow!("admit failed"))?;
+            if let Some(ref th) = thread {
+                store.set_thread(id, Some(th))?;
+            }
+            if draft.reply_to.is_some() {
+                store.set_in_reply_to(id, draft.reply_to)?;
+            }
+            if !draft.to.is_empty() {
+                store.set_to(id, &draft.to)?;
+            }
+            bump();
+            Ok(id)
+        }
+        _ => {
+            let stamp = chrono::Utc::now().timestamp_millis();
+            let foreign = format!("{}-{stamp}", sanitize_filename(&draft.title));
+            let new = NewItem {
+                source_id,
+                foreign_id: foreign,
+                title: if draft.title.trim().is_empty() {
+                    "untitled".into()
+                } else {
+                    draft.title.clone()
+                },
+                body: draft.body.clone(),
+                href: None,
+                start: None,
+                end: None,
+                thread,
+                parts: draft.parts.clone(),
+                from: None,
+                to: draft.to.clone(),
+                in_reply_to: draft.reply_to,
+                forward_of: None,
+                cite_excerpt: None,
+                cite_actor: None,
+            };
+            admit(store, config, new)?.ok_or_else(|| anyhow::anyhow!("admit failed"))
+        }
+    }
 }

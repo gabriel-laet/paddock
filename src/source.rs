@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 
-use crate::store::{NewPart, PartKind};
+use crate::store::{Actor, NewPart, PartKind};
 
 #[derive(Debug, Clone, Default)]
 pub struct NewItem {
@@ -15,6 +15,24 @@ pub struct NewItem {
     pub end: Option<String>,
     pub thread: Option<String>,
     pub parts: Vec<NewPart>,
+    pub from: Option<Actor>,
+    pub to: Vec<Actor>,
+    pub in_reply_to: Option<i64>,
+    pub forward_of: Option<i64>,
+    pub cite_excerpt: Option<String>,
+    pub cite_actor: Option<Actor>,
+}
+
+/// A compose or reply waiting to become an item.
+#[derive(Debug, Clone, Default)]
+pub struct Draft {
+    pub source_id: String,
+    pub title: String,
+    pub body: String,
+    pub thread: Option<String>,
+    pub reply_to: Option<i64>,
+    pub parts: Vec<NewPart>,
+    pub to: Vec<Actor>,
 }
 
 /// Non-recursive. Skips dotfiles and directories.
@@ -68,6 +86,7 @@ pub fn item_from_file(source_id: &str, path: &Path) -> Result<NewItem> {
                 bytes: None,
                 src: Some(path.display().to_string()),
             }],
+            ..Default::default()
         });
     }
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
@@ -82,6 +101,7 @@ pub fn item_from_file(source_id: &str, path: &Path) -> Result<NewItem> {
         end: None,
         thread: None,
         parts: Vec::new(),
+        ..Default::default()
     })
 }
 
@@ -98,6 +118,10 @@ fn media_kind(path: &Path) -> Option<(PartKind, &'static str)> {
         "ogg" | "oga" => (PartKind::Audio, "audio/ogg"),
         "m4a" => (PartKind::Audio, "audio/mp4"),
         "flac" => (PartKind::Audio, "audio/flac"),
+        "mp4" => (PartKind::Video, "video/mp4"),
+        "webm" => (PartKind::Video, "video/webm"),
+        "mov" => (PartKind::Video, "video/quicktime"),
+        "mkv" => (PartKind::Video, "video/x-matroska"),
         _ => return None,
     })
 }
@@ -138,6 +162,7 @@ pub fn pull_rss(source_id: &str, url: &str) -> Result<Vec<NewItem>> {
             end: None,
             thread: None,
             parts: Vec::new(),
+            ..Default::default()
         });
     }
     Ok(out)

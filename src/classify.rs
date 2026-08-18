@@ -475,6 +475,7 @@ mod tests {
             read: false,
             labels: vec![],
             parts: vec![],
+            ..Default::default()
         }
     }
 

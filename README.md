@@ -9,7 +9,11 @@ An inbox host. TUI and web.
 - **label** — a mark a classifier put on an item
 - **inbox** — a named question over the pile (labels + sources + sort), not an account and not a folder
 
-Items may have parts (text, file, image, audio) and an optional thread. `body` is the list preview.
+Items may have parts (text, file, image, audio, video) and an optional thread. `body` is the list preview.
+
+Actors and cites are kernel: an item can have `from` / `to` (a person, a group, or a list) and may cite another item. A group is an actor; a reply cites an item (`in_reply_to` + thread).
+
+Compose is a verb: `c` / `:compose` opens a title+body draft, `R` / `:reply` keeps the thread (or starts one from the parent), and `:send` / `:w` (or Ctrl-s) persists. The source writes a file if it can; `:new TITLE` stays the one-shot create.
 
 Inboxes nest. A child is a tighter question over its parent's matched items. Classifiers are a plugin role owned by an inbox; they run when an item enters that inbox, then children re-evaluate.
 
@@ -137,6 +141,8 @@ dd         eat (mark read)
 L          label (toggle + classify)
 :          command
 ?          help
+c          compose
+R          reply
 esc        back
 q          quit (list)
 ```
@@ -157,8 +163,11 @@ Read: `j/k` next item, `esc`/`h` back, `:` still works, `q` quits.
 :bury        label later + classify → all/later
 :todo        label todo + classify → all/todo
 :yank        write title to $data/yank
-:open        show href; xdg-open if possible
+:open        show href, or the first image/audio/video part; xdg-open if possible
 :new TITLE   write $incoming/TITLE.md and admit
+:compose     open compose
+:reply       open compose as a reply
+:send :w     persist the draft
 :which       inbox path + counts
 :db          store path
 :only        unread-only filter

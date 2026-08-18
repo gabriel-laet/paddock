@@ -1,13 +1,15 @@
 use anyhow::Result;
 use axum::extract::{Path, Query, State};
-use axum::response::{Html, Redirect};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::Router;
 use paddock::cmd::{run_verb, VerbCtx};
 use paddock::keys::{bindings_json, Verb};
 use paddock::theme::{load_theme, Theme};
 use paddock::{
-    items_in_chain, load_or_init, pull_all, relabel, spawn_fs_watch, Config, Item, Paths, Store,
+    items_in_chain, load_or_init, pull_all, relabel, spawn_fs_watch, Config, Item, PartKind, Paths,
+    Store,
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -32,6 +34,8 @@ async fn serve_async(paths: Paths, bind: String) -> Result<()> {
         .route("/", get(root))
         .route("/i/{*path}", get(inbox_page))
         .route("/item/{id}", get(item_page))
+        .route("/compose", get(compose_page))
+        .route("/part/{id}", get(part_bytes))
         .route("/x/{verb}", get(exec_x))
         .with_state(state);
 
@@ -73,6 +77,9 @@ struct Xq {
     inbox: Option<String>,
     arg: Option<String>,
     only: Option<String>,
+    title: Option<String>,
+    body: Option<String>,
+    reply: Option<i64>,
 }
 
 async fn exec_x(
@@ -81,7 +88,15 @@ async fn exec_x(
     Query(q): Query<Xq>,
 ) -> Result<Redirect, Html<String>> {
     let cfg = Config::load(&st.paths.config_file).map_err(|e| html_err(&st, &e.to_string()))?;
-    let parsed = Verb::from_id(&verb, q.arg.as_deref());
+    let parsed = if verb == "send" {
+        Some(Verb::Send {
+            title: q.title.clone().or(q.arg.clone()).unwrap_or_default(),
+            body: q.body.clone().unwrap_or_default(),
+            reply_to: q.reply,
+        })
+    } else {
+        Verb::from_id(&verb, q.arg.as_deref())
+    };
     let inbox = q.inbox.clone().unwrap_or_else(|| {
         cfg.inbox
             .first()
@@ -113,6 +128,13 @@ async fn exec_x(
     };
     match run_verb(&st.store, &cfg, &st.paths, &ctx, &verb) {
         Ok(out) => {
+            if out.open_compose {
+                let dest = match out.reply_to {
+                    Some(id) => format!("/compose?reply={id}"),
+                    None => "/compose".into(),
+                };
+                return Ok(Redirect::to(&dest));
+            }
             let only = out
                 .unread_only
                 .map(|u| if u { "1" } else { "0" })
@@ -257,7 +279,7 @@ fn render_inbox(st: &AppState, cfg: &Config, path: &str, msg: Option<&str>, only
             r#"<div class="wrap">
 <nav>{nav}</nav>
 <main>
-<header class="bar"><h1>{crumb}</h1><a href="/i/{path}?pull=1">pull</a></header>
+<header class="bar"><h1>{crumb}</h1><a href="/compose">compose</a><a href="/i/{path}?pull=1">pull</a></header>
 {missing}
 {list}
 </main>
@@ -342,11 +364,18 @@ fn render_item(st: &AppState, it: &Item, msg: Option<&str>) -> Html<String> {
     };
     let show_parts = it.parts.len() > 1
         || it.parts.iter().any(|p| p.kind != paddock::PartKind::Text);
+    let cite = cite_html(it);
     let parts_html = if show_parts {
         let mut s = String::from("<ul class=\"parts\">");
         for p in &it.parts {
+            let media = match p.kind {
+                PartKind::Image => format!(r#"<img src="/part/{}" alt="">"#, p.id),
+                PartKind::Audio => format!(r#"<audio controls src="/part/{}"></audio>"#, p.id),
+                PartKind::Video => format!(r#"<video controls src="/part/{}"></video>"#, p.id),
+                _ => String::new(),
+            };
             s.push_str(&format!(
-                "<li>{} {} {}</li>",
+                "<li>{} {} {} {media}</li>",
                 esc(p.kind.as_str()),
                 esc(&p.mime),
                 esc(p.path.as_deref().unwrap_or("")),
@@ -362,10 +391,11 @@ fn render_item(st: &AppState, it: &Item, msg: Option<&str>) -> Html<String> {
         &it.title,
         &format!(
             r#"<main class="item">
-<p class="bar"><a href="/">← inboxes</a> · <a href="/item/{id}?toggle=1">{mark}</a></p>
+<p class="bar"><a href="/">← inboxes</a> · <a href="/item/{id}?toggle=1">{mark}</a> · <a href="/compose?reply={id}">reply</a></p>
 <h1>{title}</h1>
 <p class="meta">{src} · {when} · {href}</p>
 {thread_line}
+{cite}
 <p class="labels">labels {labels} · <a href="/item/{id}?label=later">later</a> · <a href="/item/{id}?label=todo">todo</a></p>
 <pre>{body}</pre>
 {parts_html}
@@ -383,14 +413,23 @@ fn render_item(st: &AppState, it: &Item, msg: Option<&str>) -> Html<String> {
 }
 
 fn page(theme: &Theme, title: &str, body: &str) -> Html<String> {
+    page_opts(theme, title, body, true)
+}
+
+fn page_opts(theme: &Theme, title: &str, body: &str, refresh: bool) -> Html<String> {
     let css = CSS.replace("/*VARS*/", &theme.css_vars());
+    let refresh_tag = if refresh {
+        r#"<meta http-equiv="refresh" content="15">"#
+    } else {
+        ""
+    };
     Html(format!(
         r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="15">
+{refresh_tag}
 <title>{title} · paddock</title>
 <style>{css}</style>
 </head>
@@ -406,7 +445,106 @@ fn page(theme: &Theme, title: &str, body: &str) -> Html<String> {
         css = css,
         bindings = bindings_json(),
         js = JS,
+        refresh_tag = refresh_tag,
     ))
+}
+
+#[derive(Deserialize)]
+struct ComposeQ {
+    reply: Option<i64>,
+}
+
+async fn compose_page(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<ComposeQ>,
+) -> Html<String> {
+    let mut title = String::new();
+    let reply_hidden = if let Some(id) = q.reply {
+        if let Ok(parent) = st.store.get(id) {
+            title = paddock::reply_title(&parent);
+        }
+        format!(r#"<input type="hidden" name="reply" value="{id}">"#)
+    } else {
+        String::new()
+    };
+    let heading = if let Some(id) = q.reply {
+        format!("reply to #{id}")
+    } else {
+        "compose".into()
+    };
+    page_opts(
+        &theme_of(&st),
+        &heading,
+        &format!(
+            r#"<main class="item">
+<p class="bar"><a href="/">← inboxes</a></p>
+<h1>{heading}</h1>
+<form class="compose" method="get" action="/x/send">
+{reply_hidden}
+<label>title</label>
+<input name="title" value="{title}" autofocus>
+<label>body</label>
+<textarea name="body" rows="12"></textarea>
+<button type="submit">send</button>
+</form>
+</main>"#,
+            heading = esc(&heading),
+            title = esc(&title),
+            reply_hidden = reply_hidden,
+        ),
+        false,
+    )
+}
+
+async fn part_bytes(State(st): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
+    let Ok(part) = st.store.get_part(id) else {
+        return (StatusCode::NOT_FOUND, "no part").into_response();
+    };
+    let Some(path) = st.store.part_abs_path(&part) else {
+        return (StatusCode::NOT_FOUND, "no path").into_response();
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let mut headers = HeaderMap::new();
+            let mime = HeaderValue::from_str(&part.mime)
+                .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+            headers.insert(header::CONTENT_TYPE, mime);
+            (headers, bytes).into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "missing").into_response(),
+    }
+}
+
+fn cite_html(it: &Item) -> String {
+    if it.from.is_none()
+        && it.to.is_empty()
+        && it.in_reply_to.is_none()
+        && it.forward_of.is_none()
+    {
+        return String::new();
+    }
+    let mut bits = Vec::new();
+    if let Some(f) = &it.from {
+        bits.push(format!(
+            "from {}",
+            esc(f.name.as_deref().unwrap_or(&f.id))
+        ));
+    }
+    if !it.to.is_empty() {
+        let names: Vec<String> = it
+            .to
+            .iter()
+            .map(|a| esc(a.name.as_deref().unwrap_or(&a.id)))
+            .collect();
+        bits.push(format!("to {}", names.join(", ")));
+    }
+    if let Some(id) = it.in_reply_to {
+        bits.push(format!(r#"reply <a href="/item/{id}">#{id}</a>"#));
+    }
+    if let Some(id) = it.forward_of {
+        bits.push(format!(r#"fwd <a href="/item/{id}">#{id}</a>"#));
+    }
+    format!(r#"<p class="meta">{}</p>"#, bits.join(" · "))
 }
 
 fn html_err(st: &AppState, msg: &str) -> Html<String> {
@@ -483,6 +621,11 @@ pre { white-space: pre-wrap; word-break: break-word; margin: 16px 0 0; }
 .lab { border: 1px solid var(--border); padding: 0 4px; }
 .parts { list-style: none; margin: 12px 0 0; padding: 0; color: var(--dim); }
 .parts li { padding: 2px 0; }
+.parts img, .parts video { max-width: 100%; display: block; margin: 8px 0; }
+.parts audio { display: block; margin: 8px 0; }
+form.compose label { display: block; color: var(--dim); margin: 8px 0 2px; }
+form.compose input, form.compose textarea { width: 100%; background: var(--bg); color: var(--fg); border: 1px solid var(--border); font: inherit; padding: 4px 6px; }
+form.compose button { margin-top: 12px; }
 .status { position: fixed; bottom: 0; left: 0; right: 0; padding: 2px 8px; color: var(--dim); background: var(--bg); }
 #cmdwrap { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg); border-top: 1px solid var(--border); padding: 4px 8px; z-index: 2; }
 #cmdwrap input { background: transparent; border: 0; color: var(--fg); font: inherit; width: 90%; outline: none; }
