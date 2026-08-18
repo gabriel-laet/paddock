@@ -121,6 +121,16 @@ fn item_map(item: &Item) -> rhai::Map {
         item.start.clone().unwrap_or_default().into(),
     );
     map.insert("end".into(), item.end.clone().unwrap_or_default().into());
+    map.insert(
+        "thread".into(),
+        item.thread.clone().unwrap_or_default().into(),
+    );
+    let parts: rhai::Array = item
+        .parts
+        .iter()
+        .map(|p| rhai::Dynamic::from(p.kind.as_str().to_string()))
+        .collect();
+    map.insert("parts".into(), parts.into());
     let labels: rhai::Array = item
         .labels
         .iter()
@@ -460,9 +470,11 @@ mod tests {
             href: None,
             start: None,
             end: None,
+            thread: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             read: false,
             labels: vec![],
+            parts: vec![],
         }
     }
 
@@ -507,6 +519,35 @@ mod tests {
         it.start = Some("2026-08-18T12:00:00Z".into());
         it.labels = vec!["todo".into()];
         assert_eq!(run_classifier(&cfg, &it).unwrap(), Some("cal".into()));
+    }
+
+    #[test]
+    fn script_reads_thread_and_parts() {
+        let cfg = script_cfg(
+            r#"if item["thread"] == "t1" && item.parts.len() == 2 { "ok" } else { () }"#,
+            None,
+        );
+        let mut it = item("x", "");
+        it.thread = Some("t1".into());
+        it.parts = vec![
+            crate::store::Part {
+                id: 1,
+                seq: 0,
+                kind: crate::store::PartKind::Text,
+                mime: "text/plain".into(),
+                text: Some("a".into()),
+                path: None,
+            },
+            crate::store::Part {
+                id: 2,
+                seq: 1,
+                kind: crate::store::PartKind::Image,
+                mime: "image/png".into(),
+                text: None,
+                path: Some("parts/1-1.png".into()),
+            },
+        ];
+        assert_eq!(run_classifier(&cfg, &it).unwrap(), Some("ok".into()));
     }
 
     #[test]

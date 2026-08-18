@@ -9,6 +9,8 @@ An inbox host. TUI and web.
 - **label** — a mark a classifier put on an item
 - **inbox** — a named question over the pile (labels + sources + sort), not an account and not a folder
 
+Items may have parts (text, file, image, audio) and an optional thread. `body` is the list preview.
+
 Inboxes nest. A child is a tighter question over its parent's matched items. Classifiers are a plugin role owned by an inbox; they run when an item enters that inbox, then children re-evaluate.
 
 A label change re-runs classify (classify-on-enter) so a newly matching child can fire. `all/todo` is the todo list — same machinery, no extra feature.

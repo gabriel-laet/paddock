@@ -809,14 +809,35 @@ fn draw_read(f: &mut ratatui::Frame, app: &App, area: Rect) {
     } else {
         it.labels.join(" ")
     };
-    let head = format!(
+    let mut head = format!(
         "{}\n{}  {}  {}\nlabels  {labels}\n",
         it.title,
         it.source_id,
         short_time(&it.created_at),
         it.href.as_deref().unwrap_or(""),
     );
-    let text = format!("{head}\n{}", it.body);
+    if let Some(th) = it.thread.as_deref().filter(|s| !s.is_empty()) {
+        let n = app
+            .store
+            .items_in_thread(th)
+            .map(|v| v.len())
+            .unwrap_or(1);
+        head.push_str(&format!("thread {th}  {n}\n"));
+    }
+    let mut text = format!("{head}\n{}", it.body);
+    let show_parts = it.parts.len() > 1
+        || it.parts.iter().any(|p| p.kind != paddock::PartKind::Text);
+    if show_parts {
+        text.push('\n');
+        for p in &it.parts {
+            text.push_str(&format!(
+                "{}  {}  {}\n",
+                p.kind.as_str(),
+                p.mime,
+                p.path.as_deref().unwrap_or(""),
+            ));
+        }
+    }
     let p = Paragraph::new(text).wrap(Wrap { trim: false }).block(
         Block::default()
             .borders(Borders::ALL)

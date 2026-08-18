@@ -1,9 +1,58 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::source::NewItem;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PartKind {
+    #[default]
+    Text,
+    File,
+    Image,
+    Audio,
+}
+
+impl PartKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::File => "file",
+            Self::Image => "image",
+            Self::Audio => "audio",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "text" => Self::Text,
+            "file" => Self::File,
+            "image" => Self::Image,
+            "audio" => Self::Audio,
+            _ => Self::File,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Part {
+    pub id: i64,
+    pub seq: i64,
+    pub kind: PartKind,
+    pub mime: String,
+    pub text: Option<String>,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NewPart {
+    pub kind: PartKind,
+    pub mime: String,
+    pub text: Option<String>,
+    pub bytes: Option<Vec<u8>>,
+    pub src: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct Item {
@@ -15,14 +64,20 @@ pub struct Item {
     pub href: Option<String>,
     pub start: Option<String>,
     pub end: Option<String>,
+    pub thread: Option<String>,
     pub created_at: String,
     pub read: bool,
     pub labels: Vec<String>,
+    pub parts: Vec<Part>,
 }
+
+const ITEM_COLS: &str =
+    "id, source_id, foreign_id, title, body, href, start, end, created_at, read, thread";
 
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
+    data_dir: PathBuf,
 }
 
 impl Store {
@@ -30,6 +85,10 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let data_dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         let conn = Connection::open(path)
             .with_context(|| format!("open {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -45,6 +104,7 @@ impl Store {
                 href TEXT,
                 start TEXT,
                 end TEXT,
+                thread TEXT,
                 created_at TEXT NOT NULL,
                 read INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(source_id, foreign_id)
@@ -55,12 +115,27 @@ impl Store {
                 PRIMARY KEY (item_id, label),
                 FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS parts (
+                id INTEGER PRIMARY KEY,
+                item_id INTEGER NOT NULL,
+                seq INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                mime TEXT NOT NULL,
+                text TEXT,
+                path TEXT,
+                FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_parts_item ON parts(item_id);
+            CREATE INDEX IF NOT EXISTS idx_items_thread ON items(thread);
             "#,
         )?;
         ensure_column(&conn, "items", "start", "TEXT")?;
         ensure_column(&conn, "items", "end", "TEXT")?;
+        ensure_column(&conn, "items", "thread", "TEXT")?;
+        backfill_parts(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            data_dir,
         })
     }
 
@@ -73,26 +148,36 @@ impl Store {
     /// Insert if new. Returns Some(id) when a row was created.
     pub fn insert_new(&self, item: &NewItem) -> Result<Option<i64>> {
         let created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let conn = self.lock()?;
-        conn.execute(
+        let body = preview_body(item);
+        let thread = trim_thread(item.thread.as_deref());
+        let to_write = parts_to_insert(item);
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT OR IGNORE INTO items
-                (source_id, foreign_id, title, body, href, start, end, created_at, read)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+                (source_id, foreign_id, title, body, href, start, end, thread, created_at, read)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
             params![
                 item.source_id,
                 item.foreign_id,
                 item.title,
-                item.body,
+                body,
                 item.href,
                 item.start,
                 item.end,
+                thread,
                 created
             ],
         )?;
-        if conn.changes() == 0 {
+        if tx.changes() == 0 {
             return Ok(None);
         }
-        Ok(Some(conn.last_insert_rowid()))
+        let id = tx.last_insert_rowid();
+        for (seq, part) in to_write.iter().enumerate() {
+            insert_part_row(&tx, &self.data_dir, id, seq as i64, part)?;
+        }
+        tx.commit()?;
+        Ok(Some(id))
     }
 
     pub fn update_body(&self, source_id: &str, foreign_id: &str, title: &str, body: &str, href: Option<&str>) -> Result<bool> {
@@ -108,36 +193,26 @@ impl Store {
     pub fn get(&self, id: i64) -> Result<Item> {
         let conn = self.lock()?;
         let mut item = conn.query_row(
-            "SELECT id, source_id, foreign_id, title, body, href, start, end, created_at, read
-             FROM items WHERE id = ?1",
+            &format!("SELECT {ITEM_COLS} FROM items WHERE id = ?1"),
             params![id],
             row_item,
         )?;
         item.labels = labels_for(&conn, id)?;
+        item.parts = parts_for(&conn, id)?;
+        ensure_text_part(&conn, &mut item)?;
         Ok(item)
     }
 
     pub fn list_all(&self) -> Result<Vec<Item>> {
         let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, source_id, foreign_id, title, body, href, start, end, created_at, read
-             FROM items ORDER BY created_at DESC, id DESC",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ITEM_COLS} FROM items ORDER BY created_at DESC, id DESC"
+        ))?;
         let mut items: Vec<Item> = stmt
             .query_map([], row_item)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut lab_stmt = conn.prepare("SELECT item_id, label FROM labels")?;
-        let labs = lab_stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
-        for row in labs {
-            let (id, label) = row?;
-            map.entry(id).or_default().push(label);
-        }
-        for item in &mut items {
-            item.labels = map.remove(&item.id).unwrap_or_default();
-        }
+        drop(stmt);
+        hydrate(&conn, &mut items)?;
         Ok(items)
     }
 
@@ -205,6 +280,157 @@ impl Store {
             .optional()?;
         Ok(id)
     }
+
+    pub fn add_part(&self, item_id: i64, part: &NewPart) -> Result<i64> {
+        let conn = self.lock()?;
+        let seq: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(seq), -1) + 1 FROM parts WHERE item_id = ?1",
+            params![item_id],
+            |row| row.get(0),
+        )?;
+        insert_part_row(&conn, &self.data_dir, item_id, seq, part)
+    }
+
+    pub fn set_thread(&self, item_id: i64, thread: Option<&str>) -> Result<()> {
+        let thread = trim_thread(thread);
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE items SET thread = ?1 WHERE id = ?2",
+            params![thread, item_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn items_in_thread(&self, thread: &str) -> Result<Vec<Item>> {
+        if thread.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ITEM_COLS} FROM items WHERE thread = ?1 ORDER BY created_at DESC, id DESC"
+        ))?;
+        let mut items: Vec<Item> = stmt
+            .query_map(params![thread], row_item)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        hydrate(&conn, &mut items)?;
+        Ok(items)
+    }
+}
+
+fn preview_body(item: &NewItem) -> String {
+    item.parts
+        .iter()
+        .find(|p| p.kind == PartKind::Text)
+        .and_then(|p| p.text.clone())
+        .unwrap_or_else(|| item.body.clone())
+}
+
+fn parts_to_insert(item: &NewItem) -> Vec<NewPart> {
+    if item.parts.is_empty() && !item.body.is_empty() {
+        vec![NewPart {
+            kind: PartKind::Text,
+            mime: "text/plain".into(),
+            text: Some(item.body.clone()),
+            bytes: None,
+            src: None,
+        }]
+    } else {
+        item.parts.clone()
+    }
+}
+
+fn trim_thread(thread: Option<&str>) -> Option<String> {
+    thread
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+fn insert_part_row(
+    conn: &Connection,
+    data_dir: &Path,
+    item_id: i64,
+    seq: i64,
+    part: &NewPart,
+) -> Result<i64> {
+    let path = materialize_part_path(data_dir, item_id, seq, part)?;
+    conn.execute(
+        "INSERT INTO parts (item_id, seq, kind, mime, text, path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            item_id,
+            seq,
+            part.kind.as_str(),
+            part.mime,
+            part.text,
+            path
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn materialize_part_path(
+    data_dir: &Path,
+    item_id: i64,
+    seq: i64,
+    part: &NewPart,
+) -> Result<Option<String>> {
+    let bytes = if let Some(b) = &part.bytes {
+        Some(b.clone())
+    } else if let Some(src) = &part.src {
+        Some(std::fs::read(src).with_context(|| format!("read part {src}"))?)
+    } else {
+        None
+    };
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    let ext = extension_for(part);
+    let dir = data_dir.join("parts");
+    std::fs::create_dir_all(&dir)?;
+    let name = format!("{item_id}-{seq}{ext}");
+    std::fs::write(dir.join(&name), bytes)?;
+    Ok(Some(format!("parts/{name}")))
+}
+
+fn extension_for(part: &NewPart) -> String {
+    if let Some(src) = &part.src {
+        if let Some(e) = Path::new(src).extension().and_then(|s| s.to_str()) {
+            if !e.is_empty() {
+                return format!(".{e}");
+            }
+        }
+    }
+    match part.kind {
+        PartKind::Image => {
+            if part.mime.contains("png") {
+                ".png".into()
+            } else if part.mime.contains("jpeg") || part.mime.contains("jpg") {
+                ".jpg".into()
+            } else if part.mime.contains("gif") {
+                ".gif".into()
+            } else if part.mime.contains("webp") {
+                ".webp".into()
+            } else {
+                ".bin".into()
+            }
+        }
+        PartKind::Audio => {
+            if part.mime.contains("mpeg") || part.mime.contains("mp3") {
+                ".mp3".into()
+            } else if part.mime.contains("wav") {
+                ".wav".into()
+            } else if part.mime.contains("ogg") {
+                ".ogg".into()
+            } else if part.mime.contains("mp4") || part.mime.contains("m4a") {
+                ".m4a".into()
+            } else {
+                ".bin".into()
+            }
+        }
+        _ => String::new(),
+    }
 }
 
 fn row_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
@@ -219,7 +445,9 @@ fn row_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
         end: row.get(7)?,
         created_at: row.get(8)?,
         read: row.get::<_, i64>(9)? != 0,
+        thread: row.get(10)?,
         labels: Vec::new(),
+        parts: Vec::new(),
     })
 }
 
@@ -231,6 +459,98 @@ fn labels_for(conn: &Connection, id: i64) -> Result<Vec<String>> {
         out.push(r?);
     }
     Ok(out)
+}
+
+fn parts_for(conn: &Connection, id: i64) -> Result<Vec<Part>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, seq, kind, mime, text, path FROM parts WHERE item_id = ?1 ORDER BY seq, id",
+    )?;
+    let rows = stmt.query_map(params![id], row_part)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+fn row_part(row: &rusqlite::Row<'_>) -> rusqlite::Result<Part> {
+    let kind: String = row.get(2)?;
+    Ok(Part {
+        id: row.get(0)?,
+        seq: row.get(1)?,
+        kind: PartKind::parse(&kind),
+        mime: row.get(3)?,
+        text: row.get(4)?,
+        path: row.get(5)?,
+    })
+}
+
+fn hydrate(conn: &Connection, items: &mut [Item]) -> Result<()> {
+    let mut lab_stmt = conn.prepare("SELECT item_id, label FROM labels")?;
+    let labs = lab_stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut lab_map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    for row in labs {
+        let (id, label) = row?;
+        lab_map.entry(id).or_default().push(label);
+    }
+    drop(lab_stmt);
+
+    let mut part_stmt = conn.prepare(
+        "SELECT id, item_id, seq, kind, mime, text, path FROM parts ORDER BY item_id, seq, id",
+    )?;
+    let part_rows = part_stmt.query_map([], |row| {
+        let item_id: i64 = row.get(1)?;
+        let kind: String = row.get(3)?;
+        Ok((
+            item_id,
+            Part {
+                id: row.get(0)?,
+                seq: row.get(2)?,
+                kind: PartKind::parse(&kind),
+                mime: row.get(4)?,
+                text: row.get(5)?,
+                path: row.get(6)?,
+            },
+        ))
+    })?;
+    let mut part_map: std::collections::HashMap<i64, Vec<Part>> = std::collections::HashMap::new();
+    for row in part_rows {
+        let (id, part) = row?;
+        part_map.entry(id).or_default().push(part);
+    }
+    drop(part_stmt);
+
+    for item in items {
+        item.labels = lab_map.remove(&item.id).unwrap_or_default();
+        item.parts = part_map.remove(&item.id).unwrap_or_default();
+    }
+    Ok(())
+}
+
+fn ensure_text_part(conn: &Connection, item: &mut Item) -> Result<()> {
+    if item.parts.is_empty() && !item.body.is_empty() {
+        conn.execute(
+            "INSERT INTO parts (item_id, seq, kind, mime, text, path)
+             VALUES (?1, 0, 'text', 'text/plain', ?2, NULL)",
+            params![item.id, item.body],
+        )?;
+        item.parts = parts_for(conn, item.id)?;
+    }
+    Ok(())
+}
+
+fn backfill_parts(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO parts (item_id, seq, kind, mime, text, path)
+         SELECT id, 0, 'text', 'text/plain', body, NULL
+         FROM items
+         WHERE body != ''
+           AND NOT EXISTS (SELECT 1 FROM parts WHERE parts.item_id = items.id)",
+        [],
+    )?;
+    Ok(())
 }
 
 fn ensure_column(conn: &Connection, table: &str, name: &str, decl: &str) -> Result<()> {

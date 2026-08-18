@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Clone)]
+use crate::store::{NewPart, PartKind};
+
+#[derive(Debug, Clone, Default)]
 pub struct NewItem {
     pub source_id: String,
     pub foreign_id: String,
@@ -11,6 +13,8 @@ pub struct NewItem {
     pub href: Option<String>,
     pub start: Option<String>,
     pub end: Option<String>,
+    pub thread: Option<String>,
+    pub parts: Vec<NewPart>,
 }
 
 /// Non-recursive. Skips dotfiles and directories.
@@ -39,8 +43,6 @@ pub fn pull_fs(source_id: &str, dir: &Path) -> Result<Vec<NewItem>> {
 }
 
 pub fn item_from_file(source_id: &str, path: &Path) -> Result<NewItem> {
-    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let body = String::from_utf8_lossy(&bytes).into_owned();
     let filename = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -49,6 +51,27 @@ pub fn item_from_file(source_id: &str, path: &Path) -> Result<NewItem> {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| filename.clone());
+    if let Some((kind, mime)) = media_kind(path) {
+        return Ok(NewItem {
+            source_id: source_id.to_string(),
+            foreign_id: filename.clone(),
+            title,
+            body: filename,
+            href: Some(path.display().to_string()),
+            start: None,
+            end: None,
+            thread: None,
+            parts: vec![NewPart {
+                kind,
+                mime: mime.to_string(),
+                text: None,
+                bytes: None,
+                src: Some(path.display().to_string()),
+            }],
+        });
+    }
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let body = String::from_utf8_lossy(&bytes).into_owned();
     Ok(NewItem {
         source_id: source_id.to_string(),
         foreign_id: filename,
@@ -57,6 +80,25 @@ pub fn item_from_file(source_id: &str, path: &Path) -> Result<NewItem> {
         href: Some(path.display().to_string()),
         start: None,
         end: None,
+        thread: None,
+        parts: Vec::new(),
+    })
+}
+
+fn media_kind(path: &Path) -> Option<(PartKind, &'static str)> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => (PartKind::Image, "image/png"),
+        "jpg" | "jpeg" => (PartKind::Image, "image/jpeg"),
+        "gif" => (PartKind::Image, "image/gif"),
+        "webp" => (PartKind::Image, "image/webp"),
+        "svg" => (PartKind::Image, "image/svg+xml"),
+        "mp3" => (PartKind::Audio, "audio/mpeg"),
+        "wav" => (PartKind::Audio, "audio/wav"),
+        "ogg" | "oga" => (PartKind::Audio, "audio/ogg"),
+        "m4a" => (PartKind::Audio, "audio/mp4"),
+        "flac" => (PartKind::Audio, "audio/flac"),
+        _ => return None,
     })
 }
 
@@ -94,6 +136,8 @@ pub fn pull_rss(source_id: &str, url: &str) -> Result<Vec<NewItem>> {
             href,
             start: None,
             end: None,
+            thread: None,
+            parts: Vec::new(),
         });
     }
     Ok(out)

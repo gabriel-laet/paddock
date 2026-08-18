@@ -326,6 +326,37 @@ fn render_item(st: &AppState, it: &Item, msg: Option<&str>) -> Html<String> {
     };
     let mark = if it.read { "unread" } else { "read" };
     let status = msg.unwrap_or("");
+    let thread_line = match it.thread.as_deref().filter(|s| !s.is_empty()) {
+        Some(th) => {
+            let n = st
+                .store
+                .items_in_thread(th)
+                .map(|v| v.len())
+                .unwrap_or(1);
+            format!(
+                "<p class=\"meta\">thread {th} · {n}</p>",
+                th = esc(th),
+            )
+        }
+        None => String::new(),
+    };
+    let show_parts = it.parts.len() > 1
+        || it.parts.iter().any(|p| p.kind != paddock::PartKind::Text);
+    let parts_html = if show_parts {
+        let mut s = String::from("<ul class=\"parts\">");
+        for p in &it.parts {
+            s.push_str(&format!(
+                "<li>{} {} {}</li>",
+                esc(p.kind.as_str()),
+                esc(&p.mime),
+                esc(p.path.as_deref().unwrap_or("")),
+            ));
+        }
+        s.push_str("</ul>");
+        s
+    } else {
+        String::new()
+    };
     page(
         &theme_of(st),
         &it.title,
@@ -334,8 +365,10 @@ fn render_item(st: &AppState, it: &Item, msg: Option<&str>) -> Html<String> {
 <p class="bar"><a href="/">← inboxes</a> · <a href="/item/{id}?toggle=1">{mark}</a></p>
 <h1>{title}</h1>
 <p class="meta">{src} · {when} · {href}</p>
+{thread_line}
 <p class="labels">labels {labels} · <a href="/item/{id}?label=later">later</a> · <a href="/item/{id}?label=todo">todo</a></p>
 <pre>{body}</pre>
+{parts_html}
 </main>
 <p class="status">{status}</p>"#,
             id = it.id,
@@ -448,6 +481,8 @@ tr.cur { background: var(--select); }
 .meta, .labels { color: var(--dim); }
 pre { white-space: pre-wrap; word-break: break-word; margin: 16px 0 0; }
 .lab { border: 1px solid var(--border); padding: 0 4px; }
+.parts { list-style: none; margin: 12px 0 0; padding: 0; color: var(--dim); }
+.parts li { padding: 2px 0; }
 .status { position: fixed; bottom: 0; left: 0; right: 0; padding: 2px 8px; color: var(--dim); background: var(--bg); }
 #cmdwrap { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg); border-top: 1px solid var(--border); padding: 4px 8px; z-index: 2; }
 #cmdwrap input { background: transparent; border: 0; color: var(--fg); font: inherit; width: 90%; outline: none; }

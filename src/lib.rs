@@ -17,7 +17,7 @@ pub use config::{expand_path, inbox_matches, ClassifierConfig, Config, InboxConf
 pub use engine::{admit, admit_file, classify_item, items_in_chain, pull_all, relabel, spawn_fs_watch, stamp, WatchGuard};
 pub use keys::{parse_colon, Verb, HELP};
 pub use source::{pull_fs, pull_rss, NewItem};
-pub use store::{Item, Store};
+pub use store::{Item, NewPart, Part, PartKind, Store};
 pub use theme::{load_theme, Theme};
 
 use anyhow::{Context, Result};
@@ -172,9 +172,11 @@ mod tests {
             href: None,
             start: None,
             end: None,
+            thread: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             read: false,
             labels: vec![],
+            parts: vec![],
         };
         assert!(inbox_matches(&ib, &item));
     }
@@ -199,9 +201,11 @@ mod tests {
             href: None,
             start: None,
             end: None,
+            thread: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             read: false,
             labels: vec![],
+            parts: vec![],
         };
         assert!(inbox_matches(&parent, &item));
         assert!(!inbox_matches(&child, &item));
@@ -227,6 +231,8 @@ mod tests {
             href: Some("/tmp/note.md".into()),
             start: None,
             end: None,
+            thread: None,
+            parts: vec![],
         };
         let a = store.insert_new(&n).unwrap();
         let b = store.insert_new(&n).unwrap();
@@ -253,9 +259,11 @@ mod tests {
             href: None,
             start: None,
             end: None,
+            thread: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             read: false,
             labels: vec![],
+            parts: vec![],
         };
         assert_eq!(run_classifier(&cfg, &item).unwrap(), Some("rfc".into()));
         let miss = Item {
@@ -279,6 +287,8 @@ mod tests {
                 href: None,
                 start: None,
                 end: None,
+                thread: None,
+                parts: vec![],
             })
             .unwrap()
             .unwrap();
@@ -330,6 +340,8 @@ path = "/tmp"
                 href: None,
                 start: None,
                 end: None,
+                thread: None,
+                parts: vec![],
             })
             .unwrap()
             .unwrap();
@@ -423,9 +435,11 @@ path = "/tmp"
             href: None,
             start: None,
             end: None,
+            thread: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             read: false,
             labels: vec!["x".into(), "y".into()],
+            parts: vec![],
         };
         assert!(!inbox_matches(&ib, &item));
         item.source_id = "a".into();
@@ -455,6 +469,8 @@ path = "/tmp"
                 href: None,
                 start: Some("2026-08-18T15:00:00Z".into()),
                 end: Some("2026-08-18T16:00:00Z".into()),
+                thread: None,
+                parts: vec![],
             })
             .unwrap()
             .unwrap();
@@ -487,9 +503,11 @@ columns = ["todo", "doing", "done"]
             href: None,
             start: None,
             end: None,
+            thread: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             read: false,
             labels: vec!["doing".into()],
+            parts: vec![],
         };
         assert_eq!(board.board_column(&item), Some("doing"));
     }
@@ -567,6 +585,188 @@ columns = ["todo", "doing", "done"]
         assert!(dir.path().join(".paddock/paddock.db").exists());
         assert!(dir.path().join(".paddock/themes/carbon.toml").exists());
         assert_eq!(paths.db_path, dir.path().join(".paddock/paddock.db"));
+    }
+
+    #[test]
+    fn insert_body_only_synthesizes_text_part() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let id = store
+            .insert_new(&NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "n.md".into(),
+                title: "note".into(),
+                body: "hello body".into(),
+                href: None,
+                start: None,
+                end: None,
+                thread: None,
+                parts: vec![],
+            })
+            .unwrap()
+            .unwrap();
+        let item = store.get(id).unwrap();
+        assert_eq!(item.body, "hello body");
+        assert_eq!(item.parts.len(), 1);
+        assert_eq!(item.parts[0].kind, PartKind::Text);
+        assert_eq!(item.parts[0].mime, "text/plain");
+        assert_eq!(item.parts[0].text.as_deref(), Some("hello body"));
+        assert!(item.parts[0].path.is_none());
+        assert!(item.thread.is_none());
+    }
+
+    #[test]
+    fn insert_image_and_text_parts() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let id = store
+            .insert_new(&NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "pic.md".into(),
+                title: "pic".into(),
+                body: "ignored".into(),
+                href: None,
+                start: None,
+                end: None,
+                thread: None,
+                parts: vec![
+                    NewPart {
+                        kind: PartKind::Image,
+                        mime: "image/png".into(),
+                        text: None,
+                        bytes: Some(vec![0x89, 0x50, 0x4e, 0x47]),
+                        src: None,
+                    },
+                    NewPart {
+                        kind: PartKind::Text,
+                        mime: "text/plain".into(),
+                        text: Some("caption".into()),
+                        bytes: None,
+                        src: None,
+                    },
+                ],
+            })
+            .unwrap()
+            .unwrap();
+        let item = store.get(id).unwrap();
+        assert_eq!(item.body, "caption");
+        assert_eq!(item.parts.len(), 2);
+        assert_eq!(item.parts[0].kind, PartKind::Image);
+        assert_eq!(item.parts[0].mime, "image/png");
+        assert!(item.parts[0]
+            .path
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("parts/"));
+        assert_eq!(item.parts[1].kind, PartKind::Text);
+        assert_eq!(item.parts[1].text.as_deref(), Some("caption"));
+        let listed = store.list_all().unwrap();
+        assert_eq!(listed[0].parts.len(), 2);
+        assert_eq!(listed[0].body, "caption");
+        let extra = store
+            .add_part(
+                id,
+                &NewPart {
+                    kind: PartKind::File,
+                    mime: "application/pdf".into(),
+                    text: None,
+                    bytes: Some(b"%PDF".to_vec()),
+                    src: None,
+                },
+            )
+            .unwrap();
+        assert!(extra > 0);
+        let item = store.get(id).unwrap();
+        assert_eq!(item.parts.len(), 3);
+        assert_eq!(item.parts[2].kind, PartKind::File);
+        assert_eq!(item.body, "caption");
+    }
+
+    #[test]
+    fn set_thread_and_items_in_thread() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let a = store
+            .insert_new(&NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "a.md".into(),
+                title: "a".into(),
+                body: "one".into(),
+                href: None,
+                start: None,
+                end: None,
+                thread: Some("conv-1".into()),
+                parts: vec![],
+            })
+            .unwrap()
+            .unwrap();
+        let b = store
+            .insert_new(&NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "b.md".into(),
+                title: "b".into(),
+                body: "two".into(),
+                href: None,
+                start: None,
+                end: None,
+                thread: None,
+                parts: vec![],
+            })
+            .unwrap()
+            .unwrap();
+        store.set_thread(b, Some("conv-1")).unwrap();
+        let c = store
+            .insert_new(&NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "c.md".into(),
+                title: "c".into(),
+                body: "other".into(),
+                href: None,
+                start: None,
+                end: None,
+                thread: Some("other".into()),
+                parts: vec![],
+            })
+            .unwrap()
+            .unwrap();
+        let got = store.items_in_thread("conv-1").unwrap();
+        let ids: Vec<i64> = got.iter().map(|i| i.id).collect();
+        assert_eq!(got.len(), 2);
+        assert!(ids.contains(&a));
+        assert!(ids.contains(&b));
+        assert!(!ids.contains(&c));
+        assert_eq!(store.get(b).unwrap().thread.as_deref(), Some("conv-1"));
+        store.set_thread(b, None).unwrap();
+        assert!(store.get(b).unwrap().thread.is_none());
+        assert_eq!(store.items_in_thread("conv-1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn backfill_parts_from_body() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let _ = Store::open(&paths.db_path).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&paths.db_path).unwrap();
+            conn.execute(
+                "INSERT INTO items (source_id, foreign_id, title, body, created_at, read)
+                 VALUES ('incoming', 'old.md', 'old', 'legacy body', '2026-01-01T00:00:00Z', 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&paths.db_path).unwrap();
+        let items = store.list_all().unwrap();
+        let item = items.iter().find(|i| i.foreign_id == "old.md").unwrap();
+        assert_eq!(item.body, "legacy body");
+        assert_eq!(item.parts.len(), 1);
+        assert_eq!(item.parts[0].kind, PartKind::Text);
+        assert_eq!(item.parts[0].text.as_deref(), Some("legacy body"));
+        let again = store.get(item.id).unwrap();
+        assert_eq!(again.parts.len(), 1);
     }
 
     static PATH_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
