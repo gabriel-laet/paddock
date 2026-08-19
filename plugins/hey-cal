@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib  # noqa: E402
+
+
+def map_event(ev: dict, calendar_id: str, calendar_name: str | None) -> dict | None:
+    if not lib.is_hey_event(ev):
+        return None
+    eid = str(lib.pick(ev, "id") or "").strip()
+    if not eid:
+        return None
+    cid = str(lib.pick(ev, "calendar_id", "calendarId") or calendar_id or "cal")
+    start = lib.event_instant(lib.pick(ev, "starts_at", "startsAt", "start"))
+    end = lib.event_instant(lib.pick(ev, "ends_at", "endsAt", "end"))
+    if not start:
+        return None
+    if not end:
+        end = start
+    title = str(lib.pick(ev, "title", "name", "summary") or "")
+    href = lib.pick(ev, "href", "url", "app_url", "appUrl")
+    item = {
+        "foreign_id": f"{cid}/{eid}",
+        "title": title,
+        "body": str(lib.pick(ev, "notes", "description", "body") or ""),
+        "start": start,
+        "end": end,
+    }
+    if href:
+        item["href"] = str(href)
+    owner = calendar_name or cid
+    item["from"] = lib.actor(str(cid), str(owner) if owner else None, "person")
+    return item
+
+
+def recordings_items(raw, calendar_id: str, calendar_name: str | None) -> list[dict]:
+    if raw == {} or raw is None:
+        return []
+    events = lib.unwrap_list(raw, "recordings", "events")
+    items: list[dict] = []
+    for ev in events:
+        if isinstance(ev, dict):
+            item = map_event(ev, calendar_id, calendar_name)
+            if item:
+                items.append(item)
+    return items
+
+
+def pull() -> None:
+    fx = lib.load_fixture()
+    if fx is not None:
+        cid = "cal"
+        cname = None
+        if isinstance(fx, dict):
+            cid = str(fx.get("calendar_id") or fx.get("calendarId") or cid)
+            cname = fx.get("calendar_name") or fx.get("name")
+            if isinstance(cname, str):
+                cname = cname.strip() or None
+            else:
+                cname = None
+        lib.emit_items(recordings_items(fx, cid, cname))
+        return
+    try:
+        raw_cals = lib.hey_run(["calendars", "--json", "--quiet"])
+    except SystemExit:
+        lib.emit_items([])
+        return
+    calendars = lib.unwrap_list(raw_cals, "calendars")
+    starts, ends = lib.today_window(30)
+    items: list[dict] = []
+    for cal in calendars:
+        if not isinstance(cal, dict):
+            continue
+        cid = lib.pick(cal, "id", "calendar_id", "calendarId")
+        if not cid:
+            continue
+        name = lib.pick(cal, "name", "title")
+        try:
+            rec = lib.hey_run(
+                [
+                    "recordings",
+                    str(cid),
+                    "--json",
+                    "--quiet",
+                    "--starts-on",
+                    starts,
+                    "--ends-on",
+                    ends,
+                ],
+                allow_fail=True,
+            )
+        except SystemExit:
+            rec = {}
+        if rec == {} or rec is None:
+            continue
+        items.extend(recordings_items(rec, str(cid), str(name) if name else None))
+    lib.emit_items(items)
+
+
+def send() -> None:
+    lib.cannot_send()
+
+
+def main() -> None:
+    v = lib.verb()
+    if v == "pull":
+        pull()
+    elif v == "send":
+        send()
+    else:
+        lib.die("usage: hey-cal pull|send")
+
+
+if __name__ == "__main__":
+    main()

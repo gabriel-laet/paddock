@@ -74,6 +74,11 @@ labels = ["later"]
 name = "todo"
 labels = ["todo"]
 
+[[inbox.inbox]]
+name = "cal"
+view = "calendar"
+timed = true
+
 [[source]]
 id = "incoming"
 kind = "fs"
@@ -83,6 +88,13 @@ path = "~/.local/share/paddock/incoming"
 # id = "feed"
 # kind = "rss"
 # url = "https://example.com/feed.xml"
+
+# [[source]]
+# id = "cli"
+# kind = "exec"
+# cmd = "my-source"
+# args = []
+# # dir = "~/.local/share/paddock"
 
 # theme = "phosphor"
 
@@ -115,11 +127,13 @@ path = "~/.local/share/paddock/incoming"
 # labels = ["todo"]
 ```
 
-An item matches an inbox when `(sources empty OR item.source in sources)` and `(labels empty OR item has ALL listed labels)`, and it matches every ancestor.
+An item matches an inbox when `(sources empty OR item.source in sources)` and `(labels empty OR item has ALL listed labels)` and (`timed` is unset/false OR the item has `start`), and it matches every ancestor.
 
 Classifier `kind`: `regex` (title or body match), `script` (Rhai; return a label, `()`, or `true` with `label =`), `llm` (Ollama `/api/chat` or OpenAI-compatible `/chat/completions`). `pull` and the fs watch call the model when an llm classifier is configured — that can be slow. Env: `PADDOCK_LLM_URL`, `PADDOCK_LLM_MODEL`, `PADDOCK_LLM_KEY` or `OPENAI_API_KEY`. Do not put real keys in the config.
 
-Inbox `view` (`list`, `calendar`, `board`) and item `start`/`end` (RFC3339) are kernel fields, not extra nouns. A calendar source can fill those times later; fs and rss leave them empty.
+Inbox `view` (`list`, `calendar`, `board`) and item `start`/`end` (RFC3339) are kernel fields, not extra nouns. `timed = true` keeps items that have `start`. An exec source can fill those times; fs and rss leave them empty.
+
+`kind = "exec"` runs `{cmd} {args...} pull` (stdout: JSON array or NDJSON items) and `{cmd} {args...} send` (stdin: JSON draft; stdout: `{ "foreign_id", start?, end? }`).
 
 Existing configs are not rewritten by `init`.
 

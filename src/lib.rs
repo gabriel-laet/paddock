@@ -19,7 +19,7 @@ pub use engine::{
     spawn_fs_watch, stamp, WatchGuard,
 };
 pub use keys::{parse_colon, Verb, HELP};
-pub use source::{pull_fs, pull_rss, Draft, NewItem};
+pub use source::{pull_exec, pull_fs, pull_rss, send_exec, Draft, NewItem, SendResult};
 pub use store::{Actor, ActorKind, Item, NewPart, Part, PartKind, Store};
 pub use theme::{load_theme, Theme};
 
@@ -80,6 +80,11 @@ labels = ["later"]
 [[inbox.inbox]]
 name = "todo"
 labels = ["todo"]
+
+[[inbox.inbox]]
+name = "cal"
+view = "calendar"
+timed = true
 
 [[source]]
 id = "incoming"
@@ -151,12 +156,16 @@ mod tests {
         assert_eq!(cfg.inbox[0].classifier.len(), 2);
         assert_eq!(cfg.inbox[0].classifier[0].id, "flag-rfc");
         assert_eq!(cfg.inbox[0].classifier[1].id, "flag-todo");
-        assert_eq!(cfg.inbox[0].inbox.len(), 2);
+        assert_eq!(cfg.inbox[0].inbox.len(), 3);
         assert_eq!(cfg.inbox[0].inbox[0].name, "later");
         assert_eq!(cfg.inbox[0].inbox[0].labels, vec!["later"]);
         assert!(cfg.inbox[0].inbox[0].classifier.is_empty());
         assert_eq!(cfg.inbox[0].inbox[1].name, "todo");
         assert_eq!(cfg.inbox[0].inbox[1].labels, vec!["todo"]);
+        assert_eq!(cfg.inbox[0].inbox[2].name, "cal");
+        assert_eq!(cfg.inbox[0].inbox[2].view_kind(), "calendar");
+        assert!(cfg.inbox[0].inbox[2].timed);
+        assert!(cfg.inbox[0].inbox[2].labels.is_empty());
         assert_eq!(cfg.source[0].kind, "fs");
     }
 
@@ -561,9 +570,15 @@ columns = ["todo", "doing", "done"]
         let toml = default_config_toml("/tmp/incoming");
         assert!(!toml.contains("kind = \"script\""));
         assert!(!toml.contains("kind = \"llm\""));
-        assert!(!toml.contains("view ="));
         let cfg: Config = toml::from_str(&toml).unwrap();
         assert_eq!(cfg.inbox[0].view_kind(), "list");
+        let cal = cfg.inbox[0]
+            .inbox
+            .iter()
+            .find(|i| i.name == "cal")
+            .expect("cal child");
+        assert_eq!(cal.view_kind(), "calendar");
+        assert!(cal.timed);
     }
 
     #[test]
@@ -1189,6 +1204,410 @@ url = "https://example.com/feed.xml"
         )
         .unwrap();
         assert_eq!(store.get(id).unwrap().foreign_id, "mid-1");
+    }
+
+    fn write_exec_helper(dir: &std::path::Path) -> std::path::PathBuf {
+        let p = dir.join("exec_helper.py");
+        fs::write(
+            &p,
+            r#"#!/usr/bin/env python3
+import json, sys
+verb = sys.argv[-1]
+if verb == "pull":
+    print(json.dumps([
+        {"foreign_id": "note-1", "title": "note", "body": "hello"},
+        {"foreign_id": "meet-1", "title": "meet", "body": "sync",
+         "start": "2026-08-18T15:00:00Z", "end": "2026-08-18T16:00:00Z"},
+    ]))
+elif verb == "send":
+    json.load(sys.stdin)
+    print(json.dumps({
+        "foreign_id": "sent-1",
+        "start": "2026-08-19T10:00:00Z",
+        "end": "2026-08-19T11:00:00Z",
+    }))
+else:
+    sys.stderr.write("unknown verb\n")
+    sys.exit(1)
+"#,
+        )
+        .unwrap();
+        p
+    }
+
+    fn exec_source_toml(helper: &std::path::Path) -> String {
+        let helper = helper.display().to_string().replace('\\', "\\\\").replace('"', "\\\"");
+        format!(
+            r#"
+[[inbox]]
+name = "all"
+
+[[inbox.inbox]]
+name = "cal"
+view = "calendar"
+timed = true
+
+[[source]]
+id = "plug"
+kind = "exec"
+cmd = "python3"
+args = ["{helper}"]
+"#
+        )
+    }
+
+    #[test]
+    fn exec_pull_admits_items_including_timed() {
+        let (tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let helper = write_exec_helper(tmp.path());
+        fs::write(&paths.config_file, exec_source_toml(&helper)).unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let n = pull_all(&store, &cfg).unwrap();
+        assert_eq!(n, 2);
+        let items = store.list_all().unwrap();
+        assert_eq!(items.len(), 2);
+        let note = items.iter().find(|i| i.foreign_id == "note-1").unwrap();
+        assert_eq!(note.source_id, "plug");
+        assert_eq!(note.title, "note");
+        assert_eq!(note.body, "hello");
+        assert!(note.start.is_none());
+        let meet = items.iter().find(|i| i.foreign_id == "meet-1").unwrap();
+        assert_eq!(meet.title, "meet");
+        assert_eq!(meet.start.as_deref(), Some("2026-08-18T15:00:00Z"));
+        assert_eq!(meet.end.as_deref(), Some("2026-08-18T16:00:00Z"));
+
+        let all = cfg.find_chain(&["all"]).unwrap();
+        assert_eq!(items_in_chain(&store, &all).unwrap().len(), 2);
+        let cal = cfg.find_chain(&["all", "cal"]).unwrap();
+        let timed = items_in_chain(&store, &cal).unwrap();
+        assert_eq!(timed.len(), 1);
+        assert_eq!(timed[0].foreign_id, "meet-1");
+    }
+
+    #[test]
+    fn exec_send_uses_returned_foreign_id() {
+        let (tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let helper = write_exec_helper(tmp.path());
+        fs::write(&paths.config_file, exec_source_toml(&helper)).unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let id = send_draft(
+            &store,
+            &cfg,
+            &paths,
+            Draft {
+                source_id: "plug".into(),
+                title: "hello".into(),
+                body: "out".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let item = store.get(id).unwrap();
+        assert_eq!(item.foreign_id, "sent-1");
+        assert_eq!(item.title, "hello");
+        assert_eq!(item.body, "out");
+        assert_eq!(item.source_id, "plug");
+        assert_eq!(item.start.as_deref(), Some("2026-08-19T10:00:00Z"));
+        assert_eq!(item.end.as_deref(), Some("2026-08-19T11:00:00Z"));
+    }
+
+    #[test]
+    fn unknown_exec_cmd_fails_cleanly() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        fs::write(
+            &paths.config_file,
+            r#"
+[[inbox]]
+name = "all"
+
+[[source]]
+id = "gone"
+kind = "exec"
+cmd = "paddock-no-such-exec-cmd"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let err = pull_all(&store, &cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot run") || msg.contains("gone") || msg.contains("paddock-no-such-exec-cmd"),
+            "{msg}"
+        );
+        let err = send_draft(
+            &store,
+            &cfg,
+            &paths,
+            Draft {
+                source_id: "gone".into(),
+                title: "x".into(),
+                body: "y".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot run") || msg.contains("gone") || msg.contains("paddock-no-such-exec-cmd"),
+            "{msg}"
+        );
+        assert!(!msg.to_lowercase().contains("panic"));
+    }
+
+    #[test]
+    fn timed_inbox_requires_start() {
+        let ib = InboxConfig {
+            name: "cal".into(),
+            timed: true,
+            ..Default::default()
+        };
+        let mut item = Item {
+            id: 1,
+            source_id: "plug".into(),
+            foreign_id: "a".into(),
+            title: "a".into(),
+            body: String::new(),
+            href: None,
+            start: None,
+            end: None,
+            thread: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            read: false,
+            labels: vec![],
+            parts: vec![],
+            ..Default::default()
+        };
+        assert!(!inbox_matches(&ib, &item));
+        item.start = Some("2026-08-18T15:00:00Z".into());
+        assert!(inbox_matches(&ib, &item));
+    }
+
+    #[test]
+    fn calendar_view_sorts_by_start() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        fs::write(
+            &paths.config_file,
+            r#"
+[[inbox]]
+name = "all"
+
+[[inbox.inbox]]
+name = "cal"
+view = "calendar"
+timed = true
+
+[[source]]
+id = "incoming"
+kind = "fs"
+path = "/tmp"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        admit(
+            &store,
+            &cfg,
+            NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "late".into(),
+                title: "late".into(),
+                body: "b".into(),
+                start: Some("2026-08-19T18:00:00Z".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        admit(
+            &store,
+            &cfg,
+            NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "early".into(),
+                title: "early".into(),
+                body: "a".into(),
+                start: Some("2026-08-19T09:00:00Z".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cal = cfg.find_chain(&["all", "cal"]).unwrap();
+        let listed = items_in_chain(&store, &cal).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].foreign_id, "early");
+        assert_eq!(listed[1].foreign_id, "late");
+    }
+
+    fn plugin_cmd(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins")
+            .join(name)
+    }
+
+    fn plugin_fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins")
+            .join("testdata")
+            .join(name)
+    }
+
+    fn exec_plugin_toml(source_id: &str, cmd: &std::path::Path) -> String {
+        let cmd = cmd
+            .display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        format!(
+            r#"
+[[inbox]]
+name = "all"
+
+[[inbox.inbox]]
+name = "cal"
+view = "calendar"
+timed = true
+
+[[source]]
+id = "{source_id}"
+kind = "exec"
+cmd = "{cmd}"
+"#
+        )
+    }
+
+    static PLUGIN_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_plugin_fixture<T>(fixture: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let _g = PLUGIN_ENV.lock().unwrap();
+        std::env::set_var("PADDOCK_PLUGIN_FIXTURE", fixture);
+        std::env::set_var("GOG_ACCOUNT", "ada@example.com");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::env::remove_var("PADDOCK_PLUGIN_FIXTURE");
+        std::env::remove_var("GOG_ACCOUNT");
+        match result {
+            Ok(v) => v,
+            Err(e) => std::panic::resume_unwind(e),
+        }
+    }
+
+    #[test]
+    fn default_init_has_no_brand_exec_sources() {
+        let toml = default_config_toml("/tmp/incoming");
+        assert!(!toml.contains("gog"));
+        assert!(!toml.contains("hey"));
+        assert!(!toml.contains("wacli"));
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        assert!(cfg.source.iter().all(|s| s.kind == "fs"));
+        assert_eq!(cfg.source.len(), 1);
+        let cal = cfg.inbox[0]
+            .inbox
+            .iter()
+            .find(|i| i.name == "cal")
+            .expect("cal child");
+        assert_eq!(cal.view_kind(), "calendar");
+        assert!(cal.timed);
+    }
+
+    #[test]
+    fn gog_cal_fixture_admits_and_calendar_inbox_sees_them() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let plugin = plugin_cmd("gog-cal");
+        fs::write(&paths.config_file, exec_plugin_toml("gog-cal", &plugin)).unwrap();
+        let fixture = plugin_fixture("gog-events.json");
+        with_plugin_fixture(&fixture, || {
+            let cfg = Config::load(&paths.config_file).unwrap();
+            let store = Store::open(&paths.db_path).unwrap();
+            let n = pull_all(&store, &cfg).unwrap();
+            assert_eq!(n, 3);
+            let items = store.list_all().unwrap();
+            assert_eq!(items.len(), 3);
+            for it in &items {
+                assert_eq!(it.source_id, "gog-cal");
+                assert!(it.start.is_some(), "start missing on {}", it.foreign_id);
+                assert!(it.end.is_some(), "end missing on {}", it.foreign_id);
+            }
+            let standup = items
+                .iter()
+                .find(|i| i.foreign_id == "ada@example.com/primary/evt-1")
+                .expect("standup");
+            assert_eq!(standup.title, "Standup");
+            assert_eq!(standup.start.as_deref(), Some("2026-08-20T10:00:00-03:00"));
+            assert_eq!(standup.end.as_deref(), Some("2026-08-20T10:30:00-03:00"));
+            let holiday = items
+                .iter()
+                .find(|i| i.foreign_id == "ada@example.com/work@example.com/evt-2")
+                .expect("all-day holiday");
+            assert_eq!(holiday.title, "Holiday");
+            assert_eq!(holiday.start.as_deref(), Some("2026-08-25"));
+            assert_eq!(holiday.end.as_deref(), Some("2026-08-26"));
+            let review = items
+                .iter()
+                .find(|i| i.foreign_id == "ada@example.com/work@example.com/evt-3")
+                .expect("design review");
+            assert_eq!(review.thread.as_deref(), Some("rec-design"));
+            assert_eq!(review.end.as_deref(), Some("2026-08-21T15:00:00-03:00"));
+
+            let all = cfg.find_chain(&["all"]).unwrap();
+            assert_eq!(items_in_chain(&store, &all).unwrap().len(), 3);
+            let cal = cfg.find_chain(&["all", "cal"]).unwrap();
+            let timed = items_in_chain(&store, &cal).unwrap();
+            assert_eq!(timed.len(), 3, "timed calendar inbox must see start+end events");
+            let cals: std::collections::HashSet<_> = items
+                .iter()
+                .map(|i| i.foreign_id.split('/').nth(1).unwrap_or(""))
+                .collect();
+            assert!(cals.contains("primary"));
+            assert!(cals.contains("work@example.com"));
+        });
+    }
+
+    #[test]
+    fn hey_cal_empty_fixture_yields_no_items() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let plugin = plugin_cmd("hey-cal");
+        fs::write(&paths.config_file, exec_plugin_toml("hey-cal", &plugin)).unwrap();
+        let fixture = plugin_fixture("hey-events-empty.json");
+        with_plugin_fixture(&fixture, || {
+            let cfg = Config::load(&paths.config_file).unwrap();
+            let store = Store::open(&paths.db_path).unwrap();
+            let n = pull_all(&store, &cfg).unwrap();
+            assert_eq!(n, 0);
+            assert!(store.list_all().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn hey_cal_event_fixture_keeps_end() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let plugin = plugin_cmd("hey-cal");
+        fs::write(&paths.config_file, exec_plugin_toml("hey-cal", &plugin)).unwrap();
+        let fixture = plugin_fixture("hey-events.json");
+        with_plugin_fixture(&fixture, || {
+            let cfg = Config::load(&paths.config_file).unwrap();
+            let store = Store::open(&paths.db_path).unwrap();
+            let n = pull_all(&store, &cfg).unwrap();
+            assert_eq!(n, 1, "only Calendar::Event, not Habit/Todo");
+            let items = store.list_all().unwrap();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].foreign_id, "cal-home/evt-1");
+            assert_eq!(items[0].title, "Dentist");
+            assert_eq!(items[0].start.as_deref(), Some("2026-08-22T13:00:00Z"));
+            assert_eq!(items[0].end.as_deref(), Some("2026-08-22T14:00:00Z"));
+            let cal = cfg.find_chain(&["all", "cal"]).unwrap();
+            let timed = items_in_chain(&store, &cal).unwrap();
+            assert_eq!(timed.len(), 1);
+            assert_eq!(timed[0].foreign_id, "cal-home/evt-1");
+        });
     }
 
     static PATH_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());

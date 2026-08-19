@@ -8,8 +8,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::classify::run_classifier;
-use crate::config::{chain_matches, expand_path, Config, InboxConfig, Paths};
-use crate::source::{item_from_file, pull_fs, pull_rss, Draft, NewItem};
+use crate::config::{chain_matches, expand_path, Config, InboxConfig, Paths, SourceConfig};
+use crate::source::{item_from_file, pull_exec, pull_fs, pull_rss, send_exec, Draft, NewItem};
 use crate::store::{Item, Store};
 
 /// Generation bump after store mutations from the watcher (TUI polls this).
@@ -113,6 +113,10 @@ pub fn pull_all(store: &Store, config: &Config) -> Result<usize> {
                     .ok_or_else(|| anyhow::anyhow!("source {} rss needs url", src.id))?;
                 pull_rss(&src.id, url)?
             }
+            "exec" => {
+                let (cmd, dir) = exec_cmd_dir(src)?;
+                pull_exec(&src.id, &cmd, &src.args, dir.as_deref())?
+            }
             other => {
                 anyhow::bail!("unknown source kind `{other}` on {}", src.id);
             }
@@ -132,10 +136,19 @@ pub fn pull_all(store: &Store, config: &Config) -> Result<usize> {
 
 pub fn items_in_chain(store: &Store, chain: &[&InboxConfig]) -> Result<Vec<Item>> {
     let all = store.list_all()?;
-    Ok(all
+    let mut items: Vec<Item> = all
         .into_iter()
         .filter(|it| chain_matches(chain, it))
-        .collect())
+        .collect();
+    if chain.last().is_some_and(|ib| ib.view_kind() == "calendar") {
+        items.sort_by(|a, b| match (&a.start, &b.start) {
+            (Some(x), Some(y)) => x.cmp(y).then_with(|| b.id.cmp(&a.id)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => b.id.cmp(&a.id),
+        });
+    }
+    Ok(items)
 }
 
 pub struct WatchGuard {
@@ -296,7 +309,23 @@ pub fn unique_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Persist a draft. The source sends if it can (`fs` writes a file; unknown admits locally).
+fn exec_cmd_dir(src: &SourceConfig) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>)> {
+    let cmd = src
+        .cmd
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("source {} exec needs cmd", src.id))?;
+    let dir = src
+        .dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(expand_path);
+    Ok((expand_path(cmd), dir))
+}
+
+/// Persist a draft. fs writes a file; exec runs the source command; rss cannot send; unknown admits locally.
 pub fn send_draft(store: &Store, config: &Config, paths: &Paths, draft: Draft) -> Result<i64> {
     let source_id = if draft.source_id.is_empty() {
         default_send_source(config)
@@ -340,6 +369,44 @@ pub fn send_draft(store: &Store, config: &Config, paths: &Paths, draft: Draft) -
             if let Some(fid) = draft.foreign_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 new.foreign_id = fid.to_string();
             }
+            Ok(admit(store, config, new)?)
+        }
+        Some("exec") => {
+            let src = config
+                .source
+                .iter()
+                .find(|s| s.id == source_id)
+                .ok_or_else(|| anyhow::anyhow!("source {source_id} not found"))?;
+            let (cmd, dir) = exec_cmd_dir(src)?;
+            let result = send_exec(
+                &source_id,
+                &cmd,
+                &src.args,
+                dir.as_deref(),
+                &draft,
+                reply_foreign.as_deref(),
+            )?;
+            let new = NewItem {
+                source_id,
+                foreign_id: result.foreign_id,
+                title: if draft.title.trim().is_empty() {
+                    "untitled".into()
+                } else {
+                    draft.title.clone()
+                },
+                body: draft.body.clone(),
+                href: None,
+                start: result.start,
+                end: result.end,
+                thread,
+                parts: draft.parts.clone(),
+                from: None,
+                to: draft.to.clone(),
+                in_reply_to: reply_foreign,
+                forward_of: None,
+                cite_excerpt: None,
+                cite_actor: None,
+            };
             Ok(admit(store, config, new)?)
         }
         _ => {

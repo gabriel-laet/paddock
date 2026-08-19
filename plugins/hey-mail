@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib  # noqa: E402
+
+
+def _topic_id(posting: dict) -> str:
+    tid = lib.pick(posting, "topic_id", "topicId")
+    if tid:
+        return str(tid)
+    return lib.topic_from_url(str(lib.pick(posting, "app_url", "appUrl", "url") or ""))
+
+
+def map_posting(posting: dict) -> dict | None:
+    topic = _topic_id(posting)
+    if not topic:
+        return None
+    title = str(lib.pick(posting, "name", "title", "subject") or "")
+    body = str(lib.pick(posting, "summary", "body") or "")
+    href = lib.pick(posting, "app_url", "appUrl", "url")
+    item = {
+        "foreign_id": topic,
+        "title": title,
+        "body": body,
+        "thread": topic,
+    }
+    if href:
+        item["href"] = str(href)
+    creator = posting.get("creator")
+    frm = lib.email_actor(creator)
+    if not frm:
+        contacts = posting.get("contacts")
+        if isinstance(contacts, list) and contacts:
+            frm = lib.email_actor(contacts[0])
+    if frm:
+        item["from"] = frm
+    to = []
+    addressed = posting.get("addressed_contacts") or posting.get("addressedContacts") or []
+    if isinstance(addressed, list):
+        for a in addressed:
+            act = lib.email_actor(a)
+            if act:
+                to.append(act)
+    if to:
+        item["to"] = to
+    return item
+
+
+def map_box(raw) -> list[dict]:
+    postings = lib.unwrap_list(raw, "postings")
+    items: list[dict] = []
+    for p in postings:
+        if isinstance(p, dict):
+            item = map_posting(p)
+            if item:
+                items.append(item)
+    return items
+
+
+def pull() -> None:
+    fx = lib.load_fixture()
+    if fx is not None:
+        lib.emit_items(map_box(fx))
+        return
+    items: list[dict] = []
+    seen: set[str] = set()
+    for box in ("imbox", "feedbox", "asidebox"):
+        try:
+            raw = lib.hey_run(["box", box, "--json", "--quiet"])
+        except SystemExit:
+            if box == "imbox":
+                raise
+            continue
+        for item in map_box(raw):
+            fid = item.get("foreign_id")
+            if fid in seen:
+                continue
+            seen.add(fid)
+            items.append(item)
+    lib.emit_items(items)
+
+
+def send() -> None:
+    draft = lib.read_draft()
+    thread = str(draft.get("thread") or "").strip()
+    reply = str(draft.get("reply_to_foreign") or "").strip()
+    topic = lib.last_id(thread) or lib.last_id(reply) or lib.topic_from_url(thread or reply)
+    body = str(draft.get("body") or "")
+    if topic:
+        raw = lib.hey_run(["reply", topic, "-m", body])
+        fid = lib.pick_foreign_id(raw) or topic
+        lib.emit_send(fid)
+        return
+    to = []
+    for a in draft.get("to") or []:
+        if isinstance(a, dict) and a.get("id"):
+            to.append(str(a["id"]))
+    args = ["compose"]
+    for t in to:
+        args.extend(["--to", t])
+    args.extend(["--subject", str(draft.get("title") or ""), "-m", body])
+    raw = lib.hey_run(args)
+    fid = lib.pick_foreign_id(raw) or "sent"
+    lib.emit_send(fid)
+
+
+def main() -> None:
+    v = lib.verb()
+    if v == "pull":
+        pull()
+    elif v == "send":
+        send()
+    else:
+        lib.die("usage: hey-mail pull|send")
+
+
+if __name__ == "__main__":
+    main()

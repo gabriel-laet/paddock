@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib  # noqa: E402
+
+
+def iter_events(raw) -> list[dict]:
+    events = lib.unwrap_list(raw, "events")
+    if events:
+        out = []
+        for ev in events:
+            if isinstance(ev, dict):
+                out.append(ev)
+        return out
+    calendars = lib.unwrap_list(raw, "calendars")
+    out: list[dict] = []
+    for cal in calendars:
+        if not isinstance(cal, dict):
+            continue
+        cid = lib.pick(cal, "id", "calendarId", "calendar_id")
+        for ev in lib.unwrap_list(cal, "events"):
+            if not isinstance(ev, dict):
+                continue
+            if cid and not lib.pick(ev, "calendarId", "calendar_id"):
+                ev = dict(ev)
+                ev["calendarId"] = cid
+            out.append(ev)
+    return out
+
+
+def map_event(ev: dict, account: str) -> dict | None:
+    eid = str(lib.pick(ev, "id", "eventId", "event_id") or "").strip()
+    if not eid:
+        return None
+    cal = str(lib.pick(ev, "calendarId", "calendar_id") or "primary")
+    start = lib.event_instant(ev.get("start") if "start" in ev else None) or lib.event_instant(
+        lib.pick(ev, "start", "startTime", "start_time")
+    )
+    end = lib.event_instant(ev.get("end") if "end" in ev else None) or lib.event_instant(
+        lib.pick(ev, "end", "endTime", "end_time")
+    )
+    if not start:
+        return None
+    if not end:
+        end = start
+    title = str(lib.pick(ev, "summary", "title") or "")
+    body = str(lib.pick(ev, "description") or lib.pick(ev, "location") or "")
+    href = lib.pick(ev, "htmlLink", "html_link", "href")
+    thread = str(lib.pick(ev, "recurringEventId", "recurring_event_id") or eid)
+    item = {
+        "foreign_id": f"{account}/{cal}/{eid}",
+        "title": title,
+        "body": body,
+        "start": start,
+        "end": end,
+        "thread": thread,
+    }
+    if href:
+        item["href"] = str(href)
+    org = lib.email_actor(ev.get("organizer") or ev.get("creator"))
+    if org:
+        item["from"] = org
+    to = []
+    attendees = ev.get("attendees")
+    if isinstance(attendees, list):
+        for a in attendees:
+            act = lib.email_actor(a)
+            if act:
+                to.append(act)
+    if to:
+        item["to"] = to
+    return item
+
+
+def pull_live_events(account: str):
+    variants = [
+        [
+            "--account",
+            account,
+            "calendar",
+            "events",
+            "--all",
+            "--from",
+            "now",
+            "--days",
+            "14",
+            "--max",
+            "50",
+            "--sort",
+            "start",
+        ],
+        [
+            "--account",
+            account,
+            "calendar",
+            "events",
+            "--all",
+            "--from",
+            "now",
+            "--days",
+            "14",
+            "--max",
+            "50",
+        ],
+        [
+            "--account",
+            account,
+            "calendar",
+            "events",
+            "--from",
+            "now",
+            "--days",
+            "14",
+            "--max",
+            "50",
+        ],
+    ]
+    last = None
+    for args in variants:
+        try:
+            return lib.gog_run(args)
+        except SystemExit as e:
+            last = e
+            continue
+    if last:
+        raise last
+    return {}
+
+
+def pull() -> None:
+    fx = lib.load_fixture()
+    items: list[dict] = []
+    if fx is not None:
+        acct = (lib.gog_accounts() or ["me"])[0]
+        for ev in iter_events(fx):
+            item = map_event(ev, acct)
+            if item:
+                items.append(item)
+    else:
+        for acct in lib.gog_accounts():
+            raw = pull_live_events(acct)
+            for ev in iter_events(raw):
+                item = map_event(ev, acct)
+                if item:
+                    items.append(item)
+    lib.emit_items(items)
+
+
+def send() -> None:
+    # Host draft has no start/end yet; creating an event without times is dishonest.
+    lib.cannot_send()
+
+
+def main() -> None:
+    v = lib.verb()
+    if v == "pull":
+        pull()
+    elif v == "send":
+        send()
+    else:
+        lib.die("usage: gog-cal pull|send")
+
+
+if __name__ == "__main__":
+    main()

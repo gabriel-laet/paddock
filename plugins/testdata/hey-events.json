@@ -1,0 +1,29 @@
+{
+  "calendar_id": "cal-home",
+  "calendar_name": "Home",
+  "recordings": [
+    {
+      "id": "evt-1",
+      "title": "Dentist",
+      "starts_at": "2026-08-22T13:00:00Z",
+      "ends_at": "2026-08-22T14:00:00Z",
+      "all_day": false,
+      "recurring": false,
+      "type": "Calendar::Event",
+      "url": "https://app.hey.com/calendar/events/evt-1"
+    },
+    {
+      "id": "habit-1",
+      "title": "Meditate",
+      "starts_at": "2026-08-22T07:00:00Z",
+      "ends_at": "2026-08-22T07:15:00Z",
+      "type": "Calendar::Habit"
+    },
+    {
+      "id": "todo-1",
+      "title": "Buy milk",
+      "starts_at": "2026-08-23",
+      "type": "Calendar::Todo"
+    }
+  ]
+}

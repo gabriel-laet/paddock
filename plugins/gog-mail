@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib  # noqa: E402
+
+
+def _map_message(msg: dict, account: str, thread_hint: str) -> dict | None:
+    mid = str(lib.pick(msg, "id", "messageId", "message_id") or "").strip()
+    tid = str(lib.pick(msg, "threadId", "thread_id", "thread") or thread_hint or "").strip()
+    if not mid and not tid:
+        return None
+    payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else {}
+    headers = lib.header_map(payload.get("headers") if payload else msg.get("headers"))
+    title = headers.get("subject") or str(lib.pick(msg, "subject", "title") or "")
+    body = str(lib.pick(msg, "snippet", "body") or "")
+    frm = lib.parse_from_header(headers.get("from")) or lib.email_actor(msg.get("from"))
+    item = {
+        "foreign_id": f"{account}/{mid or tid}",
+        "title": title,
+        "body": body,
+        "thread": tid or None,
+    }
+    if tid:
+        item["href"] = f"https://mail.google.com/mail/#all/{tid}"
+    if frm:
+        item["from"] = frm
+    return item
+
+
+def _map_thread(th: dict, account: str) -> list[dict]:
+    tid = str(lib.pick(th, "id", "threadId", "thread_id") or "").strip()
+    messages = th.get("messages")
+    out: list[dict] = []
+    if isinstance(messages, list) and messages:
+        for msg in messages:
+            if isinstance(msg, dict):
+                item = _map_message(msg, account, tid)
+                if item:
+                    out.append(item)
+        return out
+    if not tid:
+        item = _map_message(th, account, "")
+        return [item] if item else []
+    headers = {}
+    payload = th.get("payload") if isinstance(th.get("payload"), dict) else {}
+    if payload:
+        headers = lib.header_map(payload.get("headers"))
+    title = headers.get("subject") or str(lib.pick(th, "subject", "title", "snippet") or "")
+    body = str(lib.pick(th, "snippet", "body") or "")
+    frm = lib.parse_from_header(headers.get("from")) or lib.email_actor(th.get("from"))
+    item = {
+        "foreign_id": f"{account}/{tid}",
+        "title": title,
+        "body": body,
+        "thread": tid,
+        "href": f"https://mail.google.com/mail/#all/{tid}",
+    }
+    if frm:
+        item["from"] = frm
+    return [item]
+
+
+def map_search(raw, account: str) -> list[dict]:
+    threads = lib.unwrap_list(raw, "threads")
+    items: list[dict] = []
+    if threads:
+        for th in threads:
+            if isinstance(th, dict):
+                items.extend(_map_thread(th, account))
+        return items
+    messages = lib.unwrap_list(raw, "messages")
+    for msg in messages:
+        if isinstance(msg, dict):
+            item = _map_message(msg, account, "")
+            if item:
+                items.append(item)
+    return items
+
+
+def pull() -> None:
+    fx = lib.load_fixture()
+    items: list[dict] = []
+    if fx is not None:
+        acct = (lib.gog_accounts() or ["me"])[0]
+        items.extend(map_search(fx, acct))
+    else:
+        for acct in lib.gog_accounts():
+            raw = lib.gog_run(
+                [
+                    "--account",
+                    acct,
+                    "gmail",
+                    "search",
+                    "in:inbox newer_than:14d",
+                    "--max",
+                    "20",
+                ]
+            )
+            items.extend(map_search(raw, acct))
+    lib.emit_items(items)
+
+
+def send() -> None:
+    draft = lib.read_draft()
+    to = []
+    for a in draft.get("to") or []:
+        if isinstance(a, dict) and a.get("id"):
+            to.append(str(a["id"]))
+    if not to:
+        lib.die("no recipients")
+    args = ["gmail", "send", "--to", ",".join(to)]
+    args.extend(["--subject", str(draft.get("title") or "")])
+    args.extend(["--body", str(draft.get("body") or "")])
+    reply = str(draft.get("reply_to_foreign") or "").strip()
+    thread = str(draft.get("thread") or "").strip()
+    rid = lib.last_id(reply)
+    tid = lib.last_id(thread)
+    if rid:
+        args.extend(["--reply-to-message-id", rid])
+    if tid:
+        args.extend(["--thread-id", tid])
+    acct = (
+        os.environ.get("GOG_ACCOUNT", "").strip()
+        or os.environ.get("PADDOCK_GOG_ACCOUNT", "").strip()
+    )
+    if acct:
+        args = ["--account", acct] + args
+    raw = lib.gog_run(args, write=True)
+    fid = lib.pick_foreign_id(raw) or rid or tid or "sent"
+    if "@" in (acct or "") and "/" not in fid:
+        fid = f"{acct}/{fid}"
+    lib.emit_send(fid)
+
+
+def main() -> None:
+    v = lib.verb()
+    if v == "pull":
+        pull()
+    elif v == "send":
+        send()
+    else:
+        lib.die("usage: gog-mail pull|send")
+
+
+if __name__ == "__main__":
+    main()

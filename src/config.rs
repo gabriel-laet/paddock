@@ -130,6 +130,9 @@ pub struct InboxConfig {
     /// Board columns (label names). Ignored unless view = "board".
     #[serde(default)]
     pub columns: Vec<String>,
+    /// If true, match only items that have `start` set.
+    #[serde(default)]
+    pub timed: bool,
     #[serde(default)]
     pub classifier: Vec<ClassifierConfig>,
     #[serde(default)]
@@ -191,6 +194,15 @@ pub struct SourceConfig {
     pub path: Option<String>,
     #[serde(default)]
     pub url: Option<String>,
+    /// Command for kind = "exec".
+    #[serde(default)]
+    pub cmd: Option<String>,
+    /// Extra args before the verb (`pull` / `send`).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Working directory for kind = "exec".
+    #[serde(default)]
+    pub dir: Option<String>,
 }
 
 impl Config {
@@ -256,13 +268,15 @@ fn find_chain<'a>(inboxes: &'a [InboxConfig], path: &[&str]) -> Option<Vec<&'a I
 }
 
 /// Item matches an inbox if (sources empty OR source in list)
-/// AND (labels empty OR item has ALL listed labels).
+/// AND (labels empty OR item has ALL listed labels)
+/// AND (not timed OR item.start is set).
 pub fn inbox_matches(inbox: &InboxConfig, item: &Item) -> bool {
     let source_ok =
         inbox.sources.is_empty() || inbox.sources.iter().any(|s| s == &item.source_id);
     let labels_ok = inbox.labels.is_empty()
         || inbox.labels.iter().all(|l| item.labels.iter().any(|x| x == l));
-    source_ok && labels_ok
+    let timed_ok = !inbox.timed || item.start.is_some();
+    source_ok && labels_ok && timed_ok
 }
 
 pub fn chain_matches(chain: &[&InboxConfig], item: &Item) -> bool {

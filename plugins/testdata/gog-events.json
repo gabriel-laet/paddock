@@ -1,0 +1,43 @@
+{
+  "account": "ada@example.com",
+  "events": [
+    {
+      "id": "evt-1",
+      "summary": "Standup",
+      "description": "Daily sync",
+      "location": "Zoom",
+      "start": { "dateTime": "2026-08-20T10:00:00-03:00" },
+      "end": { "dateTime": "2026-08-20T10:30:00-03:00" },
+      "organizer": { "email": "ada@example.com", "displayName": "Ada" },
+      "attendees": [
+        { "email": "bob@example.com", "displayName": "Bob" }
+      ],
+      "htmlLink": "https://calendar.google.com/calendar/event?eid=evt-1",
+      "calendarId": "primary"
+    },
+    {
+      "id": "evt-2",
+      "summary": "Holiday",
+      "description": "Office closed",
+      "start": { "date": "2026-08-25" },
+      "end": { "date": "2026-08-26" },
+      "organizer": { "email": "ada@example.com" },
+      "calendarId": "work@example.com"
+    },
+    {
+      "id": "evt-3",
+      "summary": "Design review",
+      "description": "Review the new inbox view",
+      "start": { "dateTime": "2026-08-21T14:00:00-03:00" },
+      "end": { "dateTime": "2026-08-21T15:00:00-03:00" },
+      "htmlLink": "https://calendar.google.com/calendar/event?eid=evt-3",
+      "recurringEventId": "rec-design",
+      "calendarId": "work@example.com",
+      "organizer": { "email": "cara@example.com", "displayName": "Cara" },
+      "attendees": [
+        { "email": "ada@example.com", "displayName": "Ada" },
+        { "email": "bob@example.com" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib  # noqa: E402
+
+CHAT_LIMIT = 15
+MSG_LIMIT = 15
+
+
+def _chat_kind(chat: dict | None, jid: str) -> str:
+    kind = ""
+    if isinstance(chat, dict):
+        kind = str(lib.pick(chat, "kind", "type") or "").lower()
+    if kind == "group" or "@g.us" in jid:
+        return "group"
+    return "person"
+
+
+def map_message(msg: dict, chat: dict | None) -> dict | None:
+    if not isinstance(msg, dict):
+        return None
+    chat_jid = str(
+        lib.pick(msg, "ChatJID", "chat_jid", "chatJid", "jid")
+        or (lib.pick(chat, "jid") if chat else "")
+        or ""
+    ).strip()
+    mid = str(lib.pick(msg, "MsgID", "msg_id", "msgId", "id") or "").strip()
+    if not chat_jid or not mid:
+        return None
+    chat_name = lib.pick(msg, "ChatName", "chat_name", "chatName") or (
+        lib.pick(chat, "name") if chat else None
+    )
+    sender_jid = str(lib.pick(msg, "SenderJID", "sender_jid", "senderJid", "from") or "").strip()
+    sender_name = lib.pick(msg, "SenderName", "sender_name", "senderName")
+    title = str(chat_name or sender_name or chat_jid)
+    body = str(lib.pick(msg, "DisplayText", "display_text", "displayText", "Text", "text") or "")
+    kind = _chat_kind(chat, chat_jid)
+    item = {
+        "foreign_id": f"{chat_jid}/{mid}",
+        "title": title,
+        "body": body,
+        "thread": chat_jid,
+    }
+    if sender_jid:
+        item["from"] = lib.actor(sender_jid, str(sender_name) if sender_name else None, kind)
+    if kind == "group":
+        item["to"] = [lib.actor(chat_jid, str(chat_name) if chat_name else None, "group")]
+    quoted = lib.pick(
+        msg,
+        "quoted_msg_id",
+        "QuotedMsgID",
+        "quotedMsgId",
+        "quoted_id",
+        "QuotedID",
+    )
+    if quoted:
+        q = str(quoted)
+        item["in_reply_to"] = q if "/" in q else f"{chat_jid}/{q}"
+    path = lib.pick(msg, "LocalPath", "local_path", "localPath")
+    if path:
+        mime = lib.pick(msg, "MimeType", "mime_type", "mimeType")
+        media = lib.pick(msg, "MediaType", "media_type", "mediaType")
+        filename = lib.pick(msg, "Filename", "filename", "file_name")
+        item["parts"] = [lib.media_part(str(path), mime, media, filename)]
+    return item
+
+
+def map_messages(raw, chat: dict | None) -> list[dict]:
+    rows = raw
+    if isinstance(raw, dict):
+        rows = lib.unwrap_list(raw, "messages")
+    if not isinstance(rows, list):
+        rows = []
+    items: list[dict] = []
+    for msg in rows:
+        item = map_message(msg, chat)
+        if item:
+            items.append(item)
+    return items
+
+
+def pull() -> None:
+    fx = lib.load_fixture()
+    if fx is not None:
+        chats = {
+            str(c.get("jid") or c.get("JID") or ""): c
+            for c in lib.unwrap_list(fx, "chats")
+            if isinstance(c, dict)
+        }
+        msgs = lib.unwrap_list(fx, "messages")
+        if msgs:
+            items: list[dict] = []
+            for msg in msgs:
+                if not isinstance(msg, dict):
+                    continue
+                jid = str(lib.pick(msg, "ChatJID", "chat_jid", "jid") or "")
+                item = map_message(msg, chats.get(jid))
+                if item:
+                    items.append(item)
+            lib.emit_items(items)
+            return
+        lib.emit_items(map_messages(fx, None))
+        return
+    chats_raw = lib.wacli_run(
+        ["--json", "--read-only", "chats", "list", "--limit", "30", "--no-archived"]
+    )
+    chats = lib.unwrap_list(chats_raw, "chats")
+    if not chats and isinstance(chats_raw, list):
+        chats = chats_raw
+    items: list[dict] = []
+    for chat in chats[:CHAT_LIMIT]:
+        if not isinstance(chat, dict):
+            continue
+        jid = lib.pick(chat, "jid", "JID")
+        if not jid:
+            continue
+        msgs = lib.wacli_run(
+            [
+                "--json",
+                "--read-only",
+                "messages",
+                "list",
+                "--chat",
+                str(jid),
+                "--limit",
+                str(MSG_LIMIT),
+            ],
+            allow_fail=True,
+        )
+        items.extend(map_messages(msgs, chat))
+    lib.emit_items(items)
+
+
+def send() -> None:
+    draft = lib.read_draft()
+    to = None
+    tos = draft.get("to") or []
+    if tos and isinstance(tos[0], dict):
+        to = tos[0].get("id")
+    to = to or draft.get("thread")
+    if not to:
+        lib.die("no chat jid")
+    args = ["send", "text", "--to", str(to), "--message", str(draft.get("body") or ""), "--json"]
+    reply = str(draft.get("reply_to_foreign") or "").strip()
+    if reply:
+        args.extend(["--reply-to", lib.last_id(reply)])
+    raw = lib.wacli_run(args)
+    fid = lib.pick_foreign_id(raw)
+    if not fid:
+        fid = "sent"
+    elif "/" not in fid:
+        fid = f"{to}/{fid}"
+    lib.emit_send(fid)
+
+
+def main() -> None:
+    v = lib.verb()
+    if v == "pull":
+        pull()
+    elif v == "send":
+        send()
+    else:
+        lib.die("usage: wacli pull|send")
+
+
+if __name__ == "__main__":
+    main()
