@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -120,6 +121,31 @@ pub struct Item {
 const ITEM_COLS: &str =
     "id, source_id, foreign_id, title, body, href, start, end, created_at, read, thread,      from_id, from_name, from_kind, in_reply_to, forward_of, cite_excerpt,      cite_actor_id, cite_actor_name, cite_actor_kind";
 
+/// SQL filter for inbox queries. Do not import InboxConfig here.
+#[derive(Debug, Clone, Default)]
+pub struct ItemFilter {
+    /// None = any source; Some(empty) = match nothing.
+    pub sources: Option<Vec<String>>,
+    /// Item must have ALL of these labels.
+    pub labels: Vec<String>,
+    /// start IS NOT NULL AND start != ''
+    pub timed: bool,
+    pub unread_only: bool,
+    /// Else created_at DESC, id DESC.
+    pub order_by_start: bool,
+}
+
+/// Thin row for stale cleanup (no body, parts, or actors).
+#[derive(Debug, Clone)]
+pub struct StaleHint {
+    pub id: i64,
+    pub source_id: String,
+    pub created_at: String,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub labels: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -200,7 +226,9 @@ impl Store {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_items_thread ON items(thread);
              CREATE INDEX IF NOT EXISTS idx_items_reply_foreign ON items(source_id, in_reply_to_foreign);
-             CREATE INDEX IF NOT EXISTS idx_items_fwd_foreign ON items(source_id, forward_of_foreign);",
+             CREATE INDEX IF NOT EXISTS idx_items_fwd_foreign ON items(source_id, forward_of_foreign);
+             CREATE INDEX IF NOT EXISTS idx_items_start ON items(start);
+             CREATE INDEX IF NOT EXISTS idx_items_created ON items(created_at);",
         )?;
         backfill_parts(&conn)?;
         Ok(Self {
@@ -379,16 +407,113 @@ impl Store {
     }
 
     pub fn list_all(&self) -> Result<Vec<Item>> {
+        self.list_filtered(&ItemFilter::default())
+    }
+
+    /// id + times + labels only. For forget_stale.
+    pub fn list_stale_hints(&self) -> Result<Vec<StaleHint>> {
         let conn = self.lock()?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {ITEM_COLS} FROM items ORDER BY created_at DESC, id DESC"
-        ))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, source_id, created_at, start, end FROM items",
+        )?;
+        let mut hints: Vec<StaleHint> = stmt
+            .query_map([], |row| {
+                Ok(StaleHint {
+                    id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    created_at: row.get(2)?,
+                    start: row.get(3)?,
+                    end: row.get(4)?,
+                    labels: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let mut lab_stmt = conn.prepare("SELECT item_id, label FROM labels")?;
+        let labs = lab_stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+        let mut map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+        for row in labs {
+            let (id, label) = row?;
+            map.entry(id).or_default().push(label);
+        }
+        for h in &mut hints {
+            h.labels = map.remove(&h.id).unwrap_or_default();
+        }
+        Ok(hints)
+    }
+
+    pub fn list_filtered(&self, filter: &ItemFilter) -> Result<Vec<Item>> {
+        let (where_sql, params) = filter_where(filter);
+        let order = filter_order(filter);
+        let conn = self.lock()?;
+        let sql = format!("SELECT {ITEM_COLS} FROM items {where_sql} {order}");
+        let mut stmt = conn.prepare(&sql)?;
         let mut items: Vec<Item> = stmt
-            .query_map([], row_item)?
+            .query_map(params_from_iter(params), row_item)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         hydrate(&conn, &mut items)?;
         Ok(items)
+    }
+
+    pub fn count_filtered(&self, filter: &ItemFilter) -> Result<usize> {
+        let (where_sql, params) = filter_where(filter);
+        let conn = self.lock()?;
+        let sql = format!("SELECT COUNT(*) FROM items {where_sql}");
+        let n: i64 = conn.query_row(&sql, params_from_iter(params), |row| row.get(0))?;
+        Ok(n as usize)
+    }
+
+    pub fn counts_by_source(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT source_id, COUNT(*) FROM items GROUP BY source_id ORDER BY source_id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn count_timed(&self) -> Result<i64> {
+        let conn = self.lock()?;
+        let n = conn.query_row(
+            "SELECT COUNT(*) FROM items WHERE start IS NOT NULL AND start != ''",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(n)
+    }
+
+    pub fn count_all(&self) -> Result<i64> {
+        let conn = self.lock()?;
+        let n = conn.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))?;
+        Ok(n)
+    }
+
+    /// Delete the item and its files under data_dir. FK cascade labels/parts/item_to.
+    pub fn delete(&self, id: i64) -> Result<bool> {
+        let conn = self.lock()?;
+        let exists: Option<i64> = conn
+            .query_row("SELECT id FROM items WHERE id = ?1", params![id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if exists.is_none() {
+            return Ok(false);
+        }
+        let parts = parts_for(&conn, id)?;
+        for part in &parts {
+            if let Some(abs) = self.part_abs_path(part) {
+                if path_under_dir(&abs, &self.data_dir) {
+                    let _ = std::fs::remove_file(&abs);
+                }
+            }
+        }
+        conn.execute("DELETE FROM items WHERE id = ?1", params![id])?;
+        Ok(conn.changes() > 0)
     }
 
     pub fn set_read(&self, id: i64, read: bool) -> Result<()> {
@@ -768,9 +893,69 @@ fn row_part(row: &rusqlite::Row<'_>) -> rusqlite::Result<Part> {
     })
 }
 
+fn filter_where(filter: &ItemFilter) -> (String, Vec<Value>) {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<Value> = Vec::new();
+    match &filter.sources {
+        None => {}
+        Some(srcs) if srcs.is_empty() => {
+            clauses.push("1 = 0".into());
+        }
+        Some(srcs) => {
+            let marks: Vec<&str> = srcs.iter().map(|_| "?").collect();
+            clauses.push(format!("source_id IN ({})", marks.join(", ")));
+            for s in srcs {
+                params.push(Value::Text(s.clone()));
+            }
+        }
+    }
+    for label in &filter.labels {
+        clauses.push(
+            "EXISTS (SELECT 1 FROM labels WHERE labels.item_id = items.id AND labels.label = ?)"
+                .into(),
+        );
+        params.push(Value::Text(label.clone()));
+    }
+    if filter.timed {
+        clauses.push("start IS NOT NULL AND start != ''".into());
+    }
+    if filter.unread_only {
+        clauses.push("read = 0".into());
+    }
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", clauses.join(" AND "))
+    };
+    (where_sql, params)
+}
+
+fn filter_order(filter: &ItemFilter) -> &'static str {
+    if filter.order_by_start {
+        "ORDER BY CASE WHEN start IS NULL OR start = '' THEN 1 ELSE 0 END, start ASC, id DESC"
+    } else {
+        "ORDER BY created_at DESC, id DESC"
+    }
+}
+
+fn path_under_dir(path: &Path, dir: &Path) -> bool {
+    let dir_c = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let path_c = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    path_c.starts_with(&dir_c)
+}
+
 fn hydrate(conn: &Connection, items: &mut [Item]) -> Result<()> {
-    let mut lab_stmt = conn.prepare("SELECT item_id, label FROM labels")?;
-    let labs = lab_stmt.query_map([], |row| {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<Value> = items.iter().map(|i| Value::Integer(i.id)).collect();
+    let marks: Vec<&str> = ids.iter().map(|_| "?").collect();
+    let in_list = marks.join(", ");
+
+    let mut lab_stmt = conn.prepare(&format!(
+        "SELECT item_id, label FROM labels WHERE item_id IN ({in_list})"
+    ))?;
+    let labs = lab_stmt.query_map(params_from_iter(ids.iter().cloned()), |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
     })?;
     let mut lab_map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
@@ -780,10 +965,10 @@ fn hydrate(conn: &Connection, items: &mut [Item]) -> Result<()> {
     }
     drop(lab_stmt);
 
-    let mut part_stmt = conn.prepare(
-        "SELECT id, item_id, seq, kind, mime, text, path FROM parts ORDER BY item_id, seq, id",
-    )?;
-    let part_rows = part_stmt.query_map([], |row| {
+    let mut part_stmt = conn.prepare(&format!(
+        "SELECT id, item_id, seq, kind, mime, text, path FROM parts WHERE item_id IN ({in_list}) ORDER BY item_id, seq, id"
+    ))?;
+    let part_rows = part_stmt.query_map(params_from_iter(ids.iter().cloned()), |row| {
         let item_id: i64 = row.get(1)?;
         let kind: String = row.get(3)?;
         Ok((
@@ -805,8 +990,10 @@ fn hydrate(conn: &Connection, items: &mut [Item]) -> Result<()> {
     }
     drop(part_stmt);
 
-    let mut to_stmt = conn.prepare("SELECT item_id, actor_id, name, kind FROM item_to")?;
-    let to_rows = to_stmt.query_map([], |row| {
+    let mut to_stmt = conn.prepare(&format!(
+        "SELECT item_id, actor_id, name, kind FROM item_to WHERE item_id IN ({in_list})"
+    ))?;
+    let to_rows = to_stmt.query_map(params_from_iter(ids.iter().cloned()), |row| {
         Ok((
             row.get::<_, i64>(0)?,
             Actor {

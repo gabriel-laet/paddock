@@ -7,8 +7,9 @@ use std::process::Command;
 
 use crate::config::{Config, Paths};
 use crate::engine::{
-    admit_file, classify_item, default_send_source, items_in_chain, pull_all, relabel,
-    reply_title, send_draft, source_can_send, stamp, unique_path,
+    admit_file, classify_item, default_send_source, filter_for_chain, forget, forget_stale,
+    items_in_chain, pull_all, relabel, reply_title, send_draft, source_can_send, stamp,
+    unique_path,
 };
 use crate::keys::{Verb, HELP};
 use crate::source::Draft;
@@ -67,11 +68,20 @@ pub fn run_verb(
         }),
         Verb::Pull => {
             let n = pull_all(store, config)?;
+            let f = forget_stale(store, config)?;
             Ok(Outcome {
-                status: format!("admitted {n}"),
+                status: format!("admitted {n}, forgot {f}"),
                 reload_config: true,
                 ..Outcome::default()
             })
+        }
+        Verb::Forget => {
+            let item = match need_item(store, ctx)? {
+                Ok(i) => i,
+                Err(o) => return Ok(o),
+            };
+            let gone = forget(store, item.id)?;
+            Ok(ok_status(if gone { "forgot" } else { "no item" }))
         }
         Verb::ToggleRead => {
             let item = match need_item(store, ctx)? {
@@ -247,8 +257,11 @@ pub fn run_verb(
             let refs: Vec<&str> = ctx.inbox_path.iter().map(|s| s.as_str()).collect();
             let (unread, total) = match config.find_chain(&refs) {
                 Some(chain) => {
-                    let items = items_in_chain(store, &chain).unwrap_or_default();
-                    (items.iter().filter(|i| !i.read).count(), items.len())
+                    let mut filter = filter_for_chain(&chain);
+                    let total = store.count_filtered(&filter).unwrap_or(0);
+                    filter.unread_only = true;
+                    let unread = store.count_filtered(&filter).unwrap_or(0);
+                    (unread, total)
                 }
                 None => (0, 0),
             };

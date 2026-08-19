@@ -3,7 +3,7 @@ mod web;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use paddock::{init, load_or_init, pull_all, resolve_remote, shell_quote, write_context, Config, Paths};
+use paddock::{forget_stale, init, load_or_init, pull_all, resolve_remote, shell_quote, write_context, Config, Paths};
 use std::process::{Command, Stdio};
 
 #[derive(Parser)]
@@ -77,7 +77,8 @@ fn main() -> Result<()> {
         Some(Cmd::Pull) => {
             let (config, store) = load_or_init(&paths)?;
             let n = pull_all(&store, &config)?;
-            println!("admitted {n}");
+            let f = forget_stale(&store, &config)?;
+            println!("admitted {n}, forgot {f}");
         }
         Some(Cmd::Serve { bind }) => {
             load_or_init(&paths)?;

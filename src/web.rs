@@ -8,7 +8,7 @@ use paddock::cmd::{run_verb, VerbCtx};
 use paddock::keys::{bindings_json, Verb};
 use paddock::theme::{load_theme, Theme};
 use paddock::{
-    items_in_chain, load_or_init, pull_all, relabel, spawn_fs_watch, Config, Item, PartKind, Paths,
+    forget_stale, items_in_chain, load_or_init, pull_all, relabel, spawn_fs_watch, Config, Item, PartKind, Paths,
     Store,
 };
 use serde::Deserialize;
@@ -174,6 +174,7 @@ async fn inbox_page(
     let cfg = Config::load(&st.paths.config_file).map_err(|e| html_err(&st, &e.to_string()))?;
     if q.pull.is_some() {
         let _ = pull_all(&st.store, &cfg);
+        let _ = forget_stale(&st.store, &cfg);
         return Ok(Redirect::to(&here));
     }
     if let Some(id) = q.toggle {

@@ -17,14 +17,14 @@ pub use classify::{build_classifier, Classifier, LlmClassifier, RegexClassifier,
 pub use context::write_context;
 pub use remote::{remote_argv, resolve_remote, shell_quote};
 pub use cmd::{run_verb, Outcome, VerbCtx};
-pub use config::{expand_path, inbox_matches, ClassifierConfig, Config, InboxConfig, Paths, SourceConfig, TreeNode};
+pub use config::{chain_matches, expand_path, inbox_matches, ClassifierConfig, Config, InboxConfig, Paths, SourceConfig, TreeNode};
 pub use engine::{
-    admit, admit_file, classify_item, items_in_chain, pull_all, relabel, reply_title, send_draft,
-    spawn_fs_watch, stamp, WatchGuard,
+    admit, admit_file, classify_item, filter_for_chain, forget, forget_stale, items_in_chain,
+    pull_all, relabel, reply_title, send_draft, spawn_fs_watch, stamp, WatchGuard,
 };
 pub use keys::{parse_colon, Verb, HELP};
 pub use source::{pull_exec, pull_fs, pull_rss, send_exec, Draft, NewItem, SendResult};
-pub use store::{Actor, ActorKind, Item, NewPart, Part, PartKind, Store};
+pub use store::{Actor, ActorKind, Item, ItemFilter, NewPart, Part, PartKind, Store};
 pub use theme::{load_theme, Theme};
 
 use anyhow::{Context, Result};
@@ -61,6 +61,9 @@ pub fn default_config_toml(incoming: &str) -> String {
         r#"# paddock — inboxes nest. a child is a tighter question over its parent.
 # classifiers belong to an inbox and run when an item enters it.
 # a label change re-runs classify so children can fire (classify-on-enter).
+
+keep = ["todo", "later"]
+# forget_after = "30d"   # optional host default for untimed
 
 [[inbox]]
 name = "all"
@@ -1643,6 +1646,249 @@ cmd = "{cmd}"
         assert!(s.contains("total 1"), "missing total: {s}");
         assert!(s.contains("timed"), "missing timed");
         assert!(!s.contains("mailbox"), "mailbox leaked");
+    }
+
+    #[test]
+    fn forget_deletes_the_row() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let id = store
+            .insert_new(&NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "gone.md".into(),
+                title: "gone".into(),
+                body: "bye".into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert!(forget(&store, id).unwrap());
+        assert!(store.list_all().unwrap().is_empty());
+        assert!(!forget(&store, id).unwrap());
+    }
+
+    fn yesterday() -> String {
+        (chrono::Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    #[test]
+    fn forget_stale_drops_past_timed() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let y = yesterday();
+        admit(
+            &store,
+            &cfg,
+            NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "old-meet".into(),
+                title: "old meet".into(),
+                body: "done".into(),
+                start: Some(y.clone()),
+                end: Some(y),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let n = forget_stale(&store, &cfg).unwrap();
+        assert_eq!(n, 1);
+        assert!(store.list_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn forget_stale_keeps_past_timed_todo() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let y = yesterday();
+        let id = admit(
+            &store,
+            &cfg,
+            NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "keep-meet".into(),
+                title: "keep meet".into(),
+                body: "still".into(),
+                start: Some(y.clone()),
+                end: Some(y),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store.add_label(id, "todo").unwrap();
+        let n = forget_stale(&store, &cfg).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(store.list_all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn forget_stale_keeps_untimed_when_forget_after_unset() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        admit(
+            &store,
+            &cfg,
+            NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "note.md".into(),
+                title: "note".into(),
+                body: "stay".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let n = forget_stale(&store, &cfg).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(store.list_all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn forget_stale_drops_untimed_when_forget_after_1d() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        fs::write(
+            &paths.config_file,
+            r#"
+keep = ["todo", "later"]
+forget_after = "1d"
+
+[[inbox]]
+name = "all"
+
+[[source]]
+id = "incoming"
+kind = "fs"
+path = "/tmp"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let id = store
+            .insert_new(&NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "old.md".into(),
+                title: "old".into(),
+                body: "aged".into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::days(3))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        {
+            let conn = rusqlite::Connection::open(&paths.db_path).unwrap();
+            conn.execute(
+                "UPDATE items SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![old, id],
+            )
+            .unwrap();
+        }
+        let n = forget_stale(&store, &cfg).unwrap();
+        assert_eq!(n, 1);
+        assert!(store.list_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn forget_stale_source_forget_after_overrides_host() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        fs::write(
+            &paths.config_file,
+            r#"
+keep = ["todo", "later"]
+forget_after = "1d"
+
+[[inbox]]
+name = "all"
+
+[[source]]
+id = "incoming"
+kind = "fs"
+path = "/tmp"
+forget_after = "30d"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let id = store
+            .insert_new(&NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "mid.md".into(),
+                title: "mid".into(),
+                body: "source window".into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::days(3))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        {
+            let conn = rusqlite::Connection::open(&paths.db_path).unwrap();
+            conn.execute(
+                "UPDATE items SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![old, id],
+            )
+            .unwrap();
+        }
+        let n = forget_stale(&store, &cfg).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(store.list_all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn items_in_chain_cal_still_only_timed() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        admit(
+            &store,
+            &cfg,
+            NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "note".into(),
+                title: "note".into(),
+                body: "plain".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        admit(
+            &store,
+            &cfg,
+            NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "meet".into(),
+                title: "meet".into(),
+                body: "sync".into(),
+                start: Some("2026-08-19T12:00:00Z".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let all = cfg.find_chain(&["all"]).unwrap();
+        assert_eq!(items_in_chain(&store, &all).unwrap().len(), 2);
+        let cal = cfg.find_chain(&["all", "cal"]).unwrap();
+        let timed = items_in_chain(&store, &cal).unwrap();
+        assert_eq!(timed.len(), 1);
+        assert_eq!(timed[0].foreign_id, "meet");
+        assert_eq!(store.count_timed().unwrap(), 1);
+        assert_eq!(store.count_all().unwrap(), 2);
+    }
+
+    #[test]
+    fn parse_colon_forget_is_forget() {
+        assert_eq!(parse_colon("forget"), Ok(Verb::Forget));
     }
 
     static PATH_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());

@@ -8,9 +8,9 @@ use std::thread;
 use std::time::Duration;
 
 use crate::classify::run_classifier;
-use crate::config::{chain_matches, expand_path, Config, InboxConfig, Paths, SourceConfig};
+use crate::config::{expand_path, Config, InboxConfig, Paths, SourceConfig};
 use crate::source::{item_from_file, pull_exec, pull_fs, pull_rss, send_exec, Draft, NewItem};
-use crate::store::{Item, Store};
+use crate::store::{Item, ItemFilter, StaleHint, Store};
 
 /// Generation bump after store mutations from the watcher (TUI polls this).
 pub static GEN: AtomicU64 = AtomicU64::new(0);
@@ -135,20 +135,120 @@ pub fn pull_all(store: &Store, config: &Config) -> Result<usize> {
 }
 
 pub fn items_in_chain(store: &Store, chain: &[&InboxConfig]) -> Result<Vec<Item>> {
-    let all = store.list_all()?;
-    let mut items: Vec<Item> = all
-        .into_iter()
-        .filter(|it| chain_matches(chain, it))
-        .collect();
-    if chain.last().is_some_and(|ib| ib.view_kind() == "calendar") {
-        items.sort_by(|a, b| match (&a.start, &b.start) {
-            (Some(x), Some(y)) => x.cmp(y).then_with(|| b.id.cmp(&a.id)),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => b.id.cmp(&a.id),
-        });
+    store.list_filtered(&filter_for_chain(chain))
+}
+
+/// AND each inbox in the chain into one SQL filter.
+pub fn filter_for_chain(chain: &[&InboxConfig]) -> ItemFilter {
+    let mut sources: Option<Vec<String>> = None;
+    let mut labels = Vec::new();
+    let mut timed = false;
+    for ib in chain {
+        if !ib.sources.is_empty() {
+            sources = Some(match sources.take() {
+                None => ib.sources.clone(),
+                Some(existing) => existing
+                    .into_iter()
+                    .filter(|s| ib.sources.iter().any(|x| x == s))
+                    .collect(),
+            });
+        }
+        labels.extend(ib.labels.iter().cloned());
+        if ib.timed {
+            timed = true;
+        }
     }
-    Ok(items)
+    ItemFilter {
+        sources,
+        labels,
+        timed,
+        unread_only: false,
+        order_by_start: chain.last().is_some_and(|ib| ib.view_kind() == "calendar"),
+    }
+}
+
+/// Always deletes the item (user asked to forget it).
+pub fn forget(store: &Store, id: i64) -> Result<bool> {
+    let gone = store.delete(id)?;
+    if gone {
+        bump();
+    }
+    Ok(gone)
+}
+
+/// Drop stale items. Keep-labels never auto-forget.
+pub fn forget_stale(store: &Store, config: &Config) -> Result<usize> {
+    let keep = keep_labels(config);
+    let hints = store.list_stale_hints()?;
+    let mut n = 0usize;
+    let now = chrono::Utc::now();
+    for item in hints {
+        if item.labels.iter().any(|l| keep.iter().any(|k| k == l)) {
+            continue;
+        }
+        if should_forget_stale(&item, config, now) && forget(store, item.id)? {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+fn keep_labels(config: &Config) -> Vec<String> {
+    if config.keep.is_empty() {
+        vec!["todo".into(), "later".into()]
+    } else {
+        config.keep.clone()
+    }
+}
+
+fn should_forget_stale(item: &StaleHint, config: &Config, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let timed = nonempty(item.start.as_deref()).is_some() || nonempty(item.end.as_deref()).is_some();
+    if timed {
+        let raw = nonempty(item.end.as_deref()).or_else(|| nonempty(item.start.as_deref()));
+        return match raw.and_then(parse_when) {
+            Some(dt) => dt < now,
+            None => false,
+        };
+    }
+    let after = config
+        .source
+        .iter()
+        .find(|s| s.id == item.source_id)
+        .and_then(|s| s.forget_after.as_deref())
+        .or(config.forget_after.as_deref());
+    let Some(after) = after.and_then(parse_duration) else {
+        return false;
+    };
+    match parse_when(&item.created_at) {
+        Some(created) => now.signed_duration_since(created) > after,
+        None => false,
+    }
+}
+
+fn nonempty(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn parse_when(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = s.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|n| n.and_utc())
+}
+
+fn parse_duration(s: &str) -> Option<chrono::Duration> {
+    let s = s.trim();
+    if let Some(n) = s.strip_suffix(['d', 'D']) {
+        return n.trim().parse::<i64>().ok().map(chrono::Duration::days);
+    }
+    if let Some(n) = s.strip_suffix(['h', 'H']) {
+        return n.trim().parse::<i64>().ok().map(chrono::Duration::hours);
+    }
+    None
 }
 
 pub struct WatchGuard {

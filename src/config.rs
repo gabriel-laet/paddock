@@ -118,6 +118,12 @@ pub struct Config {
     /// SSH host for `paddock --remote`. Not a source.
     #[serde(default)]
     pub remote: Option<String>,
+    /// Labels that never auto-forget. Empty means ["todo", "later"].
+    #[serde(default)]
+    pub keep: Vec<String>,
+    /// Optional host default for untimed stale cleanup (`"14d"`, `"30d"`, `"7d"`, `"24h"`).
+    #[serde(default)]
+    pub forget_after: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -206,6 +212,9 @@ pub struct SourceConfig {
     /// Working directory for kind = "exec".
     #[serde(default)]
     pub dir: Option<String>,
+    /// Optional per-source stale window for untimed items. Wins over host.
+    #[serde(default)]
+    pub forget_after: Option<String>,
 }
 
 impl Config {
@@ -272,13 +281,14 @@ fn find_chain<'a>(inboxes: &'a [InboxConfig], path: &[&str]) -> Option<Vec<&'a I
 
 /// Item matches an inbox if (sources empty OR source in list)
 /// AND (labels empty OR item has ALL listed labels)
-/// AND (not timed OR item.start is set).
+/// AND (not timed OR item.start is a non-empty string).
 pub fn inbox_matches(inbox: &InboxConfig, item: &Item) -> bool {
     let source_ok =
         inbox.sources.is_empty() || inbox.sources.iter().any(|s| s == &item.source_id);
     let labels_ok = inbox.labels.is_empty()
         || inbox.labels.iter().all(|l| item.labels.iter().any(|x| x == l));
-    let timed_ok = !inbox.timed || item.start.is_some();
+    let timed_ok = !inbox.timed
+        || item.start.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
     source_ok && labels_ok && timed_ok
 }
 

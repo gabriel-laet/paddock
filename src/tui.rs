@@ -157,9 +157,11 @@ impl App {
             Some(c) => c,
             None => return (0, 0),
         };
-        let items = items_in_chain(&self.store, &chain).unwrap_or_default();
-        let unread = items.iter().filter(|i| !i.read).count();
-        (unread, items.len())
+        let mut filter = paddock::filter_for_chain(&chain);
+        let total = self.store.count_filtered(&filter).unwrap_or(0);
+        filter.unread_only = true;
+        let unread = self.store.count_filtered(&filter).unwrap_or(0);
+        (unread, total)
     }
 
     fn move_tree(&mut self, delta: isize) {
@@ -564,6 +566,7 @@ fn read_ok(v: &Verb) -> bool {
             | Verb::Help
             | Verb::ToggleRead
             | Verb::Eat
+            | Verb::Forget
             | Verb::Unread
             | Verb::Bury
             | Verb::Todo

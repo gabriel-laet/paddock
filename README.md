@@ -130,7 +130,7 @@ path = "~/.local/share/paddock/incoming"
 # labels = ["todo"]
 ```
 
-An item matches an inbox when `(sources empty OR item.source in sources)` and `(labels empty OR item has ALL listed labels)` and (`timed` is unset/false OR the item has `start`), and it matches every ancestor.
+An item matches an inbox when `(sources empty OR item.source in sources)` and `(labels empty OR item has ALL listed labels)` and (`timed` is unset/false OR the item has `start`), and it matches every ancestor. `:forget` deletes; `keep` labels survive stale cleanup; lists are queried, not loaded whole.
 
 Classifier `kind`: `regex` (title or body match), `script` (Rhai; return a label, `()`, or `true` with `label =`), `llm` (Ollama `/api/chat` or OpenAI-compatible `/chat/completions`). `pull` and the fs watch call the model when an llm classifier is configured — that can be slow. Env: `PADDOCK_LLM_URL`, `PADDOCK_LLM_MODEL`, `PADDOCK_LLM_KEY` or `OPENAI_API_KEY`. Do not put real keys in the config.
 
@@ -177,6 +177,7 @@ Read: `j/k` next item, `esc`/`h` back, `:` still works, `q` quits.
 :why         why this item is in this inbox
 :again       reclassify
 :eat         mark read
+:forget      delete the current item
 :bury        label later + classify → all/later
 :todo        label todo + classify → all/todo
 :yank        write title to $data/yank

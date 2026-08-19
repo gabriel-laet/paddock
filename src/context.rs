@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 
 use crate::config::{Config, InboxConfig, Paths};
-use crate::engine::items_in_chain;
+use crate::engine::filter_for_chain;
 use crate::keys::HELP;
 use crate::store::Store;
 
@@ -58,15 +58,9 @@ pub fn write_context(paths: &Paths, config: &Config, store: &Store, mut w: impl 
     }
     writeln!(w)?;
     writeln!(w, "## sources")?;
-    let items = store.list_all()?;
-    let mut by_src: BTreeMap<String, usize> = BTreeMap::new();
-    let mut timed = 0usize;
-    for it in &items {
-        *by_src.entry(it.source_id.clone()).or_default() += 1;
-        if it.start.as_deref().is_some_and(|s| !s.is_empty()) {
-            timed += 1;
-        }
-    }
+    let by_src: BTreeMap<String, i64> = store.counts_by_source()?.into_iter().collect();
+    let timed = store.count_timed()?;
+    let total = store.count_all()?;
     for src in &config.source {
         let n = by_src.get(&src.id).copied().unwrap_or(0);
         let extra = match src.kind.as_str() {
@@ -82,14 +76,14 @@ pub fn write_context(paths: &Paths, config: &Config, store: &Store, mut w: impl 
             writeln!(w, "{id}  items={n}  (not in config)")?;
         }
     }
-    writeln!(w, "total {}  timed {timed}", items.len())?;
+    writeln!(w, "total {total}  timed {timed}")?;
     writeln!(w)?;
     writeln!(w, "## inboxes")?;
     for node in config.flatten() {
         let refs: Vec<&str> = node.path.iter().map(|s| s.as_str()).collect();
         let n = config
             .find_chain(&refs)
-            .map(|chain| items_in_chain(store, &chain).map(|v| v.len()).unwrap_or(0))
+            .and_then(|chain| store.count_filtered(&filter_for_chain(&chain)).ok())
             .unwrap_or(0);
         write_inbox_line(&mut w, &node.path.join("/"), &node.inbox, n)?;
     }

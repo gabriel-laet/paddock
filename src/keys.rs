@@ -52,6 +52,7 @@ pub enum Verb {
     Pull,
     Theme { name: Option<String> },
     Themes,
+    Forget,
 }
 
 impl Verb {
@@ -100,6 +101,7 @@ impl Verb {
             Verb::Pull => "pull",
             Verb::Theme { .. } => "theme",
             Verb::Themes => "themes",
+            Verb::Forget => "forget",
         }
     }
 
@@ -182,6 +184,7 @@ impl Verb {
             "only" => Verb::Only,
             "spill" => Verb::Spill,
             "pull" => Verb::Pull,
+            "forget" => Verb::Forget,
             "theme" => Verb::Theme {
                 name: arg
                     .map(str::trim)
@@ -247,6 +250,7 @@ const COLONS: &[(&str, ColonSpec)] = &[
     ("q", ColonSpec::Unit("quit")),
     ("quit", ColonSpec::Unit("quit")),
     ("pull", ColonSpec::Unit("pull")),
+    ("forget", ColonSpec::Unit("forget")),
     ("help", ColonSpec::Unit("help")),
     ("theme", ColonSpec::Theme),
     ("themes", ColonSpec::Unit("themes")),
@@ -293,7 +297,7 @@ q              quit
 
 :q :quit  :pull  :help
 :theme NAME  :themes
-:why  :again  :eat  :bury  :todo
+:why  :again  :eat  :forget  :bury  :todo
 :yank  :open  :new TITLE
 :compose  :reply  :send  :w
 :which  :db  :only  :spill
