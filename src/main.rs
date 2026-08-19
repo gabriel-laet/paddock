@@ -3,7 +3,7 @@ mod web;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use paddock::{init, load_or_init, pull_all, Paths};
+use paddock::{init, load_or_init, pull_all, write_context, Paths};
 
 #[derive(Parser)]
 #[command(name = "paddock", about = "An inbox host", version)]
@@ -27,6 +27,8 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:4736")]
         bind: String,
     },
+    /// Dump this host for an agent (pipeable)
+    Context,
 }
 
 fn main() -> Result<()> {
@@ -57,6 +59,10 @@ fn main() -> Result<()> {
         Some(Cmd::Serve { bind }) => {
             load_or_init(&paths)?;
             web::serve(paths, bind)?;
+        }
+        Some(Cmd::Context) => {
+            let (config, store) = load_or_init(&paths)?;
+            write_context(&paths, &config, &store, std::io::stdout())?;
         }
     }
     Ok(())

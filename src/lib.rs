@@ -3,6 +3,7 @@
 //! Four nouns: item, source, label, inbox.
 
 mod classify;
+mod context;
 pub mod cmd;
 mod config;
 pub mod engine;
@@ -12,6 +13,7 @@ mod store;
 pub mod theme;
 
 pub use classify::{build_classifier, Classifier, LlmClassifier, RegexClassifier, ScriptClassifier};
+pub use context::write_context;
 pub use cmd::{run_verb, Outcome, VerbCtx};
 pub use config::{expand_path, inbox_matches, ClassifierConfig, Config, InboxConfig, Paths, SourceConfig, TreeNode};
 pub use engine::{
@@ -1610,7 +1612,39 @@ cmd = "{cmd}"
         });
     }
 
+    #[test]
+    fn context_dump_has_kernel_and_counts() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        admit(
+            &store,
+            &cfg,
+            NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "meet.md".into(),
+                title: "meet".into(),
+                body: "sync".into(),
+                start: Some("2026-08-19T12:00:00Z".into()),
+                end: Some("2026-08-19T13:00:00Z".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        write_context(&paths, &cfg, &store, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("Four nouns"), "missing nouns");
+        assert!(s.contains("incoming"), "missing incoming");
+        assert!(s.contains("all/cal"), "missing all/cal");
+        assert!(s.contains("total 1"), "missing total: {s}");
+        assert!(s.contains("timed"), "missing timed");
+        assert!(!s.contains("mailbox"), "mailbox leaked");
+    }
+
     static PATH_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
+
 
 
