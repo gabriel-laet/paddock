@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 #[command(name = "paddock", about = "An inbox host", version)]
 struct Cli {
     /// Run on a remote host over ssh (host from flag, PADDOCK_REMOTE, or config remote)
-    #[arg(long, value_name = "HOST", num_args = 0..=1, default_missing_value = "")]
+    #[arg(long, value_name = "HOST", num_args = 0..=1, require_equals = true, default_missing_value = "")]
     remote: Option<String>,
     /// Force this machine even if a remote is configured
     #[arg(long)]
