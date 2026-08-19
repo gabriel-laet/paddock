@@ -33,6 +33,9 @@ paddock init --here # ./.paddock in cwd
 paddock             # TUI; init if needed
 paddock pull        # pull sources, classify new items
 paddock serve       # http://127.0.0.1:4736
+paddock context     # dump this host for an agent
+paddock --remote    # ssh (HOST, PADDOCK_REMOTE, or config remote)
+paddock --local     # this machine even if remote is set
 ```
 
 Drop a file in the incoming directory, then `paddock pull` (or just wait — the TUI and `serve` watch that directory).

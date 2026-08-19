@@ -4,6 +4,7 @@
 
 mod classify;
 mod context;
+mod remote;
 pub mod cmd;
 mod config;
 pub mod engine;
@@ -14,6 +15,7 @@ pub mod theme;
 
 pub use classify::{build_classifier, Classifier, LlmClassifier, RegexClassifier, ScriptClassifier};
 pub use context::write_context;
+pub use remote::{remote_argv, resolve_remote, shell_quote};
 pub use cmd::{run_verb, Outcome, VerbCtx};
 pub use config::{expand_path, inbox_matches, ClassifierConfig, Config, InboxConfig, Paths, SourceConfig, TreeNode};
 pub use engine::{

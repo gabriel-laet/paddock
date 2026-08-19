@@ -115,6 +115,9 @@ pub struct Config {
     /// Theme name. File lives at `$config_dir/themes/<name>.toml`.
     #[serde(default)]
     pub theme: Option<String>,
+    /// SSH host for `paddock --remote`. Not a source.
+    #[serde(default)]
+    pub remote: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
