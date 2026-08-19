@@ -8,8 +8,9 @@ use paddock::cmd::{run_verb, VerbCtx};
 use paddock::keys::{bindings_json, Verb};
 use paddock::theme::{load_theme, Theme};
 use paddock::{
-    forget_stale, items_in_chain, load_or_init, pull_all, relabel, spawn_fs_watch, Config, Item, PartKind, Paths,
-    Store,
+    collapse_threads, forget_stale, inbox_visible, items_in_chain, load_or_init, open_inbox_path,
+    pull_all, relabel, row_who_text, source_label, spawn_fs_watch, view_prefix, Config, Item,
+    PartKind, Paths, Store,
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -51,12 +52,20 @@ async fn serve_async(paths: Paths, bind: String) -> Result<()> {
 
 async fn root(State(st): State<Arc<AppState>>) -> Redirect {
     let cfg = Config::load(&st.paths.config_file).unwrap_or_default();
-    let name = cfg
-        .inbox
-        .first()
-        .map(|i| i.name.as_str())
-        .unwrap_or("all");
-    Redirect::to(&format!("/i/{name}"))
+    let tree = cfg.flatten();
+    let path = open_inbox_path(&tree, |p| inbox_counts(&cfg, &st.store, p).1);
+    Redirect::to(&format!("/i/{}?only=1", path.join("/")))
+}
+
+fn inbox_counts(cfg: &Config, store: &Store, path: &[String]) -> (usize, usize) {
+    let refs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+    match cfg.find_chain(&refs) {
+        Some(chain) => {
+            let items = items_in_chain(store, &chain).unwrap_or_default();
+            (items.iter().filter(|i| !i.read).count(), items.len())
+        }
+        None => (0, 0),
+    }
 }
 
 #[derive(Deserialize)]
@@ -232,41 +241,47 @@ fn render_inbox(st: &AppState, cfg: &Config, path: &str, msg: Option<&str>, only
     if only {
         items.retain(|i| !i.read);
     }
+    let rows = collapse_threads(items);
     let nav = render_tree(cfg, &st.store, &parts);
-    let list = if items.is_empty() {
+    let list = if rows.is_empty() {
         "<p class=\"empty\">empty</p>".into()
     } else {
-        let mut rows = String::from("<table><thead><tr><th></th><th>title</th><th>source</th><th>when</th><th></th></tr></thead><tbody>");
-        for (n, it) in items.iter().enumerate() {
+        let mut html = String::from(
+            "<table><thead><tr><th></th><th>who</th><th>snippet</th><th>source</th><th>when</th><th></th><th></th></tr></thead><tbody>",
+        );
+        let inbox = chain.as_ref().and_then(|c| c.last()).copied();
+        for (n, row) in rows.iter().enumerate() {
+            let it = &row.item;
             let mark = if it.read { "" } else { "*" };
             let cls = if it.read { "read" } else { "unread" };
             let cur = if n == 0 { " cur" } else { "" };
             let when = short_time(&it.created_at);
-            let prefix = chain
-                .as_ref()
-                .and_then(|c| c.last())
-                .map(|ib| match ib.view_kind() {
-                    "board" => format!("[{}] ", ib.board_column(it).unwrap_or("—")),
-                    "calendar" => it
-                        .start
-                        .as_deref()
-                        .map(|s| format!("{} ", s.chars().take(10).collect::<String>()))
-                        .unwrap_or_default(),
-                    _ => String::new(),
-                })
-                .unwrap_or_default();
-            rows.push_str(&format!(
-                "<tr class=\"{cls}{cur}\" data-id=\"{id}\"><td class=\"mark\">{mark}</td><td><a href=\"/item/{id}\">{title}</a></td><td class=\"dim\">{src}</td><td class=\"dim\">{when}</td><td><a href=\"/i/{path}?toggle={id}\">read</a></td></tr>",
+            let prefix = view_prefix(inbox, it);
+            let (who, snippet) = row_who_text(it);
+            let src = source_label(cfg, &it.source_id);
+            let count = if row.count > 1 {
+                format!("{}", row.count)
+            } else {
+                String::new()
+            };
+            html.push_str(&format!(
+                "<tr class=\"{cls}{cur}\" data-id=\"{id}\"><td class=\"mark\">{mark}</td><td><a href=\"/item/{id}\">{who}</a></td><td class=\"dim\">{snippet}</td><td class=\"dim\">{src}</td><td class=\"dim\">{when}</td><td class=\"dim\">{count}</td><td><a href=\"/i/{path}?toggle={id}\">read</a></td></tr>",
                 id = it.id,
-                title = esc(&format!("{prefix}{}", it.title)),
-                src = esc(&it.source_id),
+                who = esc(&format!("{prefix}{who}")),
+                snippet = esc(&snippet),
+                src = esc(src),
                 path = esc(path),
             ));
         }
-        rows.push_str("</tbody></table>");
-        rows
+        html.push_str("</tbody></table>");
+        html
     };
     let crumb = parts.join(" / ");
+    let heading = if only {
+        format!("{crumb}  unread")
+    } else {
+        crumb.clone()
+    };
     let missing = if chain.is_none() {
         format!("<p class=\"empty\">no inbox named {}</p>", esc(path))
     } else {
@@ -275,18 +290,18 @@ fn render_inbox(st: &AppState, cfg: &Config, path: &str, msg: Option<&str>, only
     let status = msg.unwrap_or("");
     page(
         &theme_of(st),
-        &crumb,
+        &heading,
         &format!(
             r#"<div class="wrap">
 <nav>{nav}</nav>
 <main>
-<header class="bar"><h1>{crumb}</h1><a href="/compose">compose</a><a href="/i/{path}?pull=1">pull</a></header>
+<header class="bar"><h1>{heading}</h1><a href="/compose">compose</a><a href="/i/{path}?pull=1">pull</a></header>
 {missing}
 {list}
 </main>
 </div>
 <p class="status">{status}</p>"#,
-            crumb = esc(&crumb),
+            heading = esc(&heading),
             path = esc(path),
             status = esc(status),
         ),
@@ -295,7 +310,8 @@ fn render_inbox(st: &AppState, cfg: &Config, path: &str, msg: Option<&str>, only
 
 fn render_tree(cfg: &Config, store: &Store, selected: &[&str]) -> String {
     let mut out = String::from("<ul class=\"tree\">");
-    walk_nav(cfg, &cfg.inbox, &[], selected, store, &mut out);
+    let selected_s: Vec<String> = selected.iter().map(|s| (*s).to_string()).collect();
+    walk_nav(cfg, &cfg.inbox, &[], &selected_s, store, false, &mut out);
     out.push_str("</ul>");
     out
 }
@@ -304,30 +320,35 @@ fn walk_nav(
     cfg: &Config,
     inboxes: &[paddock::InboxConfig],
     prefix: &[String],
-    selected: &[&str],
+    selected: &[String],
     store: &Store,
+    parent_hidden: bool,
     out: &mut String,
 ) {
     for ib in inboxes {
         let mut path = prefix.to_vec();
         path.push(ib.name.clone());
-        let refs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-        let (unread, total) = match cfg.find_chain(&refs) {
-            Some(chain) => {
-                let items = items_in_chain(store, &chain).unwrap_or_default();
-                (items.iter().filter(|i| !i.read).count(), items.len())
-            }
-            None => (0, 0),
-        };
-        let href = format!("/i/{}", path.join("/"));
-        let sel = refs == selected;
-        let cls = if sel { "sel" } else { "" };
-        out.push_str(&format!(
-            "<li class=\"d{depth} {cls}\"><a href=\"{href}\">{name} <span class=\"dim\">{unread}/{total}</span></a></li>",
-            depth = prefix.len(),
-            name = esc(&ib.name),
-        ));
-        walk_nav(cfg, &ib.inbox, &path, selected, store, out);
+        let (unread, total) = inbox_counts(cfg, store, &path);
+        let show = inbox_visible(&ib.name, &path, total, selected, parent_hidden);
+        if show {
+            let href = format!("/i/{}", path.join("/"));
+            let sel = path.as_slice() == selected;
+            let cls = if sel { "sel" } else { "" };
+            out.push_str(&format!(
+                "<li class=\"d{depth} {cls}\"><a href=\"{href}\">{name} <span class=\"dim\">{unread}/{total}</span></a></li>",
+                depth = prefix.len(),
+                name = esc(&ib.name),
+            ));
+        }
+        walk_nav(
+            cfg,
+            &ib.inbox,
+            &path,
+            selected,
+            store,
+            parent_hidden || !show,
+            out,
+        );
     }
 }
 

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -543,3 +543,255 @@ pub fn send_draft(store: &Store, config: &Config, paths: &Paths, draft: Draft) -
         }
     }
 }
+
+
+/// One list row after thread collapse. `item` is the latest in the thread.
+#[derive(Debug, Clone)]
+pub struct ListRow {
+    pub item: Item,
+    pub count: usize,
+}
+
+/// Collapse items that share a non-empty `thread` into one row.
+/// Empty/missing thread stays a singleton. Same thread keeps the newest
+/// `created_at` (then highest id). Surviving heads stay in input order
+/// (store lists are already newest-first, or start order for calendar).
+pub fn collapse_threads(items: Vec<Item>) -> Vec<ListRow> {
+    let mut rows: Vec<ListRow> = Vec::new();
+    let mut at: HashMap<String, usize> = HashMap::new();
+    for item in items {
+        let key = item
+            .thread
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        match key {
+            None => rows.push(ListRow { item, count: 1 }),
+            Some(th) => {
+                if let Some(&i) = at.get(&th) {
+                    rows[i].count += 1;
+                    if is_newer_item(&item, &rows[i].item) {
+                        rows[i].item = item;
+                    }
+                } else {
+                    at.insert(th, rows.len());
+                    rows.push(ListRow { item, count: 1 });
+                }
+            }
+        }
+    }
+    rows
+}
+
+fn is_newer_item(a: &Item, b: &Item) -> bool {
+    match a.created_at.cmp(&b.created_at) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => a.id > b.id,
+        std::cmp::Ordering::Less => false,
+    }
+}
+
+/// First non-empty line of body, whitespace collapsed.
+pub fn body_snippet(body: &str) -> String {
+    let line = body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    collapse_ws(line)
+}
+
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::new();
+    let mut gap = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            gap = true;
+        } else {
+            if gap && !out.is_empty() {
+                out.push(' ');
+            }
+            gap = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn actor_label(actor: Option<&crate::store::Actor>) -> Option<String> {
+    let a = actor?;
+    let name = a
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(n) = name {
+        return Some(n.to_string());
+    }
+    let id = a.id.trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+/// Who + text for a list row (chat: title is the thread name; mail: title is the subject).
+pub fn row_who_text(item: &Item) -> (String, String) {
+    let from = actor_label(item.from.as_ref());
+    let title = item.title.trim();
+    let snippet = body_snippet(&item.body);
+    if let Some(ref from) = from {
+        if !title.is_empty() && title != from.as_str() {
+            let text = if snippet.is_empty() {
+                String::new()
+            } else {
+                format!("{from}: {snippet}")
+            };
+            return (title.to_string(), text);
+        }
+    }
+    let who = from.unwrap_or_else(|| title.to_string());
+    let text = if snippet.is_empty() {
+        title.to_string()
+    } else {
+        snippet
+    };
+    (who, text)
+}
+
+/// Board / calendar prefix in front of the who/snippet.
+pub fn view_prefix(inbox: Option<&InboxConfig>, item: &Item) -> String {
+    match inbox.map(|ib| ib.view_kind()) {
+        Some("board") => format!(
+            "[{}] ",
+            inbox.and_then(|ib| ib.board_column(item)).unwrap_or("—")
+        ),
+        Some("calendar") => item
+            .start
+            .as_deref()
+            .map(|s| format!("{} ", s.chars().take(10).collect::<String>()))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Display width: wide glyphs (CJK, emoji) count as 2.
+pub fn display_width(s: &str) -> usize {
+    s.chars().map(char_display_width).sum()
+}
+
+fn char_display_width(c: char) -> usize {
+    match c {
+        '\u{00AD}' => 0,
+        '\u{0300}'..='\u{036F}' | '\u{20D0}'..='\u{20FF}' => 0,
+        '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' => 0,
+        '\u{FE00}'..='\u{FE0F}' | '\u{FE20}'..='\u{FE2F}' => 0,
+        c if c.is_control() => 0,
+        '\u{1100}'..='\u{115F}'
+        | '\u{2329}'..='\u{232A}'
+        | '\u{2E80}'..='\u{A4CF}'
+        | '\u{AC00}'..='\u{D7A3}'
+        | '\u{F900}'..='\u{FAFF}'
+        | '\u{FE10}'..='\u{FE19}'
+        | '\u{FE30}'..='\u{FE6F}'
+        | '\u{FF01}'..='\u{FF60}'
+        | '\u{FFE0}'..='\u{FFE6}'
+        | '\u{2190}'..='\u{21FF}'
+        | '\u{2300}'..='\u{23FF}'
+        | '\u{2460}'..='\u{24FF}'
+        | '\u{25A0}'..='\u{27BF}'
+        | '\u{2900}'..='\u{297F}'
+        | '\u{2B00}'..='\u{2BFF}'
+        | '\u{1F000}'..='\u{1FAFF}' => 2,
+        _ => 1,
+    }
+}
+
+pub fn trunc_width(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if display_width(s) <= max {
+        return s.to_string();
+    }
+    let budget = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = char_display_width(c);
+        if w + cw > budget {
+            break;
+        }
+        w += cw;
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
+pub fn pad_width(s: &str, width: usize) -> String {
+    let w = display_width(s);
+    if w >= width {
+        trunc_width(s, width)
+    } else {
+        format!("{s}{}", " ".repeat(width - w))
+    }
+}
+
+/// Show an inbox in the tree: always `all`, always the selected path (and ancestors),
+/// hide empty nodes, and hide children of a hidden parent.
+pub fn inbox_visible(
+    name: &str,
+    path: &[String],
+    total: usize,
+    selected: &[String],
+    parent_hidden: bool,
+) -> bool {
+    if name == "all" {
+        return true;
+    }
+    if !selected.is_empty() && selected.starts_with(path) {
+        return true;
+    }
+    if parent_hidden {
+        return false;
+    }
+    total > 0
+}
+
+pub fn filter_visible_inboxes(
+    nodes: &[crate::config::TreeNode],
+    selected: &[String],
+    total_of: impl Fn(&[String]) -> usize,
+) -> Vec<crate::config::TreeNode> {
+    let mut hidden: Vec<Vec<String>> = Vec::new();
+    let mut out = Vec::new();
+    for n in nodes {
+        let parent_hidden = hidden
+            .iter()
+            .any(|p| n.path.starts_with(p) && n.path.len() > p.len());
+        if inbox_visible(&n.inbox.name, &n.path, total_of(&n.path), selected, parent_hidden)
+        {
+            out.push(n.clone());
+        } else {
+            hidden.push(n.path.clone());
+        }
+    }
+    out
+}
+
+/// Open `todo` when that path exists and has items; else the first inbox (`all`).
+pub fn open_inbox_path(
+    tree: &[crate::config::TreeNode],
+    total_of: impl Fn(&[String]) -> usize,
+) -> Vec<String> {
+    tree.iter()
+        .find(|n| n.inbox.name == "todo" && total_of(&n.path) > 0)
+        .or_else(|| tree.first())
+        .map(|n| n.path.clone())
+        .unwrap_or_else(|| vec!["all".into()])
+}
+
+pub const IDLE_HINT: &str = ":cmd  /search  ?help  q";

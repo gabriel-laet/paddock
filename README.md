@@ -97,6 +97,7 @@ path = "~/.local/share/paddock/incoming"
 # kind = "exec"
 # cmd = "my-source"
 # args = []
+# # name = "chat"   # list label; missing uses id
 # # dir = "~/.local/share/paddock"
 
 # theme = "phosphor"
@@ -129,6 +130,8 @@ path = "~/.local/share/paddock/incoming"
 # columns = ["todo", "doing", "done"]
 # labels = ["todo"]
 ```
+
+Optional `name` on `[[source]]` is the list label; if it is missing or empty, `id` is used.
 
 An item matches an inbox when `(sources empty OR item.source in sources)` and `(labels empty OR item has ALL listed labels)` and (`timed` is unset/false OR the item has `start`), and it matches every ancestor. `:forget` deletes; `keep` labels survive stale cleanup; lists are queried, not loaded whole.
 

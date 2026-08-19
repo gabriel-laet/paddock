@@ -215,6 +215,20 @@ pub struct SourceConfig {
     /// Optional per-source stale window for untimed items. Wins over host.
     #[serde(default)]
     pub forget_after: Option<String>,
+    /// List label. Empty/missing uses `id`.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Human source label: non-empty `name`, else `id`.
+pub fn source_label<'a>(cfg: &'a Config, id: &'a str) -> &'a str {
+    cfg.source
+        .iter()
+        .find(|s| s.id == id)
+        .and_then(|s| s.name.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(id)
 }
 
 impl Config {

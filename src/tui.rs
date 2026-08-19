@@ -8,7 +8,9 @@ use paddock::cmd::{run_verb, VerbCtx};
 use paddock::keys::{feed, parse_colon, Feed, KeySeq, Verb, HELP};
 use paddock::theme::{load_theme, Theme};
 use paddock::{
-    items_in_chain, load_or_init, spawn_fs_watch, Config, InboxConfig, Item, Paths, Store,
+    collapse_threads, display_width, filter_visible_inboxes, items_in_chain, load_or_init,
+    open_inbox_path, pad_width, row_who_text, source_label, spawn_fs_watch, trunc_width,
+    view_prefix, Config, InboxConfig, Item, ListRow, Paths, Store, IDLE_HINT,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -46,7 +48,7 @@ struct App {
     theme: Theme,
     tree: Vec<(Vec<String>, usize, InboxConfig)>,
     tree_state: ListState,
-    items: Vec<Item>,
+    items: Vec<ListRow>,
     item_state: ListState,
     pane: Pane,
     mode: Mode,
@@ -88,10 +90,10 @@ impl App {
             search_hits: Vec::new(),
             search_at: 0,
             cmd_buf: String::new(),
-            status: ":  /  ?  q".into(),
+            status: IDLE_HINT.into(),
             last_gen: paddock::engine::gen(),
             keys: KeySeq::default(),
-            unread_only: false,
+            unread_only: true,
             list_height: 12,
             from_compose: false,
             compose_reply_to: None,
@@ -120,29 +122,37 @@ impl App {
 
     fn reload_tree(&mut self) {
         let flat = self.config.flatten();
-        self.tree = flat
+        let keep = self.selected_path();
+        let open = if keep.is_empty() || !flat.iter().any(|n| n.path == keep) {
+            open_inbox_path(&flat, |p| self.counts(p).1)
+        } else {
+            keep
+        };
+        let visible = filter_visible_inboxes(&flat, &open, |p| self.counts(p).1);
+        self.tree = visible
             .into_iter()
             .map(|n| (n.path, n.depth, n.inbox))
             .collect();
         if self.tree.is_empty() {
             self.tree_state.select(None);
-        } else if self
-            .tree_state
-            .selected()
-            .map(|i| i >= self.tree.len())
-            .unwrap_or(true)
-        {
-            self.tree_state.select(Some(0));
+        } else {
+            let idx = self
+                .tree
+                .iter()
+                .position(|(p, _, _)| *p == open)
+                .unwrap_or(0);
+            self.tree_state.select(Some(idx));
         }
     }
 
     fn reload_items(&mut self) {
+        self.reload_tree();
         let chain = self.chain();
         let mut items = items_in_chain(&self.store, &chain).unwrap_or_default();
         if self.unread_only {
             items.retain(|i| !i.read);
         }
-        self.items = items;
+        self.items = collapse_threads(items);
         if self.items.is_empty() {
             self.item_state.select(None);
         } else {
@@ -218,7 +228,7 @@ impl App {
         self.item_state
             .selected()
             .and_then(|i| self.items.get(i))
-            .map(|i| i.id)
+            .map(|r| r.item.id)
     }
 
     fn ctx(&self) -> VerbCtx {
@@ -355,7 +365,8 @@ impl App {
             .items
             .iter()
             .enumerate()
-            .filter(|(_, it)| {
+            .filter(|(_, row)| {
+                let it = &row.item;
                 it.title.to_lowercase().contains(&q) || it.body.to_lowercase().contains(&q)
             })
             .map(|(i, _)| i)
@@ -705,7 +716,9 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         .constraints([Constraint::Length(28), Constraint::Min(20)])
         .split(chunks[0]);
 
-    app.list_height = body[1].height.saturating_sub(2) as usize;
+    if app.list_height == 0 {
+        app.list_height = body[1].height.saturating_sub(2) as usize;
+    }
 
     draw_tree(f, app, body[0]);
     match app.mode {
@@ -766,6 +779,16 @@ fn draw_tree(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_items(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let panes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(area);
+    app.list_height = panes[0].height.saturating_sub(2) as usize;
+    draw_item_list(f, app, panes[0]);
+    draw_preview(f, app, panes[1]);
+}
+
+fn draw_item_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let th = &app.theme;
     let active = matches!(app.pane, Pane::Items) && matches!(app.mode, Mode::List);
     let border = if active {
@@ -786,50 +809,31 @@ fn draw_items(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             format!(" {name} ")
         }
     };
+    let inner_w = area.width.saturating_sub(2) as usize;
     let items: Vec<ListItem> = if app.items.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "  empty",
             Style::default().fg(rgb(th.c_dim())),
         )))]
     } else {
-        {
-            let inbox = app.chain().last().copied();
-            app.items
-                .iter()
-                .map(|it| {
-                    let mark = if it.read { " " } else { "*" };
-                    let when = short_time(&it.created_at);
-                    let style = if it.read {
-                        Style::default().fg(rgb(th.c_dim()))
-                    } else {
-                        Style::default().fg(rgb(th.c_unread()))
-                    };
-                    let prefix = match inbox.map(|ib| ib.view_kind()) {
-                        Some("board") => format!(
-                            "[{}] ",
-                            inbox.and_then(|ib| ib.board_column(it)).unwrap_or("—")
-                        ),
-                        Some("calendar") => it
-                            .start
-                            .as_deref()
-                            .map(|s| format!("{} ", s.chars().take(10).collect::<String>()))
-                            .unwrap_or_default(),
-                        _ => String::new(),
-                    };
-                    ListItem::new(Line::from(vec![
-                        Span::styled(format!("{mark} "), style),
-                        Span::styled(
-                            format!("{prefix}{}", trunc(&it.title, 42)),
-                            style.add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            format!("  {}  {when}", it.source_id),
-                            Style::default().fg(rgb(th.c_dim())),
-                        ),
-                    ]))
-                })
-                .collect()
-        }
+        let inbox = app.chain().last().copied();
+        let dim = Style::default().fg(rgb(th.c_dim()));
+        app.items
+            .iter()
+            .map(|row| {
+                let it = &row.item;
+                let style = if it.read {
+                    Style::default().fg(rgb(th.c_dim()))
+                } else {
+                    Style::default().fg(rgb(th.c_unread()))
+                };
+                let prefix = view_prefix(inbox, it);
+                let src = source_label(&app.config, &it.source_id);
+                ListItem::new(format_list_line(
+                    it, row.count, src, &prefix, inner_w, style, dim,
+                ))
+            })
+            .collect()
     };
     let list = List::new(items)
         .block(
@@ -842,6 +846,88 @@ fn draw_items(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(list, area, &mut app.item_state);
 }
 
+fn format_list_line(
+    item: &Item,
+    count: usize,
+    source: &str,
+    prefix: &str,
+    inner_w: usize,
+    style: Style,
+    dim: Style,
+) -> Line<'static> {
+    let mark = if item.read { " " } else { "*" };
+    let when = short_time(&item.created_at);
+    let src = pad_width(&trunc_width(source, 10), 10);
+    let count_bit = if count > 1 {
+        format!("·{count} ")
+    } else {
+        String::new()
+    };
+    let right = format!("{count_bit}{src}  {when}");
+    let left = format!("{mark} ");
+    let mid_w = inner_w.saturating_sub(display_width(&left) + display_width(&right));
+    let (who, text) = row_who_text(item);
+    let mut mid = format!("{prefix}{who}");
+    if !text.is_empty() && text != who {
+        mid.push_str("  ·  ");
+        mid.push_str(&text);
+    }
+    let mid = pad_width(&trunc_width(&mid, mid_w), mid_w);
+    Line::from(vec![
+        Span::styled(left, style),
+        Span::styled(mid, style.add_modifier(Modifier::BOLD)),
+        Span::styled(right, dim),
+    ])
+}
+
+fn draw_preview(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let th = &app.theme;
+    let border = rgb(th.c_border());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" preview ")
+        .border_style(Style::default().fg(border));
+    let Some(i) = app.item_state.selected() else {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "nothing selected",
+                Style::default().fg(rgb(th.c_dim())),
+            ))
+            .block(block),
+            area,
+        );
+        return;
+    };
+    let Some(row) = app.items.get(i) else {
+        return;
+    };
+    let it = &row.item;
+    let from = it
+        .from
+        .as_ref()
+        .map(|a| a.name.as_deref().filter(|s| !s.is_empty()).unwrap_or(&a.id))
+        .filter(|s| !s.is_empty());
+    let labels = if it.labels.is_empty() {
+        "—".into()
+    } else {
+        it.labels.join(" ")
+    };
+    let mut text = it.title.clone();
+    text.push('\n');
+    if let Some(from) = from {
+        text.push_str(&format!("from {from}\n"));
+    }
+    text.push_str(&format!("labels  {labels}\n\n"));
+    text.push_str(&it.body);
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(block)
+            .style(Style::default().fg(rgb(th.c_fg()))),
+        area,
+    );
+}
+
 fn draw_read(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let th = &app.theme;
     let Some(i) = app.item_state.selected() else {
@@ -851,9 +937,10 @@ fn draw_read(f: &mut ratatui::Frame, app: &App, area: Rect) {
         );
         return;
     };
-    let Some(it) = app.items.get(i) else {
+    let Some(row) = app.items.get(i) else {
         return;
     };
+    let it = &row.item;
     let labels = if it.labels.is_empty() {
         "—".into()
     } else {
@@ -918,7 +1005,13 @@ fn draw_status(f: &mut ratatui::Frame, app: &App, area: Rect) {
                 "compose".into()
             }
         }
-        _ => app.status.clone(),
+        _ => {
+            if app.status.is_empty() {
+                IDLE_HINT.into()
+            } else {
+                app.status.clone()
+            }
+        }
     };
     f.render_widget(
         Paragraph::new(msg).style(
@@ -1098,16 +1191,3 @@ fn short_time(rfc: &str) -> String {
         .unwrap_or_else(|_| rfc.chars().take(16).collect())
 }
 
-fn trunc(s: &str, n: usize) -> String {
-    let c: Vec<char> = s.chars().collect();
-    if c.len() <= n {
-        s.to_string()
-    } else {
-        format!(
-            "{}…",
-            c.into_iter()
-                .take(n.saturating_sub(1))
-                .collect::<String>()
-        )
-    }
-}

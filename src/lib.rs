@@ -17,10 +17,15 @@ pub use classify::{build_classifier, Classifier, LlmClassifier, RegexClassifier,
 pub use context::write_context;
 pub use remote::{remote_argv, resolve_remote, shell_quote};
 pub use cmd::{run_verb, Outcome, VerbCtx};
-pub use config::{chain_matches, expand_path, inbox_matches, ClassifierConfig, Config, InboxConfig, Paths, SourceConfig, TreeNode};
+pub use config::{
+    chain_matches, expand_path, inbox_matches, source_label, ClassifierConfig, Config, InboxConfig,
+    Paths, SourceConfig, TreeNode,
+};
 pub use engine::{
-    admit, admit_file, classify_item, filter_for_chain, forget, forget_stale, items_in_chain,
-    pull_all, relabel, reply_title, send_draft, spawn_fs_watch, stamp, WatchGuard,
+    admit, admit_file, body_snippet, classify_item, collapse_threads, display_width,
+    filter_for_chain, filter_visible_inboxes, forget, forget_stale, inbox_visible, items_in_chain,
+    open_inbox_path, pad_width, pull_all, relabel, reply_title, row_who_text, send_draft,
+    spawn_fs_watch, stamp, trunc_width, view_prefix, IDLE_HINT, ListRow, WatchGuard,
 };
 pub use keys::{parse_colon, Verb, HELP};
 pub use source::{pull_exec, pull_fs, pull_rss, send_exec, Draft, NewItem, SendResult};
@@ -1889,6 +1894,145 @@ forget_after = "30d"
     #[test]
     fn parse_colon_forget_is_forget() {
         assert_eq!(parse_colon("forget"), Ok(Verb::Forget));
+    }
+
+    fn list_item(
+        id: i64,
+        title: &str,
+        body: &str,
+        thread: Option<&str>,
+        created: &str,
+    ) -> Item {
+        Item {
+            id,
+            source_id: "incoming".into(),
+            foreign_id: format!("{id}"),
+            title: title.into(),
+            body: body.into(),
+            thread: thread.map(|s| s.into()),
+            created_at: created.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn collapse_threads_keeps_latest_and_counts() {
+        let items = vec![
+            list_item(3, "chat", "newest", Some("t-a"), "2026-01-03T00:00:00Z"),
+            list_item(2, "other", "b", Some("t-b"), "2026-01-02T00:00:00Z"),
+            list_item(5, "chat", "tie-high-id", Some("t-a"), "2026-01-03T00:00:00Z"),
+            list_item(1, "chat", "old", Some("t-a"), "2026-01-01T00:00:00Z"),
+        ];
+        let rows = collapse_threads(items);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].item.id, 5);
+        assert_eq!(rows[0].count, 3);
+        assert_eq!(rows[0].item.body, "tie-high-id");
+        assert_eq!(rows[1].item.id, 2);
+        assert_eq!(rows[1].count, 1);
+    }
+
+    #[test]
+    fn collapse_threads_singleton_without_thread() {
+        let items = vec![
+            list_item(2, "a", "one", None, "2026-01-02T00:00:00Z"),
+            list_item(1, "b", "two", Some(""), "2026-01-01T00:00:00Z"),
+            list_item(3, "c", "three", Some("  "), "2026-01-03T00:00:00Z"),
+        ];
+        let rows = collapse_threads(items);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r.count == 1));
+        assert_eq!(
+            rows.iter().map(|r| r.item.id).collect::<Vec<_>>(),
+            vec![2, 1, 3]
+        );
+    }
+
+    #[test]
+    fn source_label_falls_back_to_id() {
+        let cfg = Config {
+            source: vec![
+                SourceConfig {
+                    id: "chat".into(),
+                    kind: "exec".into(),
+                    name: Some("Messages".into()),
+                    ..Default::default()
+                },
+                SourceConfig {
+                    id: "incoming".into(),
+                    kind: "fs".into(),
+                    name: None,
+                    ..Default::default()
+                },
+                SourceConfig {
+                    id: "blank".into(),
+                    kind: "fs".into(),
+                    name: Some("   ".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(source_label(&cfg, "chat"), "Messages");
+        assert_eq!(source_label(&cfg, "incoming"), "incoming");
+        assert_eq!(source_label(&cfg, "blank"), "blank");
+        assert_eq!(source_label(&cfg, "missing"), "missing");
+    }
+
+    #[test]
+    fn open_inbox_path_prefers_todo() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[inbox]]
+name = "all"
+[[inbox.inbox]]
+name = "later"
+[[inbox.inbox]]
+name = "todo"
+"#,
+        )
+        .unwrap();
+        let tree = cfg.flatten();
+        let path = open_inbox_path(&tree, |p| {
+            if p.last().map(|s| s.as_str()) == Some("todo") {
+                2
+            } else {
+                5
+            }
+        });
+        assert_eq!(path, vec!["all", "todo"]);
+        let fallback = open_inbox_path(&tree, |_| 0);
+        assert_eq!(fallback, vec!["all"]);
+    }
+
+    #[test]
+    fn inbox_visible_hides_empty_except_all_and_selected() {
+        let later = vec!["all".into(), "later".into()];
+        let todo = vec!["all".into(), "todo".into()];
+        let child = vec!["all".into(), "later".into(), "x".into()];
+        assert!(inbox_visible("all", &["all".into()], 0, &[], false));
+        assert!(!inbox_visible("later", &later, 0, &[], false));
+        assert!(inbox_visible("later", &later, 0, &later, false));
+        assert!(inbox_visible("later", &later, 2, &[], false));
+        assert!(!inbox_visible("x", &child, 4, &[], true));
+        assert!(inbox_visible("todo", &todo, 0, &todo, true));
+    }
+
+    #[test]
+    fn row_who_text_chat_uses_title_and_snippet() {
+        let mut it = list_item(1, "Room", "see you at 8", Some("room-1"), "2026-01-01T00:00:00Z");
+        it.from = Some(Actor {
+            id: "u1".into(),
+            name: Some("Ada".into()),
+            kind: ActorKind::Person,
+        });
+        let (who, text) = row_who_text(&it);
+        assert_eq!(who, "Room");
+        assert_eq!(text, "Ada: see you at 8");
+        let lone = list_item(2, "note", "hello", None, "2026-01-01T00:00:00Z");
+        let (who, text) = row_who_text(&lone);
+        assert_eq!(who, "note");
+        assert_eq!(text, "hello");
     }
 
     static PATH_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
