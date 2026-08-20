@@ -22,10 +22,11 @@ pub use config::{
     Paths, SourceConfig, TreeNode,
 };
 pub use engine::{
-    admit, admit_file, body_snippet, classify_item, collapse_threads, display_width,
-    filter_for_chain, filter_visible_inboxes, forget, forget_stale, inbox_visible, items_in_chain,
-    open_inbox_path, pad_width, pull_all, relabel, reply_title, row_who_text, send_draft,
-    spawn_fs_watch, stamp, trunc_width, view_prefix, IDLE_HINT, ListRow, WatchGuard,
+    admit, admit_file, body_snippet, classify_item, collapse_threads, copy_target, display_width,
+    filter_for_chain, filter_visible_inboxes, forget, forget_stale, group_key, group_rows,
+    inbox_visible, items_in_chain, open_inbox_path, pad_width, pull_all, relabel, reply_title,
+    row_who_text, send_draft, spawn_fs_watch, stamp, trunc_width, view_prefix, GroupBy, IDLE_HINT,
+    ListRow, WatchGuard,
 };
 pub use keys::{parse_colon, Verb, HELP};
 pub use source::{pull_exec, pull_fs, pull_rss, send_exec, Draft, NewItem, SendResult};
@@ -206,6 +207,194 @@ mod tests {
         assert!(inbox_matches(&ib, &item));
     }
 
+    fn item_with(title: &str, body: &str, labels: &[&str]) -> Item {
+        Item {
+            id: 1,
+            source_id: "gog-mail".into(),
+            foreign_id: "a".into(),
+            title: title.into(),
+            body: body.into(),
+            href: None,
+            start: None,
+            end: None,
+            thread: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            read: false,
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            parts: vec![],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn copy_target_prefers_code_near_keyword() {
+        let it = item_with(
+            "Your confirmation code",
+            "Hi Gabriel, your verification code is 482913. It expires in 10 minutes.",
+            &[],
+        );
+        assert_eq!(copy_target(&it), Some("482913".into()));
+    }
+
+    #[test]
+    fn copy_target_finds_alphanumeric_code_past_filler_words() {
+        // Mirrors a real Namecheap sign-in email: the code is alphanumeric
+        // and several plain words away from the word "code".
+        let it = item_with(
+            "Sign-in from unauthorized device detected",
+            "please use the following code to enable your new device — it will \
+             expire in 30 minutes: 122cd3\nThat wasn't me!",
+            &[],
+        );
+        assert_eq!(copy_target(&it), Some("122cd3".into()));
+    }
+
+    #[test]
+    fn copy_target_ignores_keyword_in_title_when_body_has_the_real_one() {
+        // Subject says "confirmation code" with no value nearby; if title and
+        // body were searched concatenated, that keyword match would scan the
+        // *start* of the body (a date field, "2026") instead of the real code.
+        let it = item_with(
+            "Your confirmation code",
+            "Account: emcasa\nWhen: 2026-08-20 01:52:50 UT\n\
+             please use the following code to enable your device: 122cd3",
+            &[],
+        );
+        assert_eq!(copy_target(&it), Some("122cd3".into()));
+    }
+
+    #[test]
+    fn copy_target_falls_back_to_link_without_keyword_or_label() {
+        let it = item_with(
+            "Confirm your email",
+            "Please click https://example.com/confirm?token=abc123 to finish.",
+            &[],
+        );
+        assert_eq!(
+            copy_target(&it),
+            Some("https://example.com/confirm?token=abc123".into())
+        );
+    }
+
+    #[test]
+    fn copy_target_bare_digits_only_when_labeled_code() {
+        let unlabeled = item_with("Invoice #48291", "Total due: 48291 yen.", &[]);
+        assert_eq!(copy_target(&unlabeled), None);
+
+        let labeled = item_with("Your code", "48291", &["code"]);
+        assert_eq!(copy_target(&labeled), Some("48291".into()));
+    }
+
+    #[test]
+    fn copy_target_none_for_ordinary_item() {
+        let it = item_with("hello", "just saying hi", &[]);
+        assert_eq!(copy_target(&it), None);
+    }
+
+    #[test]
+    fn group_by_sender_clusters_and_sorts_alphabetically_stable_within() {
+        let cfg = Config::default();
+        let mk = |id: i64, from: &str, created: &str| ListRow {
+            item: Item {
+                id,
+                source_id: "wacli".into(),
+                foreign_id: format!("f{id}"),
+                from: Some(Actor {
+                    id: from.into(),
+                    name: Some(from.into()),
+                    kind: ActorKind::Person,
+                }),
+                created_at: created.into(),
+                ..item_with("x", "y", &[])
+            },
+            count: 1,
+        };
+        // Bob's two messages are not adjacent before grouping.
+        let rows = vec![
+            mk(1, "Bob", "2026-01-03T00:00:00Z"),
+            mk(2, "Ana", "2026-01-02T00:00:00Z"),
+            mk(3, "Bob", "2026-01-01T00:00:00Z"),
+        ];
+        let grouped = group_rows(rows, &cfg, GroupBy::Sender);
+        let ids: Vec<i64> = grouped.iter().map(|r| r.item.id).collect();
+        // Ana < Bob alphabetically; within Bob, original (newest-first) order kept.
+        assert_eq!(ids, vec![2, 1, 3]);
+    }
+
+    #[test]
+    fn group_by_none_and_date_leave_order_untouched() {
+        let cfg = Config::default();
+        let mk = |id: i64| ListRow {
+            item: Item {
+                id,
+                source_id: "wacli".into(),
+                foreign_id: format!("f{id}"),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                ..item_with("x", "y", &[])
+            },
+            count: 1,
+        };
+        let rows = vec![mk(3), mk(1), mk(2)];
+        assert_eq!(
+            group_rows(rows.clone(), &cfg, GroupBy::None)
+                .iter()
+                .map(|r| r.item.id)
+                .collect::<Vec<_>>(),
+            vec![3, 1, 2]
+        );
+        assert_eq!(
+            group_rows(rows, &cfg, GroupBy::Date)
+                .iter()
+                .map(|r| r.item.id)
+                .collect::<Vec<_>>(),
+            vec![3, 1, 2]
+        );
+    }
+
+    #[test]
+    fn newer_than_and_older_than_partition_by_effective_date() {
+        let now = chrono::Utc::now();
+        let mut recent = Item {
+            id: 1,
+            source_id: "wacli".into(),
+            foreign_id: "a".into(),
+            title: "a".into(),
+            body: String::new(),
+            href: None,
+            start: Some((now - chrono::Duration::days(1)).to_rfc3339()),
+            end: None,
+            thread: None,
+            created_at: now.to_rfc3339(),
+            read: false,
+            labels: vec![],
+            parts: vec![],
+            ..Default::default()
+        };
+        let mut old = recent.clone();
+        old.id = 2;
+        old.start = Some((now - chrono::Duration::days(30)).to_rfc3339());
+
+        let recent_ib = InboxConfig {
+            name: "recent".into(),
+            newer_than: Some("14d".into()),
+            ..Default::default()
+        };
+        assert!(inbox_matches(&recent_ib, &recent));
+        assert!(!inbox_matches(&recent_ib, &old));
+
+        let dormant_ib = InboxConfig {
+            name: "dormant".into(),
+            older_than: Some("14d".into()),
+            ..Default::default()
+        };
+        assert!(!inbox_matches(&dormant_ib, &recent));
+        assert!(inbox_matches(&dormant_ib, &old));
+
+        // No start at all: falls back to created_at, still matches "recent".
+        recent.start = None;
+        assert!(inbox_matches(&recent_ib, &recent));
+    }
+
     #[test]
     fn child_requires_all_listed_labels() {
         let parent = InboxConfig {
@@ -266,6 +455,35 @@ mod tests {
         assert!(a.is_some());
         assert!(b.is_none());
         assert_eq!(store.list_all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn llm_classified_marks_and_persists() {
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        let id = store
+            .insert_new(&NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "x.md".into(),
+                title: "note".into(),
+                body: "hi".into(),
+                href: None,
+                start: None,
+                end: None,
+                thread: None,
+                parts: vec![],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert!(!store.llm_classified(id, "important").unwrap());
+        store.mark_llm_classified(id, "important").unwrap();
+        assert!(store.llm_classified(id, "important").unwrap());
+        // Distinct classifier id on the same item is tracked separately.
+        assert!(!store.llm_classified(id, "other").unwrap());
+        // Marking twice does not error (INSERT OR IGNORE).
+        store.mark_llm_classified(id, "important").unwrap();
     }
 
     #[test]
@@ -1703,6 +1921,32 @@ cmd = "{cmd}"
         let n = forget_stale(&store, &cfg).unwrap();
         assert_eq!(n, 1);
         assert!(store.list_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn forget_stale_keeps_start_only_past_item() {
+        // A `start` with no `end` is a timestamp (e.g. a chat message's send
+        // time), not a deadline — it must not trip the "past timed" forget path.
+        let (_tmp, paths) = temp_paths();
+        init(&paths).unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let store = Store::open(&paths.db_path).unwrap();
+        admit(
+            &store,
+            &cfg,
+            NewItem {
+                source_id: "incoming".into(),
+                foreign_id: "old-msg".into(),
+                title: "old msg".into(),
+                body: "hi".into(),
+                start: Some(yesterday()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let n = forget_stale(&store, &cfg).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(store.list_all().unwrap().len(), 1);
     }
 
     #[test]

@@ -8,9 +8,9 @@ use paddock::cmd::{run_verb, VerbCtx};
 use paddock::keys::{bindings_json, Verb};
 use paddock::theme::{load_theme, Theme};
 use paddock::{
-    collapse_threads, forget_stale, inbox_visible, items_in_chain, load_or_init, open_inbox_path,
-    pull_all, relabel, row_who_text, source_label, spawn_fs_watch, view_prefix, Config, Item,
-    PartKind, Paths, Store,
+    collapse_threads, copy_target, forget_stale, inbox_visible, items_in_chain, load_or_init,
+    open_inbox_path, pull_all, relabel, row_who_text, source_label, spawn_fs_watch, view_prefix,
+    Config, Item, PartKind, Paths, Store,
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -78,6 +78,7 @@ struct Q {
     on: Option<i64>,
     msg: Option<String>,
     only: Option<String>,
+    group: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -86,6 +87,7 @@ struct Xq {
     inbox: Option<String>,
     arg: Option<String>,
     only: Option<String>,
+    group: Option<String>,
     title: Option<String>,
     body: Option<String>,
     reply: Option<i64>,
@@ -124,6 +126,7 @@ async fn exec_x(
             &dest_base,
             &format!("not an editor command: {verb}"),
             q.only.as_deref(),
+            q.group.as_deref(),
         )));
     };
     let ctx = VerbCtx {
@@ -134,6 +137,7 @@ async fn exec_x(
             .map(|s| s.to_string())
             .collect(),
         unread_only: q.only.as_deref() == Some("1"),
+        group_by: q.group.clone().unwrap_or_else(|| "none".into()),
     };
     match run_verb(&st.store, &cfg, &st.paths, &ctx, &verb) {
         Ok(out) => {
@@ -148,21 +152,35 @@ async fn exec_x(
                 .unread_only
                 .map(|u| if u { "1" } else { "0" })
                 .or(q.only.as_deref().map(|s| if s == "1" { "1" } else { "0" }));
+            let group = out.group_by.clone().or(q.group.clone());
             let msg = if !out.status.is_empty() {
                 out.status
             } else {
                 out.overlay.unwrap_or_default()
             };
-            Ok(Redirect::to(&with_qs(&dest_base, &msg, only)))
+            Ok(Redirect::to(&with_qs(
+                &dest_base,
+                &msg,
+                only,
+                group.as_deref(),
+            )))
         }
-        Err(e) => Ok(Redirect::to(&with_qs(&dest_base, &e.to_string(), q.only.as_deref()))),
+        Err(e) => Ok(Redirect::to(&with_qs(
+            &dest_base,
+            &e.to_string(),
+            q.only.as_deref(),
+            q.group.as_deref(),
+        ))),
     }
 }
 
-fn with_qs(base: &str, msg: &str, only: Option<&str>) -> String {
+fn with_qs(base: &str, msg: &str, only: Option<&str>, group: Option<&str>) -> String {
     let mut parts = Vec::new();
     if only == Some("1") {
         parts.push("only=1".into());
+    }
+    if let Some(g) = group.filter(|g| !g.is_empty() && *g != "none") {
+        parts.push(format!("group={}", urlenc(g)));
     }
     if !msg.is_empty() {
         parts.push(format!("msg={}", urlenc(msg)));
@@ -179,7 +197,10 @@ async fn inbox_page(
     Path(path): Path<String>,
     Query(q): Query<Q>,
 ) -> Result<Redirect, Html<String>> {
-    let here = format!("/i/{path}");
+    let here = format!(
+        "/i/{path}{}",
+        qs_state(q.only.as_deref(), q.group.as_deref())
+    );
     let cfg = Config::load(&st.paths.config_file).map_err(|e| html_err(&st, &e.to_string()))?;
     if q.pull.is_some() {
         let _ = pull_all(&st.store, &cfg);
@@ -202,7 +223,29 @@ async fn inbox_page(
         let _ = relabel(&st.store, &cfg, id, label);
         return Ok(Redirect::to(&here));
     }
-    Err(render_inbox(&st, &cfg, &path, q.msg.as_deref(), q.only.as_deref() == Some("1")))
+    Err(render_inbox(
+        &st,
+        &cfg,
+        &path,
+        q.msg.as_deref(),
+        q.only.as_deref() == Some("1"),
+        paddock::GroupBy::parse(q.group.as_deref().unwrap_or("none")),
+    ))
+}
+
+fn qs_state(only: Option<&str>, group: Option<&str>) -> String {
+    let mut parts = Vec::new();
+    if only == Some("1") {
+        parts.push("only=1".into());
+    }
+    if let Some(g) = group.filter(|g| !g.is_empty() && *g != "none") {
+        parts.push(format!("group={}", urlenc(g)));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", parts.join("&"))
+    }
 }
 
 async fn item_page(
@@ -231,7 +274,14 @@ fn theme_of(st: &AppState) -> Theme {
     load_theme(&cfg, &st.paths)
 }
 
-fn render_inbox(st: &AppState, cfg: &Config, path: &str, msg: Option<&str>, only: bool) -> Html<String> {
+fn render_inbox(
+    st: &AppState,
+    cfg: &Config,
+    path: &str,
+    msg: Option<&str>,
+    only: bool,
+    group: paddock::GroupBy,
+) -> Html<String> {
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let chain = cfg.find_chain(&parts);
     let mut items = match &chain {
@@ -241,8 +291,9 @@ fn render_inbox(st: &AppState, cfg: &Config, path: &str, msg: Option<&str>, only
     if only {
         items.retain(|i| !i.read);
     }
-    let rows = collapse_threads(items);
+    let rows = paddock::group_rows(collapse_threads(items), cfg, group);
     let nav = render_tree(cfg, &st.store, &parts);
+    let qs = qs_state(only.then_some("1"), Some(group.as_str()));
     let list = if rows.is_empty() {
         "<p class=\"empty\">empty</p>".into()
     } else {
@@ -250,8 +301,19 @@ fn render_inbox(st: &AppState, cfg: &Config, path: &str, msg: Option<&str>, only
             "<table><thead><tr><th></th><th>who</th><th>snippet</th><th>source</th><th>when</th><th></th><th></th></tr></thead><tbody>",
         );
         let inbox = chain.as_ref().and_then(|c| c.last()).copied();
+        let mut last_group: Option<String> = None;
         for (n, row) in rows.iter().enumerate() {
             let it = &row.item;
+            if !matches!(group, paddock::GroupBy::None) {
+                let key = paddock::group_key(it, cfg, group);
+                if last_group.as_deref() != Some(key.as_str()) {
+                    last_group = Some(key.clone());
+                    html.push_str(&format!(
+                        "<tr class=\"grouphead\"><td colspan=\"7\">{}</td></tr>",
+                        esc(&key)
+                    ));
+                }
+            }
             let mark = if it.read { "" } else { "*" };
             let cls = if it.read { "read" } else { "unread" };
             let cur = if n == 0 { " cur" } else { "" };
@@ -265,29 +327,49 @@ fn render_inbox(st: &AppState, cfg: &Config, path: &str, msg: Option<&str>, only
                 String::new()
             };
             html.push_str(&format!(
-                "<tr class=\"{cls}{cur}\" data-id=\"{id}\"><td class=\"mark\">{mark}</td><td><a href=\"/item/{id}\">{who}</a></td><td class=\"dim\">{snippet}</td><td class=\"dim\">{src}</td><td class=\"dim\">{when}</td><td class=\"dim\">{count}</td><td><a href=\"/i/{path}?toggle={id}\">read</a></td></tr>",
+                "<tr class=\"{cls}{cur}\" data-id=\"{id}\"><td class=\"mark\">{mark}</td><td><a href=\"/item/{id}\">{who}</a></td><td class=\"dim\">{snippet}</td><td class=\"dim\">{src}</td><td class=\"dim\">{when}</td><td class=\"dim\">{count}</td><td><a href=\"/i/{path}?toggle={id}{amp_qs}\">read</a></td></tr>",
                 id = it.id,
                 who = esc(&format!("{prefix}{who}")),
                 snippet = esc(&snippet),
                 src = esc(src),
                 path = esc(path),
+                amp_qs = qs.replacen('?', "&", 1),
             ));
         }
         html.push_str("</tbody></table>");
         html
     };
     let crumb = parts.join(" / ");
-    let heading = if only {
-        format!("{crumb}  unread")
-    } else {
-        crumb.clone()
-    };
+    let mut heading = crumb.clone();
+    if only {
+        heading.push_str("  unread");
+    }
+    if !matches!(group, paddock::GroupBy::None) {
+        heading.push_str(&format!("  by:{}", group.as_str()));
+    }
     let missing = if chain.is_none() {
         format!("<p class=\"empty\">no inbox named {}</p>", esc(path))
     } else {
         String::new()
     };
     let status = msg.unwrap_or("");
+    let pull_href = format!(
+        "/i/{}{}pull=1",
+        esc(path),
+        if qs.is_empty() { "?".into() } else { format!("{qs}&") }
+    );
+    let path_esc = esc(path);
+    let group_links = ["none", "sender", "date", "account"]
+        .iter()
+        .map(|g| {
+            let cls = if *g == group.as_str() { " sel" } else { "" };
+            format!(
+                "<a class=\"grp{cls}\" href=\"/i/{path_esc}{}\">{g}</a>",
+                qs_state(only.then_some("1"), Some(g)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     page(
         &theme_of(st),
         &heading,
@@ -295,14 +377,14 @@ fn render_inbox(st: &AppState, cfg: &Config, path: &str, msg: Option<&str>, only
             r#"<div class="wrap">
 <nav>{nav}</nav>
 <main>
-<header class="bar"><h1>{heading}</h1><a href="/compose">compose</a><a href="/i/{path}?pull=1">pull</a></header>
+<header class="bar"><h1>{heading}</h1><a href="/compose">compose</a><a href="{pull_href}">pull</a></header>
+<p class="groupbar dim">group by {group_links}</p>
 {missing}
 {list}
 </main>
 </div>
 <p class="status">{status}</p>"#,
             heading = esc(&heading),
-            path = esc(path),
             status = esc(status),
         ),
     )
@@ -387,6 +469,13 @@ fn render_item(st: &AppState, it: &Item, msg: Option<&str>) -> Html<String> {
     let show_parts = it.parts.len() > 1
         || it.parts.iter().any(|p| p.kind != paddock::PartKind::Text);
     let cite = cite_html(it);
+    let copy_html = match copy_target(it) {
+        Some(c) => format!(
+            r#"<p class="copy">copy <button type="button" class="copybtn" data-copy="{c}">{c}</button></p>"#,
+            c = esc(&c)
+        ),
+        None => String::new(),
+    };
     let parts_html = if show_parts {
         let mut s = String::from("<ul class=\"parts\">");
         for p in &it.parts {
@@ -419,6 +508,7 @@ fn render_item(st: &AppState, it: &Item, msg: Option<&str>) -> Html<String> {
 {thread_line}
 {cite}
 <p class="labels">labels {labels} · <a href="/item/{id}?label=later">later</a> · <a href="/item/{id}?label=todo">todo</a></p>
+{copy_html}
 <pre>{body}</pre>
 {parts_html}
 </main>
@@ -648,6 +738,14 @@ pre { white-space: pre-wrap; word-break: break-word; margin: 16px 0 0; }
 form.compose label { display: block; color: var(--dim); margin: 8px 0 2px; }
 form.compose input, form.compose textarea { width: 100%; background: var(--bg); color: var(--fg); border: 1px solid var(--border); font: inherit; padding: 4px 6px; }
 form.compose button { margin-top: 12px; }
+.groupbar { margin: 8px 0; }
+.groupbar a { margin-right: 10px; }
+.groupbar a.sel { color: var(--fg); font-weight: 700; text-decoration: underline; }
+tr.grouphead td { padding-top: 10px; color: var(--dim); font-weight: 700; border-bottom: none; }
+.copy { margin: 10px 0 0; color: var(--dim); }
+.copybtn { font: inherit; background: var(--bg); color: var(--accent); border: 1px solid var(--border); padding: 1px 6px; cursor: pointer; }
+.copybtn:hover { border-color: var(--accent); }
+.copybtn.copied { color: var(--unread); border-color: var(--unread); }
 .status { position: fixed; bottom: 0; left: 0; right: 0; padding: 2px 8px; color: var(--dim); background: var(--bg); }
 #cmdwrap { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg); border-top: 1px solid var(--border); padding: 4px 8px; z-index: 2; }
 #cmdwrap input { background: transparent; border: 0; color: var(--fg); font: inherit; width: 90%; outline: none; }
@@ -754,7 +852,34 @@ const JS: &str = r#"
       var name = prompt('label');
       if(name) runRemote('relabel', name);
     }
+    else if(verb==='yank'){
+      var btn = document.querySelector('.copybtn');
+      if(btn) btn.click();
+    }
   }
+  function copyText(text){
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).catch(function(){ legacyCopy(text); });
+    } else {
+      legacyCopy(text);
+    }
+  }
+  function legacyCopy(text){
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    try { document.execCommand('copy'); } catch(e){}
+    document.body.removeChild(ta);
+  }
+  document.addEventListener('click', function(e){
+    var btn = e.target.closest && e.target.closest('.copybtn');
+    if(!btn) return;
+    copyText(btn.getAttribute('data-copy'));
+    btn.classList.add('copied');
+    var st = document.querySelector('.status');
+    if(st) st.textContent = 'copied';
+    setTimeout(function(){ btn.classList.remove('copied'); }, 1200);
+  });
   function runRemote(verb, arg){
     var u = '/x/'+encodeURIComponent(verb)
       +'?item='+encodeURIComponent(itemId()||'0')
@@ -764,7 +889,9 @@ const JS: &str = r#"
     location.href = u;
   }
   function dispatch(binding, arg){
-    if(binding.local) runLocal(binding.verb);
+    // yank needs a real click for the clipboard permission, so it's handled
+    // locally on web even though the TUI does it through run_verb.
+    if(binding.local || binding.verb==='yank') runLocal(binding.verb);
     else runRemote(binding.verb, arg);
   }
   document.addEventListener('keydown', function(e){
@@ -800,7 +927,7 @@ const JS: &str = r#"
           if(st) st.textContent = (B.unknown_prefix||'not an editor command: ')+word;
           return;
         }
-        if(c.verb==='help' || c.verb==='quit' || c.verb==='command'){ runLocal(c.verb); return; }
+        if(c.verb==='help' || c.verb==='quit' || c.verb==='command' || c.verb==='yank'){ runLocal(c.verb); return; }
         runRemote(c.verb, rest);
       }
     });

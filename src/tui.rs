@@ -8,9 +8,9 @@ use paddock::cmd::{run_verb, VerbCtx};
 use paddock::keys::{feed, parse_colon, Feed, KeySeq, Verb, HELP};
 use paddock::theme::{load_theme, Theme};
 use paddock::{
-    collapse_threads, display_width, filter_visible_inboxes, items_in_chain, load_or_init,
-    open_inbox_path, pad_width, row_who_text, source_label, spawn_fs_watch, trunc_width,
-    view_prefix, Config, InboxConfig, Item, ListRow, Paths, Store, IDLE_HINT,
+    collapse_threads, copy_target, display_width, filter_visible_inboxes, items_in_chain,
+    load_or_init, open_inbox_path, pad_width, row_who_text, source_label, spawn_fs_watch,
+    trunc_width, view_prefix, Config, InboxConfig, Item, ListRow, Paths, Store, IDLE_HINT,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -62,6 +62,7 @@ struct App {
     last_gen: u64,
     keys: KeySeq,
     unread_only: bool,
+    group_by: paddock::GroupBy,
     list_height: usize,
     from_compose: bool,
     compose_reply_to: Option<i64>,
@@ -94,6 +95,7 @@ impl App {
             last_gen: paddock::engine::gen(),
             keys: KeySeq::default(),
             unread_only: true,
+            group_by: paddock::GroupBy::None,
             list_height: 12,
             from_compose: false,
             compose_reply_to: None,
@@ -152,7 +154,8 @@ impl App {
         if self.unread_only {
             items.retain(|i| !i.read);
         }
-        self.items = collapse_threads(items);
+        let rows = collapse_threads(items);
+        self.items = paddock::group_rows(rows, &self.config, self.group_by);
         if self.items.is_empty() {
             self.item_state.select(None);
         } else {
@@ -236,6 +239,7 @@ impl App {
             item_id: self.current_item_id(),
             inbox_path: self.selected_path(),
             unread_only: self.unread_only,
+            group_by: self.group_by.as_str().to_string(),
         }
     }
 
@@ -243,8 +247,14 @@ impl App {
         if !out.status.is_empty() {
             self.status = out.status;
         }
+        if let Some(text) = &out.clipboard {
+            osc52_copy(text);
+        }
         if let Some(u) = out.unread_only {
             self.unread_only = u;
+        }
+        if let Some(g) = &out.group_by {
+            self.group_by = paddock::GroupBy::parse(g);
         }
         if out.reload_config {
             if let Ok(c) = Config::load(&self.paths.config_file) {
@@ -803,11 +813,14 @@ fn draw_item_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         } else {
             p.join("/")
         };
+        let mut t = format!(" {name} ");
         if app.unread_only {
-            format!(" {name}  unread ")
-        } else {
-            format!(" {name} ")
+            t.push_str(" unread ");
         }
+        if !matches!(app.group_by, paddock::GroupBy::None) {
+            t.push_str(&format!(" by:{} ", app.group_by.as_str()));
+        }
+        t
     };
     let inner_w = area.width.saturating_sub(2) as usize;
     let items: Vec<ListItem> = if app.items.is_empty() {
@@ -818,6 +831,7 @@ fn draw_item_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     } else {
         let inbox = app.chain().last().copied();
         let dim = Style::default().fg(rgb(th.c_dim()));
+        let mut last_group: Option<String> = None;
         app.items
             .iter()
             .map(|row| {
@@ -829,9 +843,20 @@ fn draw_item_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 };
                 let prefix = view_prefix(inbox, it);
                 let src = source_label(&app.config, &it.source_id);
-                ListItem::new(format_list_line(
-                    it, row.count, src, &prefix, inner_w, style, dim,
-                ))
+                let line = format_list_line(it, row.count, src, &prefix, inner_w, style, dim);
+                if matches!(app.group_by, paddock::GroupBy::None) {
+                    return ListItem::new(line);
+                }
+                let key = paddock::group_key(it, &app.config, app.group_by);
+                if last_group.as_deref() == Some(key.as_str()) {
+                    return ListItem::new(line);
+                }
+                last_group = Some(key.clone());
+                let header = Line::from(Span::styled(
+                    format!(" {key}"),
+                    dim.add_modifier(Modifier::BOLD),
+                ));
+                ListItem::new(vec![header, line])
             })
             .collect()
     };
@@ -968,6 +993,9 @@ fn draw_read(f: &mut ratatui::Frame, app: &App, area: Rect) {
     {
         head.push_str(&cite_line(it));
         head.push('\n');
+    }
+    if let Some(copy) = copy_target(it) {
+        head.push_str(&format!("copy [y]  {copy}\n"));
     }
     let mut text = format!("{head}\n{}", it.body);
     let show_parts = it.parts.len() > 1
@@ -1179,6 +1207,37 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
         width: w,
         height: h,
     }
+}
+
+/// Push `text` to the terminal's system clipboard via OSC 52. Works over SSH
+/// and through most multiplexers (tmux, herdr) that pass the escape through;
+/// a terminal that doesn't support it just ignores the sequence.
+fn osc52_copy(text: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    let _ = out.flush();
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied();
+        let b2 = chunk.get(2).copied();
+        out.push(ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1.unwrap_or(0) >> 4)) as usize] as char);
+        out.push(match b1 {
+            Some(b1) => ALPHABET[(((b1 & 0x0f) << 2) | (b2.unwrap_or(0) >> 6)) as usize] as char,
+            None => '=',
+        });
+        out.push(match b2 {
+            Some(b2) => ALPHABET[(b2 & 0x3f) as usize] as char,
+            None => '=',
+        });
+    }
+    out
 }
 
 fn short_time(rfc: &str) -> String {

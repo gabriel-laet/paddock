@@ -7,9 +7,9 @@ use std::process::Command;
 
 use crate::config::{Config, Paths};
 use crate::engine::{
-    admit_file, classify_item, default_send_source, filter_for_chain, forget, forget_stale,
-    items_in_chain, pull_all, relabel, reply_title, send_draft, source_can_send, stamp,
-    unique_path,
+    admit_file, classify_item, copy_target, default_send_source, filter_for_chain, forget,
+    forget_stale, items_in_chain, pull_all, relabel, reply_title, send_draft, source_can_send,
+    stamp, unique_path,
 };
 use crate::keys::{Verb, HELP};
 use crate::source::Draft;
@@ -20,6 +20,8 @@ pub struct VerbCtx {
     pub item_id: Option<i64>,
     pub inbox_path: Vec<String>,
     pub unread_only: bool,
+    /// Current GroupBy::as_str() — "none" (default) if unset.
+    pub group_by: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -32,6 +34,11 @@ pub struct Outcome {
     pub overlay: Option<String>,
     pub open_compose: bool,
     pub reply_to: Option<i64>,
+    /// Text a renderer should push to the OS clipboard (TUI: OSC 52; web: a
+    /// copy button already carries this, so it doesn't need the field).
+    pub clipboard: Option<String>,
+    /// New GroupBy::as_str(), when a GroupCycle changed it.
+    pub group_by: Option<String>,
 }
 
 fn ok_status(s: impl Into<String>) -> Outcome {
@@ -158,10 +165,15 @@ pub fn run_verb(
                 Ok(i) => i,
                 Err(o) => return Ok(o),
             };
+            let text = copy_target(&item).unwrap_or_else(|| item.title.clone());
             fs::create_dir_all(&paths.data_dir)?;
             let dest = paths.data_dir.join("yank");
-            fs::write(&dest, item.title.as_bytes())?;
-            Ok(ok_status(format!("yank {}", dest.display())))
+            fs::write(&dest, text.as_bytes())?;
+            Ok(Outcome {
+                status: format!("yanked: {text}"),
+                clipboard: Some(text),
+                ..Outcome::default()
+            })
         }
         Verb::Open => {
             let item = match need_item(store, ctx)? {
@@ -277,6 +289,14 @@ pub fn run_verb(
             },
             ..Outcome::default()
         }),
+        Verb::GroupCycle => {
+            let next = crate::engine::GroupBy::parse(&ctx.group_by).next();
+            Ok(Outcome {
+                group_by: Some(next.as_str().to_string()),
+                status: format!("group by {}", next.as_str()),
+                ..Outcome::default()
+            })
+        }
         Verb::Spill => {
             let refs: Vec<&str> = ctx.inbox_path.iter().map(|s| s.as_str()).collect();
             let chain = config.find_chain(&refs).unwrap_or_default();

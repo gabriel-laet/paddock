@@ -7,8 +7,11 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use crate::classify::run_classifier;
-use crate::config::{expand_path, Config, InboxConfig, Paths, SourceConfig};
+use crate::classify::{run_classifier, LlmClassifier};
+use crate::config::{
+    expand_path, parse_duration, parse_when, source_label, Config, InboxConfig, Paths,
+    SourceConfig,
+};
 use crate::source::{item_from_file, pull_exec, pull_fs, pull_rss, send_exec, Draft, NewItem};
 use crate::store::{Item, ItemFilter, StaleHint, Store};
 
@@ -85,7 +88,26 @@ fn walk_inbox(store: &Store, inbox: &InboxConfig, item: &mut Item) -> Result<()>
 
 fn apply_classifiers(store: &Store, classifiers: &[crate::config::ClassifierConfig], item: &mut Item) -> Result<()> {
     for cfg in classifiers {
-        if let Some(label) = run_classifier(cfg, item)? {
+        let label = if cfg.kind == "llm" {
+            if store.llm_classified(item.id, &cfg.id)? {
+                continue;
+            }
+            match LlmClassifier::new(cfg)?.classify_result(item) {
+                Ok(label) => {
+                    store.mark_llm_classified(item.id, &cfg.id)?;
+                    label
+                }
+                Err(e) => {
+                    // Transient (key missing, rate limit, network): don't cache
+                    // the miss, so the next pull tries again instead of giving up.
+                    eprintln!("classifier {}: {e:#}", cfg.id);
+                    None
+                }
+            }
+        } else {
+            run_classifier(cfg, item)?
+        };
+        if let Some(label) = label {
             if !item.labels.iter().any(|l| l == &label) {
                 store.add_label(item.id, &label)?;
                 item.labels.push(label);
@@ -143,6 +165,11 @@ pub fn filter_for_chain(chain: &[&InboxConfig]) -> ItemFilter {
     let mut sources: Option<Vec<String>> = None;
     let mut labels = Vec::new();
     let mut timed = false;
+    let now = chrono::Utc::now();
+    // Most restrictive wins when more than one inbox in the chain sets a bound:
+    // newer_than -> latest cutoff (item must be at least this fresh); older_than -> earliest.
+    let mut newer_than: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut older_than: Option<chrono::DateTime<chrono::Utc>> = None;
     for ib in chain {
         if !ib.sources.is_empty() {
             sources = Some(match sources.take() {
@@ -157,12 +184,20 @@ pub fn filter_for_chain(chain: &[&InboxConfig]) -> ItemFilter {
         if ib.timed {
             timed = true;
         }
+        if let Some(cutoff) = ib.newer_than.as_deref().and_then(parse_duration).map(|d| now - d) {
+            newer_than = Some(newer_than.map_or(cutoff, |c| c.max(cutoff)));
+        }
+        if let Some(cutoff) = ib.older_than.as_deref().and_then(parse_duration).map(|d| now - d) {
+            older_than = Some(older_than.map_or(cutoff, |c| c.min(cutoff)));
+        }
     }
     ItemFilter {
         sources,
         labels,
         timed,
         unread_only: false,
+        newer_than: newer_than.map(|c| c.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        older_than: older_than.map(|c| c.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
         order_by_start: chain.last().is_some_and(|ib| ib.view_kind() == "calendar"),
     }
 }
@@ -202,10 +237,12 @@ fn keep_labels(config: &Config) -> Vec<String> {
 }
 
 fn should_forget_stale(item: &StaleHint, config: &Config, now: chrono::DateTime<chrono::Utc>) -> bool {
-    let timed = nonempty(item.start.as_deref()).is_some() || nonempty(item.end.as_deref()).is_some();
+    // `end` (not `start` alone) means "this has a deadline that passed" — a
+    // calendar event. A start-only item (e.g. a chat message's send time) is
+    // not a deadline, so it stays on the forget_after path like before.
+    let timed = nonempty(item.end.as_deref()).is_some();
     if timed {
-        let raw = nonempty(item.end.as_deref()).or_else(|| nonempty(item.start.as_deref()));
-        return match raw.and_then(parse_when) {
+        return match nonempty(item.end.as_deref()).and_then(parse_when) {
             Some(dt) => dt < now,
             None => false,
         };
@@ -227,28 +264,6 @@ fn should_forget_stale(item: &StaleHint, config: &Config, now: chrono::DateTime<
 
 fn nonempty(s: Option<&str>) -> Option<&str> {
     s.map(str::trim).filter(|s| !s.is_empty())
-}
-
-fn parse_when(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    let s = s.trim();
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&chrono::Utc));
-    }
-    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .ok()
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-        .map(|n| n.and_utc())
-}
-
-fn parse_duration(s: &str) -> Option<chrono::Duration> {
-    let s = s.trim();
-    if let Some(n) = s.strip_suffix(['d', 'D']) {
-        return n.trim().parse::<i64>().ok().map(chrono::Duration::days);
-    }
-    if let Some(n) = s.strip_suffix(['h', 'H']) {
-        return n.trim().parse::<i64>().ok().map(chrono::Duration::hours);
-    }
-    None
 }
 
 pub struct WatchGuard {
@@ -506,6 +521,7 @@ pub fn send_draft(store: &Store, config: &Config, paths: &Paths, draft: Draft) -
                 forward_of: None,
                 cite_excerpt: None,
                 cite_actor: None,
+                read: None,
             };
             Ok(admit(store, config, new)?)
         }
@@ -538,6 +554,7 @@ pub fn send_draft(store: &Store, config: &Config, paths: &Paths, draft: Draft) -
                 forward_of: None,
                 cite_excerpt: None,
                 cite_actor: None,
+                read: None,
             };
             Ok(admit(store, config, new)?)
         }
@@ -590,6 +607,150 @@ fn is_newer_item(a: &Item, b: &Item) -> bool {
         std::cmp::Ordering::Equal => a.id > b.id,
         std::cmp::Ordering::Less => false,
     }
+}
+
+/// How to cluster the item list for display. Same across TUI and web — only
+/// the rendering of the group header differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupBy {
+    #[default]
+    None,
+    Sender,
+    Date,
+    Account,
+}
+
+impl GroupBy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GroupBy::None => "none",
+            GroupBy::Sender => "sender",
+            GroupBy::Date => "date",
+            GroupBy::Account => "account",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "sender" => GroupBy::Sender,
+            "date" => GroupBy::Date,
+            "account" => GroupBy::Account,
+            _ => GroupBy::None,
+        }
+    }
+
+    /// Cycle order for a single "group" keypress/command.
+    pub fn next(self) -> Self {
+        match self {
+            GroupBy::None => GroupBy::Sender,
+            GroupBy::Sender => GroupBy::Date,
+            GroupBy::Date => GroupBy::Account,
+            GroupBy::Account => GroupBy::None,
+        }
+    }
+}
+
+/// The label an item falls under for a given grouping.
+pub fn group_key(item: &Item, config: &Config, by: GroupBy) -> String {
+    match by {
+        GroupBy::None => String::new(),
+        GroupBy::Sender => item
+            .from
+            .as_ref()
+            .map(|a| a.name.clone().unwrap_or_else(|| a.id.clone()))
+            .unwrap_or_else(|| "(unknown)".into()),
+        GroupBy::Date => item.created_at.chars().take(10).collect(),
+        GroupBy::Account => source_label(config, &item.source_id).to_string(),
+    }
+}
+
+/// Reorder rows so same-group rows are contiguous. Stable, so newest-first
+/// order survives within a group. Date is already contiguous in a
+/// newest-first list, so it's left as-is; sender/account need an actual sort.
+pub fn group_rows(mut rows: Vec<ListRow>, config: &Config, by: GroupBy) -> Vec<ListRow> {
+    if matches!(by, GroupBy::Sender | GroupBy::Account) {
+        rows.sort_by(|a, b| group_key(&a.item, config, by).cmp(&group_key(&b.item, config, by)));
+    }
+    rows
+}
+
+/// The single most useful thing to copy out of an item: a verification code
+/// if one is found, else the first link in the body. Shared by TUI (yank) and
+/// web (copy button) — same extraction, different delivery to the clipboard.
+pub fn copy_target(item: &Item) -> Option<String> {
+    extract_code(item).or_else(|| extract_link(item))
+}
+
+/// How far past a "code"-ish keyword to look for the value. Templates often
+/// put a sentence of filler ("...to enable your new device — it will expire
+/// in 30 minutes: 122cd3") between the two.
+const CODE_WINDOW: usize = 200;
+
+fn extract_code(item: &Item) -> Option<String> {
+    // Body first: the subject/title routinely says "your verification code"
+    // without the value anywhere near it — only the body has the real one.
+    // Searching title+body concatenated would let a title match "code" and
+    // then scan the *start* of the body (e.g. a date field) for nothing.
+    if let Some(code) = extract_code_from(&item.body) {
+        return Some(code);
+    }
+    if let Some(code) = extract_code_from(&item.title) {
+        return Some(code);
+    }
+    // No keyword nearby: only guess from bare digits when the item was
+    // already flagged as a code/verification email — avoids matching prices,
+    // dates, or invoice numbers on ordinary mail.
+    if item.labels.iter().any(|l| l == "code") {
+        return bare_code_re()
+            .find(&item.body)
+            .or_else(|| bare_code_re().find(&item.title))
+            .map(|m| m.as_str().to_string());
+    }
+    None
+}
+
+fn extract_code_from(text: &str) -> Option<String> {
+    let m = code_keyword_re().find(text)?;
+    let mut end = (m.end() + CODE_WINDOW).min(text.len());
+    while end > m.end() && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let window = &text[m.end()..end];
+    // Codes aren't always all-digit ("122cd3") — a plain contiguous run, no
+    // internal spaces (those would swallow neighboring words too). Skip
+    // plain words (no digit) in the window instead of giving up on the
+    // first one, since the code is often a few words further along.
+    alnum_token_re()
+        .find_iter(window)
+        .find(|m| m.as_str().chars().any(|c| c.is_ascii_digit()))
+        .map(|m| m.as_str().to_string())
+}
+
+fn extract_link(item: &Item) -> Option<String> {
+    let blob = format!("{} {}", item.title, item.body);
+    link_re()
+        .find(&blob)
+        .map(|m| m.as_str().trim_end_matches(['.', ',', ')', ']', '>']).to_string())
+}
+
+fn code_keyword_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"(?i)code|otp|passcode|pin|c[oó]digo").expect("valid regex"))
+}
+
+fn alnum_token_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\b[A-Za-z0-9]{4,10}\b").expect("valid regex"))
+}
+
+fn bare_code_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\b\d{4,8}\b").expect("valid regex"))
+}
+
+fn link_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r#"https?://[^\s<>"')\]]+"#).expect("valid regex"))
 }
 
 /// First non-empty line of body, whitespace collapsed.

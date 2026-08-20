@@ -48,6 +48,7 @@ pub enum Verb {
     Which,
     Db,
     Only,
+    GroupCycle,
     Spill,
     Pull,
     Theme { name: Option<String> },
@@ -97,6 +98,7 @@ impl Verb {
             Verb::Which => "which",
             Verb::Db => "db",
             Verb::Only => "only",
+            Verb::GroupCycle => "group",
             Verb::Spill => "spill",
             Verb::Pull => "pull",
             Verb::Theme { .. } => "theme",
@@ -182,6 +184,7 @@ impl Verb {
             "which" => Verb::Which,
             "db" => Verb::Db,
             "only" => Verb::Only,
+            "group" => Verb::GroupCycle,
             "spill" => Verb::Spill,
             "pull" => Verb::Pull,
             "forget" => Verb::Forget,
@@ -236,6 +239,8 @@ const BINDINGS: &[Binding] = &[
     Binding { seq: "L", verb: "label-prompt", local: true },
     Binding { seq: "c", verb: "compose", local: false },
     Binding { seq: "R", verb: "reply", local: false },
+    Binding { seq: "y", verb: "yank", local: false },
+    Binding { seq: "s", verb: "group", local: false },
 ];
 
 #[derive(Clone, Copy)]
@@ -269,6 +274,7 @@ const COLONS: &[(&str, ColonSpec)] = &[
     ("which", ColonSpec::Unit("which")),
     ("db", ColonSpec::Unit("db")),
     ("only", ColonSpec::Unit("only")),
+    ("group", ColonSpec::Unit("group")),
     ("spill", ColonSpec::Unit("spill")),
 ];
 
@@ -288,6 +294,8 @@ u              unread
 dd             eat (mark read)
 /  n N         search
 L              label (toggle + classify)
+y              yank (copy code/link/title)
+s              cycle group-by (none/sender/date/account)
 :              command
 ?              help
 c              compose
@@ -300,7 +308,7 @@ q              quit
 :why  :again  :eat  :forget  :bury  :todo
 :yank  :open  :new TITLE
 :compose  :reply  :send  :w
-:which  :db  :only  :spill
+:which  :db  :only  :group  :spill
 ";
 
 #[derive(Debug, Default)]

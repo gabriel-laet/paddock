@@ -142,6 +142,13 @@ pub struct InboxConfig {
     /// If true, match only items that have `start` set.
     #[serde(default)]
     pub timed: bool,
+    /// Match only items whose effective date (`start`, else `created_at`) is
+    /// within this duration of now (`"14d"`, `"24h"`).
+    #[serde(default)]
+    pub newer_than: Option<String>,
+    /// Match only items whose effective date is older than this duration.
+    #[serde(default)]
+    pub older_than: Option<String>,
     #[serde(default)]
     pub classifier: Vec<ClassifierConfig>,
     #[serde(default)]
@@ -295,7 +302,8 @@ fn find_chain<'a>(inboxes: &'a [InboxConfig], path: &[&str]) -> Option<Vec<&'a I
 
 /// Item matches an inbox if (sources empty OR source in list)
 /// AND (labels empty OR item has ALL listed labels)
-/// AND (not timed OR item.start is a non-empty string).
+/// AND (not timed OR item.start is a non-empty string)
+/// AND (newer_than/older_than, if set, bound the item's effective date).
 pub fn inbox_matches(inbox: &InboxConfig, item: &Item) -> bool {
     let source_ok =
         inbox.sources.is_empty() || inbox.sources.iter().any(|s| s == &item.source_id);
@@ -303,7 +311,62 @@ pub fn inbox_matches(inbox: &InboxConfig, item: &Item) -> bool {
         || inbox.labels.iter().all(|l| item.labels.iter().any(|x| x == l));
     let timed_ok = !inbox.timed
         || item.start.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
-    source_ok && labels_ok && timed_ok
+    source_ok && labels_ok && timed_ok && age_matches(inbox, item, chrono::Utc::now())
+}
+
+/// Item's own date: `start` (a message's real timestamp) if set, else
+/// `created_at` (when paddock first admitted it).
+fn effective_when(item: &Item) -> Option<chrono::DateTime<chrono::Utc>> {
+    let raw = item
+        .start
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&item.created_at);
+    parse_when(raw)
+}
+
+fn age_matches(inbox: &InboxConfig, item: &Item, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if inbox.newer_than.is_none() && inbox.older_than.is_none() {
+        return true;
+    }
+    // No date info at all: don't hide the item behind an age filter.
+    let Some(when) = effective_when(item) else {
+        return true;
+    };
+    if let Some(cutoff) = inbox.newer_than.as_deref().and_then(parse_duration) {
+        if when < now - cutoff {
+            return false;
+        }
+    }
+    if let Some(cutoff) = inbox.older_than.as_deref().and_then(parse_duration) {
+        if when >= now - cutoff {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn parse_when(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = s.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|n| n.and_utc())
+}
+
+pub(crate) fn parse_duration(s: &str) -> Option<chrono::Duration> {
+    let s = s.trim();
+    if let Some(n) = s.strip_suffix(['d', 'D']) {
+        return n.trim().parse::<i64>().ok().map(chrono::Duration::days);
+    }
+    if let Some(n) = s.strip_suffix(['h', 'H']) {
+        return n.trim().parse::<i64>().ok().map(chrono::Duration::hours);
+    }
+    None
 }
 
 pub fn chain_matches(chain: &[&InboxConfig], item: &Item) -> bool {
