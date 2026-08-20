@@ -26,6 +26,9 @@ pub struct NewItem {
     pub forward_of: Option<String>,
     pub cite_excerpt: Option<String>,
     pub cite_actor: Option<Actor>,
+    /// Read state reported by the source, if it tracks one (e.g. a chat's
+    /// unread tail). `None` means the source has no opinion.
+    pub read: Option<bool>,
 }
 
 /// A compose or reply waiting to become an item.
@@ -235,6 +238,8 @@ struct ExecItem {
     cite_actor: Option<ExecActor>,
     #[serde(default)]
     parts: Vec<ExecPart>,
+    #[serde(default)]
+    read: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -329,6 +334,7 @@ fn exec_item_to_new(source_id: &str, it: ExecItem) -> NewItem {
         forward_of: empty_to_none(it.forward_of),
         cite_excerpt: empty_to_none(it.cite_excerpt),
         cite_actor: it.cite_actor.map(actor_from_exec),
+        read: it.read,
     }
 }
 

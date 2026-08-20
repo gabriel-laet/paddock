@@ -184,6 +184,12 @@ impl LlmClassifier {
         })
     }
 
+    /// Like `classify`, but keeps the error instead of swallowing it — callers
+    /// that cache "already classified" need to know a call failed vs. decided no.
+    pub fn classify_result(&self, item: &Item) -> Result<Option<String>> {
+        self.classify_inner(item)
+    }
+
     fn classify_inner(&self, item: &Item) -> Result<Option<String>> {
         let raw = if let Some(fix) = env_nonempty("PADDOCK_LLM_FIXTURE") {
             fix

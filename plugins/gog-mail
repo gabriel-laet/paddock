@@ -6,6 +6,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lib  # noqa: E402
 
 
+def _full_body(account: str, message_id: str) -> str | None:
+    """Fetch the decoded plaintext body for one message. None on any failure
+    (permission, deleted, unknown flag) — caller falls back to the snippet."""
+    if not message_id:
+        return None
+    try:
+        full = lib.gog_run(
+            ["--account", account, "gmail", "get", message_id, "--format", "full", "--results-only"]
+        )
+    except SystemExit:
+        return None
+    body = full.get("body") if isinstance(full, dict) else None
+    if not isinstance(body, str) or not body.strip():
+        return None
+    return lib.html_to_text(body)
+
+
 def _map_message(msg: dict, account: str, thread_hint: str) -> dict | None:
     mid = str(lib.pick(msg, "id", "messageId", "message_id") or "").strip()
     tid = str(lib.pick(msg, "threadId", "thread_id", "thread") or thread_hint or "").strip()
@@ -14,7 +31,7 @@ def _map_message(msg: dict, account: str, thread_hint: str) -> dict | None:
     payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else {}
     headers = lib.header_map(payload.get("headers") if payload else msg.get("headers"))
     title = headers.get("subject") or str(lib.pick(msg, "subject", "title") or "")
-    body = str(lib.pick(msg, "snippet", "body") or "")
+    body = _full_body(account, mid) or str(lib.pick(msg, "snippet", "body") or "")
     frm = lib.parse_from_header(headers.get("from")) or lib.email_actor(msg.get("from"))
     item = {
         "foreign_id": f"{account}/{mid or tid}",
@@ -48,7 +65,7 @@ def _map_thread(th: dict, account: str) -> list[dict]:
     if payload:
         headers = lib.header_map(payload.get("headers"))
     title = headers.get("subject") or str(lib.pick(th, "subject", "title", "snippet") or "")
-    body = str(lib.pick(th, "snippet", "body") or "")
+    body = _full_body(account, tid) or str(lib.pick(th, "snippet", "body") or "")
     frm = lib.parse_from_header(headers.get("from")) or lib.email_actor(th.get("from"))
     item = {
         "foreign_id": f"{account}/{tid}",

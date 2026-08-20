@@ -13,12 +13,30 @@ def _topic_id(posting: dict) -> str:
     return lib.topic_from_url(str(lib.pick(posting, "app_url", "appUrl", "url") or ""))
 
 
+def _full_body(topic_id: str) -> str | None:
+    """Fetch the full plaintext body of every message in a topic, newest
+    joined last. None on any failure — caller falls back to the summary."""
+    if not topic_id:
+        return None
+    try:
+        raw = lib.hey_run(["threads", topic_id, "--json", "--quiet"])
+    except SystemExit:
+        return None
+    msgs = raw if isinstance(raw, list) else lib.unwrap_list(raw, "messages", "postings")
+    bodies = [
+        lib.html_to_text(str(m.get("body") or "").strip())
+        for m in msgs
+        if isinstance(m, dict) and m.get("body")
+    ]
+    return "\n\n---\n\n".join(bodies) if bodies else None
+
+
 def map_posting(posting: dict) -> dict | None:
     topic = _topic_id(posting)
     if not topic:
         return None
     title = str(lib.pick(posting, "name", "title", "subject") or "")
-    body = str(lib.pick(posting, "summary", "body") or "")
+    body = _full_body(topic) or str(lib.pick(posting, "summary", "body") or "")
     href = lib.pick(posting, "app_url", "appUrl", "url")
     item = {
         "foreign_id": topic,

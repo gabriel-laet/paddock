@@ -18,7 +18,50 @@ def _chat_kind(chat: dict | None, jid: str) -> str:
     return "person"
 
 
-def map_message(msg: dict, chat: dict | None) -> dict | None:
+def _from_me(msg: dict) -> bool:
+    return bool(lib.pick(msg, "FromMe", "from_me", "fromMe"))
+
+
+def _unread_budget(chat: dict | None) -> int | None:
+    """How many of the newest incoming messages in `chat` are still unread.
+
+    WhatsApp tracks unread per chat, not per message: `unread_count` is the
+    size of the unread tail. `None` means we don't know (no chat info), so
+    callers should leave read state unset rather than guess.
+    """
+    if not isinstance(chat, dict):
+        return None
+    if not chat.get("unread"):
+        return 0
+    n = lib.pick(chat, "unread_count", "unreadCount")
+    try:
+        return int(n) if n is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+class ReadTracker:
+    """Consumes each chat's unread budget as messages are walked newest-first."""
+
+    def __init__(self, chats: dict[str, dict]) -> None:
+        self._chats = chats
+        self._budget: dict[str, int | None] = {}
+
+    def read_for(self, chat_jid: str, chat: dict | None, msg: dict) -> bool | None:
+        if _from_me(msg):
+            return True
+        if chat_jid not in self._budget:
+            self._budget[chat_jid] = _unread_budget(chat or self._chats.get(chat_jid))
+        budget = self._budget[chat_jid]
+        if budget is None:
+            return None
+        if budget > 0:
+            self._budget[chat_jid] = budget - 1
+            return False
+        return True
+
+
+def map_message(msg: dict, chat: dict | None, read: bool | None = None) -> dict | None:
     if not isinstance(msg, dict):
         return None
     chat_jid = str(
@@ -37,14 +80,19 @@ def map_message(msg: dict, chat: dict | None) -> dict | None:
     title = str(chat_name or sender_name or chat_jid)
     body = str(lib.pick(msg, "DisplayText", "display_text", "displayText", "Text", "text") or "")
     kind = _chat_kind(chat, chat_jid)
+    ts = lib.pick(msg, "Timestamp", "timestamp", "ts")
     item = {
         "foreign_id": f"{chat_jid}/{mid}",
         "title": title,
         "body": body,
         "thread": chat_jid,
     }
+    if ts:
+        item["start"] = str(ts)
     if sender_jid:
         item["from"] = lib.actor(sender_jid, str(sender_name) if sender_name else None, kind)
+    if read is not None:
+        item["read"] = read
     if kind == "group":
         item["to"] = [lib.actor(chat_jid, str(chat_name) if chat_name else None, "group")]
     quoted = lib.pick(
@@ -73,9 +121,21 @@ def map_messages(raw, chat: dict | None) -> list[dict]:
         rows = lib.unwrap_list(raw, "messages")
     if not isinstance(rows, list):
         rows = []
+    budget = _unread_budget(chat)
     items: list[dict] = []
     for msg in rows:
-        item = map_message(msg, chat)
+        if not isinstance(msg, dict):
+            continue
+        if _from_me(msg):
+            read = True
+        elif budget is None:
+            read = None
+        elif budget > 0:
+            read = False
+            budget -= 1
+        else:
+            read = True
+        item = map_message(msg, chat, read=read)
         if item:
             items.append(item)
     return items
@@ -91,12 +151,14 @@ def pull() -> None:
         }
         msgs = lib.unwrap_list(fx, "messages")
         if msgs:
+            tracker = ReadTracker(chats)
             items: list[dict] = []
             for msg in msgs:
                 if not isinstance(msg, dict):
                     continue
                 jid = str(lib.pick(msg, "ChatJID", "chat_jid", "jid") or "")
-                item = map_message(msg, chats.get(jid))
+                chat = chats.get(jid)
+                item = map_message(msg, chat, read=tracker.read_for(jid, chat, msg))
                 if item:
                     items.append(item)
             lib.emit_items(items)

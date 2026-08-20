@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import html as html_mod
 import json
 import os
 import re
@@ -17,6 +18,32 @@ EMAIL_RE = re.compile(
 )
 FROM_RE = re.compile(r'^\s*"?([^"<]*?)"?\s*<([^>]+)>')
 TOPIC_RE = re.compile(r"/topics/([^/?#]+)")
+
+_HTML_HINT_RE = re.compile(r"(?i)<html\b|<!doctype html|<(p|div|br|table|span|a)\b")
+_SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style)\b[^>]*>.*?</\1>")
+_ANCHOR_RE = re.compile(r'(?is)<a\b[^>]*\bhref\s*=\s*["\']([^"\']+)["\'][^>]*>(.*?)</a>')
+_BLOCK_BREAK_RE = re.compile(r"(?i)</\s*(p|div|tr|li|h[1-6])\s*>|<br\s*/?>")
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _replace_anchor(m: re.Match) -> str:
+    href = m.group(1)
+    text = _TAG_RE.sub("", m.group(2)).strip()
+    return f"{text} ({href})" if text and text.lower() != href.lower() else href
+
+
+def html_to_text(s: str) -> str:
+    """Best-effort plaintext for an HTML-only email body. Keeps link URLs
+    (as "text (href)") instead of dropping them with the rest of the markup."""
+    if not s or not _HTML_HINT_RE.search(s[:4000]):
+        return s
+    s = _SCRIPT_STYLE_RE.sub(" ", s)
+    s = _ANCHOR_RE.sub(_replace_anchor, s)
+    s = _BLOCK_BREAK_RE.sub("\n", s)
+    s = _TAG_RE.sub("", s)
+    s = html_mod.unescape(s)
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in s.splitlines()]
+    return "\n".join(ln for ln in lines if ln)
 
 
 def env_bin(key: str, default: str) -> str:

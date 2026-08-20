@@ -131,6 +131,10 @@ pub struct ItemFilter {
     /// start IS NOT NULL AND start != ''
     pub timed: bool,
     pub unread_only: bool,
+    /// RFC3339 cutoff: effective date (start, else created_at) must be >= this.
+    pub newer_than: Option<String>,
+    /// RFC3339 cutoff: effective date must be < this.
+    pub older_than: Option<String>,
     /// Else created_at DESC, id DESC.
     pub order_by_start: bool,
 }
@@ -203,6 +207,12 @@ impl Store {
                 name TEXT,
                 kind TEXT NOT NULL,
                 PRIMARY KEY (item_id, actor_id),
+                FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS llm_classified (
+                item_id INTEGER NOT NULL,
+                classifier_id TEXT NOT NULL,
+                PRIMARY KEY (item_id, classifier_id),
                 FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_parts_item ON parts(item_id);
@@ -280,6 +290,9 @@ impl Store {
                 "UPDATE items SET title = ?1, body = ?2, href = ?3 WHERE id = ?4",
                 params![item.title, body, item.href, id],
             )?;
+            if item.read == Some(true) {
+                tx.execute("UPDATE items SET read = 1 WHERE id = ?1", params![id])?;
+            }
             if thread.is_some() {
                 tx.execute(
                     "UPDATE items SET thread = ?1 WHERE id = ?2",
@@ -346,7 +359,7 @@ impl Store {
                      from_id, from_name, from_kind, in_reply_to, forward_of, cite_excerpt,
                      cite_actor_id, cite_actor_name, cite_actor_kind,
                      in_reply_to_foreign, forward_of_foreign)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                 params![
                     item.source_id,
                     item.foreign_id,
@@ -357,6 +370,7 @@ impl Store {
                     item.end,
                     thread,
                     created_at,
+                    item.read.unwrap_or(false),
                     from_id,
                     from_name,
                     from_kind,
@@ -567,6 +581,29 @@ impl Store {
             self.add_label(id, label)?;
             Ok(true)
         }
+    }
+
+    /// Has an LLM classifier already run on this item? Re-admit keeps this
+    /// forever, so a classifier's per-item cost is paid once, not every pull.
+    pub fn llm_classified(&self, id: i64, classifier_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let hit: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM llm_classified WHERE item_id = ?1 AND classifier_id = ?2",
+                params![id, classifier_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(hit.is_some())
+    }
+
+    pub fn mark_llm_classified(&self, id: i64, classifier_id: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO llm_classified (item_id, classifier_id) VALUES (?1, ?2)",
+            params![id, classifier_id],
+        )?;
+        Ok(())
     }
 
     pub fn id_by_foreign(&self, source_id: &str, foreign_id: &str) -> Result<Option<i64>> {
@@ -921,6 +958,14 @@ fn filter_where(filter: &ItemFilter) -> (String, Vec<Value>) {
     }
     if filter.unread_only {
         clauses.push("read = 0".into());
+    }
+    if let Some(cutoff) = &filter.newer_than {
+        clauses.push("COALESCE(NULLIF(start, ''), created_at) >= ?".into());
+        params.push(Value::Text(cutoff.clone()));
+    }
+    if let Some(cutoff) = &filter.older_than {
+        clauses.push("COALESCE(NULLIF(start, ''), created_at) < ?".into());
+        params.push(Value::Text(cutoff.clone()));
     }
     let where_sql = if clauses.is_empty() {
         String::new()
