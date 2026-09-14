@@ -11,8 +11,9 @@ pub mod verbs;
 
 pub use classify::{run_classifier, sanitize_label, Classifier};
 pub use inbox::{
-    parse_duration, parse_when, rfc3339, ClassifierSpec, Config, Inbox, Node, Question, SourceSpec,
+    parse_duration, parse_when, rfc3339, ClassifierSpec, Config, Inbox, ModelSpec, Node, Question,
+    SourceSpec,
 };
 pub use item::{Actor, ActorKind, Draft, Item, NewItem, NewPart, Part, PartKind};
-pub use ports::{Adapters, Source, StaleHint, Store};
-pub use verbs::{reply_title, Kernel};
+pub use ports::{Adapters, Embedder, Model, Source, StaleHint, Store};
+pub use verbs::{reply_title, Answer, Kernel};

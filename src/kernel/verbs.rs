@@ -1,4 +1,4 @@
-//! The verbs: admit, classify, label, forget, pull, send, ask, why.
+//! The verbs: admit, classify, label, forget, pull, send, ask, why, embed, answer.
 //! Every one runs through a `Kernel`, which is a config plus the ports.
 
 use anyhow::{Context, Result};
@@ -8,6 +8,21 @@ use super::classify;
 use super::inbox::{parse_duration, parse_when, Config, Inbox, Question};
 use super::item::{Draft, Item, NewItem};
 use super::ports::{Adapters, StaleHint, Store};
+
+const ANSWER_ITEMS: usize = 12;
+const ANSWER_CLIP: usize = 1500;
+const ANSWER_SYSTEM: &str =
+    "You answer a question from someone's inbox using only the items given. \
+Cite every item you rely on as #id. If the items do not answer the question, say so plainly.";
+
+/// What `answer` returns: the model's text, the items it cited, and every
+/// item it was shown.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Answer {
+    pub text: String,
+    pub cites: Vec<i64>,
+    pub considered: Vec<i64>,
+}
 
 pub struct Kernel<'a> {
     pub config: &'a Config,
@@ -36,11 +51,104 @@ impl<'a> Kernel<'a> {
         self.warnings.borrow_mut().push(msg);
     }
 
-    /// Upsert, then classify from the root down.
+    /// Upsert, classify from the root down, then embed if the host has an embedder.
     pub fn admit(&self, item: NewItem) -> Result<i64> {
         let (id, _) = self.store.upsert(&item)?;
         self.classify(id)?;
+        if let Err(e) = self.embed(id) {
+            self.warn(format!("embed #{id}: {e:#}"));
+        }
         Ok(id)
+    }
+
+    /// Store the item's vector. Nothing happens without an embedder in the
+    /// config. Returns whether a vector was written.
+    pub fn embed(&self, id: i64) -> Result<bool> {
+        let Some(spec) = &self.config.embedder else {
+            return Ok(false);
+        };
+        if !self.store.unembedded()?.contains(&id) {
+            return Ok(false);
+        }
+        let item = self.store.get(id)?;
+        let vector = self.adapters.embedder(spec)?.embed(&item.text())?;
+        self.store.set_vector(id, &vector)?;
+        Ok(true)
+    }
+
+    /// Embed every item that has no vector yet. Failures are warnings.
+    pub fn embed_missing(&self) -> Result<usize> {
+        let mut n = 0;
+        for id in self.store.unembedded()? {
+            match self.embed(id) {
+                Ok(true) => n += 1,
+                Ok(false) => {}
+                Err(e) => self.warn(format!("embed #{id}: {e:#}")),
+            }
+        }
+        Ok(n)
+    }
+
+    /// A query's vector, in the same space as the items'.
+    pub fn near(&self, text: &str) -> Result<Vec<f32>> {
+        let spec = self
+            .config
+            .embedder
+            .as_ref()
+            .context("no embedder in config")?;
+        self.adapters.embedder(spec)?.embed(text)
+    }
+
+    /// Ask the model a question over an inbox: retrieve by words and by
+    /// meaning, hand the model the items, and keep the ids it cites.
+    pub fn answer(&self, chain: &[&Inbox], question: &str) -> Result<Answer> {
+        let spec = self.config.model.as_ref().context("no model in config")?;
+        let model = self.adapters.model(spec)?;
+        let mut considered: Vec<Item> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut take = |items: Vec<Item>| {
+            for it in items {
+                if seen.insert(it.id) && considered.len() < ANSWER_ITEMS {
+                    considered.push(it);
+                }
+            }
+        };
+        let mut by_words = Question::of(chain);
+        by_words.text = Some(question.to_string());
+        by_words.limit = Some(ANSWER_ITEMS);
+        take(self.store.ask(&by_words)?);
+        if self.config.embedder.is_some() {
+            let mut by_meaning = Question::of(chain);
+            by_meaning.near = Some(self.near(question)?);
+            by_meaning.limit = Some(ANSWER_ITEMS);
+            take(self.store.ask(&by_meaning)?);
+        }
+        let mut user = format!("question: {question}\n\nitems:\n");
+        for it in &considered {
+            let from = it
+                .from
+                .as_ref()
+                .map(|a| a.name.clone().unwrap_or_else(|| a.id.clone()))
+                .unwrap_or_default();
+            user.push_str(&format!(
+                "\n### #{} {}\nfrom: {from}  when: {}  source: {}\n{}\n",
+                it.id,
+                it.title,
+                it.when(),
+                it.source_id,
+                clip(&it.text(), ANSWER_CLIP)
+            ));
+        }
+        let text = model.complete(ANSWER_SYSTEM, &user)?;
+        let cites = cited_ids(&text)
+            .into_iter()
+            .filter(|id| seen.contains(id))
+            .collect();
+        Ok(Answer {
+            text,
+            cites,
+            considered: considered.iter().map(|i| i.id).collect(),
+        })
     }
 
     /// Enter the root, run its classifiers, then every child the item now
@@ -227,7 +335,7 @@ impl<'a> Kernel<'a> {
             .classifier
             .iter()
             .chain(chain.iter().flat_map(|ib| ib.classifier.iter()))
-            .filter(|c| c.label.as_deref().is_some_and(has))
+            .filter(|c| c.label.as_deref().is_some_and(has) || c.labels.iter().any(|l| has(l)))
             .map(|c| c.id.as_str())
             .collect();
         let dash = |v: Vec<&str>| {
@@ -251,6 +359,30 @@ pub fn reply_title(parent: &Item) -> String {
     } else {
         format!("re: {t}")
     }
+}
+
+/// Every `#123` in the text, in order, once each.
+fn cited_ids(text: &str) -> Vec<i64> {
+    let mut out = Vec::new();
+    for m in regex::Regex::new(r"#(\d+)")
+        .expect("valid")
+        .captures_iter(text)
+    {
+        if let Ok(id) = m[1].parse::<i64>() {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+fn clip(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 fn nonempty(s: Option<&str>) -> Option<&str> {

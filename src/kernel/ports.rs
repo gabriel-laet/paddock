@@ -4,7 +4,7 @@
 use anyhow::Result;
 
 use super::classify::Classifier;
-use super::inbox::{ClassifierSpec, Question, SourceSpec};
+use super::inbox::{ClassifierSpec, ModelSpec, Question, SourceSpec};
 use super::item::{Draft, Item, NewItem};
 
 /// Thin row for stale cleanup: no body, parts, or actors.
@@ -38,6 +38,10 @@ pub trait Store {
     fn classified(&self, id: i64, classifier_id: &str) -> Result<bool>;
     fn mark_classified(&self, id: i64, classifier_id: &str) -> Result<()>;
     fn counts_by_source(&self) -> Result<Vec<(String, i64)>>;
+    /// Remember the item's vector. `ask` with `near` ranks by it.
+    fn set_vector(&self, id: i64, vector: &[f32]) -> Result<()>;
+    /// Items with no vector yet.
+    fn unembedded(&self) -> Result<Vec<i64>>;
 }
 
 /// Where items come from, and where a draft goes.
@@ -48,9 +52,21 @@ pub trait Source {
     fn send(&self, draft: &Draft, reply_to_foreign: Option<&str>) -> Result<NewItem>;
 }
 
-/// Turns specs into live sources and classifiers. The kernel builds the
-/// classifier kinds it knows (regex, script) and asks here for the rest.
+/// Text to a vector. Items and queries share one embedder, so one space.
+pub trait Embedder {
+    fn embed(&self, text: &str) -> Result<Vec<f32>>;
+}
+
+/// A chat model: a system and a user message in, text out.
+pub trait Model {
+    fn complete(&self, system: &str, user: &str) -> Result<String>;
+}
+
+/// Turns specs into live sources, classifiers, embedders, and models. The
+/// kernel builds the classifier kinds it knows (regex) and asks here for the rest.
 pub trait Adapters {
     fn source(&self, spec: &SourceSpec) -> Result<Box<dyn Source>>;
     fn classifier(&self, spec: &ClassifierSpec) -> Result<Box<dyn Classifier>>;
+    fn embedder(&self, spec: &ModelSpec) -> Result<Box<dyn Embedder>>;
+    fn model(&self, spec: &ModelSpec) -> Result<Box<dyn Model>>;
 }

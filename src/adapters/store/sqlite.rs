@@ -104,7 +104,12 @@ impl Sqlite {
         )?;
         backfill_parts(&conn)?;
         conn.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(item_id UNINDEXED, title, text);",
+            "CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(item_id UNINDEXED, title, text);
+             CREATE TABLE IF NOT EXISTS vectors (
+                item_id INTEGER PRIMARY KEY,
+                data BLOB NOT NULL,
+                FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+             );",
         )?;
         let indexed: i64 = conn.query_row("SELECT COUNT(*) FROM items_fts", [], |r| r.get(0))?;
         if indexed == 0 {
@@ -326,6 +331,12 @@ impl Store for Sqlite {
             .query_map(params_from_iter(params), row_item)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
+        if let Some(near) = &filter.near {
+            items = rank(&conn, items, near)?;
+            items.truncate(filter.limit.unwrap_or(20));
+        } else if let Some(limit) = filter.limit {
+            items.truncate(limit);
+        }
         hydrate(&conn, &mut items)?;
         Ok(items)
     }
@@ -336,6 +347,24 @@ impl Store for Sqlite {
         let sql = format!("SELECT COUNT(*) FROM items {where_sql}");
         let n: i64 = conn.query_row(&sql, params_from_iter(params), |row| row.get(0))?;
         Ok(n as usize)
+    }
+
+    fn set_vector(&self, id: i64, vector: &[f32]) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO vectors (item_id, data) VALUES (?1, ?2)",
+            params![id, to_blob(vector)],
+        )?;
+        Ok(())
+    }
+
+    fn unembedded(&self) -> Result<Vec<i64>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM items WHERE id NOT IN (SELECT item_id FROM vectors) ORDER BY id",
+        )?;
+        let ids = stmt.query_map([], |r| r.get(0))?;
+        Ok(ids.collect::<rusqlite::Result<Vec<i64>>>()?)
     }
 
     fn counts_by_source(&self) -> Result<Vec<(String, i64)>> {
@@ -747,6 +776,57 @@ fn filter_where(filter: &Question) -> (String, Vec<Value>) {
         format!("WHERE {}", clauses.join(" AND "))
     };
     (where_sql, params)
+}
+
+/// Keep the items that have a vector, closest to `near` first.
+fn rank(conn: &Connection, items: Vec<Item>, near: &[f32]) -> Result<Vec<Item>> {
+    if items.is_empty() {
+        return Ok(items);
+    }
+    let ids: Vec<Value> = items.iter().map(|i| Value::Integer(i.id)).collect();
+    let marks: Vec<&str> = ids.iter().map(|_| "?").collect();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT item_id, data FROM vectors WHERE item_id IN ({})",
+        marks.join(", ")
+    ))?;
+    let scores: std::collections::HashMap<i64, f32> = stmt
+        .query_map(params_from_iter(ids), |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                cosine(near, &from_blob(&r.get::<_, Vec<u8>>(1)?)),
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut scored: Vec<(f32, Item)> = items
+        .into_iter()
+        .filter_map(|it| scores.get(&it.id).map(|s| (*s, it)))
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(scored.into_iter().map(|(_, it)| it).collect())
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return f32::MIN;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        f32::MIN
+    } else {
+        dot / (na * nb)
+    }
+}
+
+fn to_blob(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+fn from_blob(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 /// One FTS row per item: the title, and every text part (else the body).

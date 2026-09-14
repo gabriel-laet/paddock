@@ -1689,3 +1689,126 @@ fn text_index_is_rebuilt_for_an_old_store() {
     };
     assert_eq!(store.count(&q).unwrap(), 1);
 }
+
+/// A host with a fake embedder and a fake model, both plain `sh`, so the
+/// whole search stack runs without a network or a real model.
+fn ai_toml(incoming: &std::path::Path) -> String {
+    format!(
+        r#"
+[[inbox]]
+name = "all"
+
+[[inbox.inbox]]
+name = "money"
+labels = ["money"]
+
+[[source]]
+id = "incoming"
+kind = "fs"
+path = "{}"
+
+[embedder]
+cmd = "sh"
+args = ["-c", "grep -qi money && echo '[1, 0]' || echo '[0, 1]'"]
+
+[model]
+cmd = "sh"
+args = ["-c", "echo 'Pay the invoice, see #1 and #1. Not #999.'"]
+"#,
+        incoming.display()
+    )
+}
+
+#[test]
+fn items_are_embedded_on_admit_and_ranked_by_meaning() {
+    let (_tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    fs::write(&paths.config_file, ai_toml(&paths.incoming_dir)).unwrap();
+    let (cfg, store) = load(&paths).unwrap();
+    let k = kernel(&cfg, &store);
+    let money = k
+        .admit(NewItem {
+            source_id: "incoming".into(),
+            foreign_id: "a".into(),
+            title: "send money".into(),
+            body: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let lunch = k
+        .admit(NewItem {
+            source_id: "incoming".into(),
+            foreign_id: "b".into(),
+            title: "lunch".into(),
+            body: "y".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(k.take_warnings().is_empty());
+    assert!(store.unembedded().unwrap().is_empty(), "admit embeds");
+    let q = Question {
+        near: Some(k.near("money please").unwrap()),
+        limit: Some(1),
+        ..Default::default()
+    };
+    let ids: Vec<i64> = store.ask(&q).unwrap().iter().map(|i| i.id).collect();
+    assert_eq!(ids, vec![money]);
+    let q = Question {
+        near: Some(k.near("food").unwrap()),
+        ..Default::default()
+    };
+    let ids: Vec<i64> = store.ask(&q).unwrap().iter().map(|i| i.id).collect();
+    assert_eq!(ids, vec![lunch, money]);
+    // a question still composes: an inbox chain narrows what gets ranked
+    let chain = cfg.chain(&["all", "money"]).unwrap();
+    k.label(lunch, &["money".into()], &[]).unwrap();
+    let mut q = Question::of(&chain);
+    q.near = Some(k.near("food").unwrap());
+    let ids: Vec<i64> = store.ask(&q).unwrap().iter().map(|i| i.id).collect();
+    assert_eq!(ids, vec![lunch]);
+}
+
+#[test]
+fn embed_missing_backfills_and_answer_cites_only_shown_items() {
+    let (_tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    // admit with no embedder, then turn one on
+    let (cfg, store) = load(&paths).unwrap();
+    let k = kernel(&cfg, &store);
+    let id = k
+        .admit(NewItem {
+            source_id: "incoming".into(),
+            foreign_id: "a".into(),
+            title: "invoice".into(),
+            body: "send money".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(store.unembedded().unwrap(), vec![id]);
+    fs::write(&paths.config_file, ai_toml(&paths.incoming_dir)).unwrap();
+    let cfg = load_config(&paths.config_file).unwrap();
+    let k = kernel(&cfg, &store);
+    assert_eq!(k.embed_missing().unwrap(), 1);
+    assert_eq!(k.embed_missing().unwrap(), 0);
+    let all = cfg.chain(&["all"]).unwrap();
+    let a = k.answer(&all, "what should I pay?").unwrap();
+    assert!(a.text.contains("invoice"));
+    assert_eq!(a.cites, vec![id], "cited once, and #999 was never shown");
+    assert_eq!(a.considered, vec![id]);
+}
+
+#[test]
+fn without_a_model_or_embedder_the_verbs_say_so() {
+    let (_tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    let (cfg, store) = load(&paths).unwrap();
+    let k = kernel(&cfg, &store);
+    let all = cfg.chain(&["all"]).unwrap();
+    assert!(k
+        .answer(&all, "?")
+        .unwrap_err()
+        .to_string()
+        .contains("no model"));
+    assert!(k.near("x").unwrap_err().to_string().contains("no embedder"));
+    assert_eq!(k.embed_missing().unwrap(), 0);
+}

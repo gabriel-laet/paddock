@@ -26,6 +26,12 @@ pub struct Config {
     /// Host default for untimed stale cleanup (`"14d"`, `"24h"`).
     #[serde(default)]
     pub forget_after: Option<String>,
+    /// Text to vector, for `near` questions. Items are embedded on admit.
+    #[serde(default)]
+    pub embedder: Option<ModelSpec>,
+    /// The chat model `answer` talks to.
+    #[serde(default)]
+    pub model: Option<ModelSpec>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -82,6 +88,27 @@ pub struct ClassifierSpec {
     /// Run once per item and remember the verdict. llm always does.
     #[serde(default)]
     pub once: bool,
+    /// Bearer token for kind = "http", or for an "llm" over an openai service.
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+/// A model or embedder as declared. `kind` picks the transport.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ModelSpec {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub cmd: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Bearer token for a service that wants one.
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 /// A source as declared. `kind` picks the adapter.
@@ -188,7 +215,7 @@ fn chain<'a>(inboxes: &'a [Inbox], path: &[&str]) -> Option<Vec<&'a Inbox>> {
 /// A question over the pile. Built from an inbox chain, answered by a store
 /// or by `matches` on a single item. The two must agree; this is the one place
 /// the matching rule is written down.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Question {
     /// None = any source; Some(empty) = no source, so nothing.
     pub sources: Option<Vec<String>>,
@@ -204,6 +231,11 @@ pub struct Question {
     /// Words that must all appear in the title or text. A store may match
     /// by prefix; `matches` is a plain case-insensitive contains.
     pub text: Option<String>,
+    /// Rank by closeness to this vector instead of by date. A ranking, not a
+    /// test: `matches` ignores it.
+    pub near: Option<Vec<f32>>,
+    /// At most this many. Default 20 when `near` is set, else all.
+    pub limit: Option<usize>,
     /// List in `start` order instead of newest first.
     pub by_start: bool,
 }

@@ -9,7 +9,7 @@
 //! once = true
 //! ```
 //!
-//! `PADDOCK_HTTP_KEY` is sent as a bearer token when set.
+//! `key` is sent as a bearer token when set.
 
 use anyhow::{Context, Result};
 
@@ -19,6 +19,7 @@ use crate::kernel::{Classifier, ClassifierSpec, Item};
 pub struct HttpClassifier {
     id: String,
     url: String,
+    key: Option<String>,
     once: bool,
 }
 
@@ -27,6 +28,7 @@ impl HttpClassifier {
         Self {
             id: spec.id.clone(),
             url,
+            key: spec.key.clone(),
             once: spec.once,
         }
     }
@@ -42,11 +44,8 @@ impl Classifier for HttpClassifier {
     }
 
     fn classify(&self, item: &Item) -> Result<Option<String>> {
-        let key = std::env::var("PADDOCK_HTTP_KEY")
-            .ok()
-            .filter(|k| !k.is_empty());
         let body = serde_json::to_value(item)?;
-        let reply = post(&self.url, key.as_deref(), &body)
+        let reply = post(&self.url, self.key.as_deref(), &body)
             .with_context(|| format!("classifier {}", self.id))?;
         Ok(label_of(&reply))
     }

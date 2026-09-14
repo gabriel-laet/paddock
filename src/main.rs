@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 #[derive(Parser)]
 #[command(name = "paddock", about = "An inbox kernel", version)]
 struct Cli {
-    /// Run on a remote host over ssh (host from flag, PADDOCK_REMOTE, or config remote)
+    /// Run on a remote host over ssh (host from the flag, else `remote` in config)
     #[arg(long, value_name = "HOST", num_args = 0..=1, require_equals = true, default_missing_value = "", global = true)]
     remote: Option<String>,
     /// Force this machine even if a remote is configured
@@ -45,6 +45,12 @@ enum Cmd {
         /// Words that must all appear in the title or text (prefix match)
         #[arg(long)]
         text: Option<String>,
+        /// Closest in meaning to this, through the config's embedder
+        #[arg(long)]
+        like: Option<String>,
+        /// At most this many
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// One item in full
     Show { id: i64 },
@@ -78,6 +84,15 @@ enum Cmd {
         to: Vec<String>,
         body: Option<String>,
     },
+    /// Embed every item that has no vector yet
+    Embed,
+    /// Ask the model a question over an inbox; it answers from the items and cites them
+    Answer {
+        question: String,
+        /// Inbox path to answer from (default all)
+        #[arg(long = "in")]
+        inbox: Option<String>,
+    },
     /// Dump this host for an agent (pipeable)
     Context,
 }
@@ -101,7 +116,7 @@ fn main() -> Result<()> {
             return run_remote(host);
         }
         if cli.remote.is_some() {
-            bail!("no remote host (pass --remote=HOST, set PADDOCK_REMOTE, or config remote)");
+            bail!("no remote host (pass --remote=HOST or set `remote` in config)");
         }
     }
     if let Cmd::Init { here } = cli.cmd {
@@ -173,11 +188,17 @@ fn main() -> Result<()> {
             inbox,
             unread,
             text,
+            like,
+            limit,
         } => {
             let path = split_path(inbox.as_deref());
             let mut q = Question::of(&chain(&config, &path)?);
             q.unread = unread;
             q.text = text;
+            q.limit = limit;
+            if let Some(like) = like {
+                q.near = Some(k.near(&like)?);
+            }
             list(&store.ask(&q)?, cli.json)?;
         }
         Cmd::Show { id } => {
@@ -275,6 +296,36 @@ fn main() -> Result<()> {
             };
             let id = k.send(draft)?;
             emit(id)?;
+        }
+        Cmd::Embed => {
+            let n = k.embed_missing()?;
+            let warnings = k.take_warnings();
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "embedded": n, "warnings": warnings })
+                );
+            } else {
+                println!("embedded {n}");
+                for w in warnings {
+                    eprintln!("warning: {w}");
+                }
+            }
+        }
+        Cmd::Answer { question, inbox } => {
+            let path = split_path(inbox.as_deref());
+            let answer = k.answer(&chain(&config, &path)?, &question)?;
+            if cli.json {
+                println!("{}", serde_json::to_string(&answer)?);
+            } else {
+                println!("{}", answer.text.trim());
+                if !answer.cites.is_empty() {
+                    println!();
+                    for id in &answer.cites {
+                        println!("{}", line(&store.get(*id)?));
+                    }
+                }
+            }
         }
         Cmd::Context => context(&paths, &k)?,
     }
@@ -473,7 +524,7 @@ fn context(paths: &Paths, k: &Kernel) -> Result<()> {
         writeln!(w)?;
     }
     writeln!(w, "\n## use")?;
-    writeln!(w, "paddock pull | inboxes | ls [INBOX] [--unread] [--text WORDS] | show ID | thread ID | label ID [+l|-l]... | read ID | unread ID | forget ID | classify ID | why ID [INBOX] | send [--title T] [--reply ID] [--to A]... [BODY]")?;
+    writeln!(w, "paddock pull | inboxes | ls [INBOX] [--unread] [--text WORDS] [--like TEXT] | answer QUESTION [--in INBOX] | embed | show ID | thread ID | label ID [+l|-l]... | read ID | unread ID | forget ID | classify ID | why ID [INBOX] | send [--title T] [--reply ID] [--to A]... [BODY]")?;
     writeln!(w, "Add --json to any command for machine output. Edit config.toml, then `paddock pull`. Do not invent nouns.")?;
     Ok(())
 }

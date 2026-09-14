@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 use super::classifier::{CelClassifier, ExecClassifier, HttpClassifier, LlmClassifier};
 use super::source::{Exec, Fs, Rss};
 use super::store::Sqlite;
+use super::{embedder, model};
 use crate::kernel::{
-    Adapters, Classifier, ClassifierSpec, Config, Kernel, Source, SourceSpec, Store,
+    Adapters, Classifier, ClassifierSpec, Config, Embedder, Kernel, Model, ModelSpec, Source,
+    SourceSpec, Store,
 };
 
 #[derive(Debug, Clone)]
@@ -142,7 +144,8 @@ pub fn kernel<'a>(config: &'a Config, store: &'a dyn Store) -> Kernel<'a> {
     Kernel::new(config, store, &STD)
 }
 
-/// fs, rss, and exec sources; script, exec, http, and llm classifiers.
+/// fs, rss, and exec sources; script, exec, http, and llm classifiers;
+/// exec, http, ollama, and openai embedders and models.
 pub struct Std;
 
 pub static STD: Std = Std;
@@ -196,9 +199,17 @@ impl Adapters for Std {
                 Box::new(ExecClassifier::new(spec, cmd.display().to_string()))
             }
             "http" => Box::new(HttpClassifier::new(spec, need(spec.url.as_deref(), "url")?)),
-            "llm" => Box::new(LlmClassifier::new(spec)),
+            "llm" => Box::new(LlmClassifier::new(spec)?),
             other => bail!("unknown classifier kind `{other}` (regex, script, exec, http, llm)"),
         })
+    }
+
+    fn embedder(&self, spec: &ModelSpec) -> Result<Box<dyn Embedder>> {
+        embedder::build(spec)
+    }
+
+    fn model(&self, spec: &ModelSpec) -> Result<Box<dyn Model>> {
+        model::build(spec)
     }
 }
 
