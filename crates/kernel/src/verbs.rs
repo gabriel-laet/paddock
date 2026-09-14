@@ -33,6 +33,8 @@ pub struct Notice {
     pub id: i64,
     pub inbox: String,
     pub title: String,
+    /// The item's labels as of the notice, so `code:483920` can be shown.
+    pub labels: Vec<String>,
 }
 
 /// What a pass through the inboxes said: warnings (a classifier that could
@@ -171,6 +173,7 @@ impl Kernel<'_> {
                     id: item.id,
                     inbox: path.to_string(),
                     title: item.title.clone(),
+                    labels: item.label_names(),
                 });
                 Ok(true)
             }

@@ -1,0 +1,11 @@
+# receipts: orders, invoices, payments, shipping, kept in one place and never paged.
+
+[[classifier]]
+id = "detect"
+kind = "regex"
+pattern = "(?i)\\b(receipt|invoice|your order|order confirmation|payment (received|confirmation|due)|has shipped|out for delivery|tracking number)\\b"
+label = "receipt"
+
+[[inbox]]
+name = "receipts"
+labels = ["receipt"]

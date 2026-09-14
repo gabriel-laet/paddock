@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::item::Item;
+use super::item::{CiteKind, Item};
 
 /// Everything a host declares. Parsed by an adapter; the kernel only reads it.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -23,6 +23,13 @@ pub struct Config {
     /// Labels that never auto-forget. Empty means ["todo", "later"].
     #[serde(default)]
     pub keep: Vec<String>,
+    /// Who you are, across sources: addresses, Slack and WhatsApp ids. An
+    /// inbox saying `"me"` in `from`, `to`, or `mentions` means these.
+    #[serde(default)]
+    pub me: Vec<String>,
+    /// Skills grafted under the first top-level inbox. Host business.
+    #[serde(default, rename = "use")]
+    pub use_: Vec<String>,
     /// Host default for untimed stale cleanup (`"14d"`, `"24h"`).
     #[serde(default)]
     pub forget_after: Option<String>,
@@ -60,6 +67,14 @@ pub struct Inbox {
     /// a list). Empty means any.
     #[serde(default)]
     pub to: Vec<String>,
+    /// Item must mention ONE of these actor ids (a mention cite). Empty means
+    /// any. `"me"` in `from`, `to`, or here stands for the config's `me`.
+    #[serde(default)]
+    pub mentions: Vec<String>,
+    /// Skills grafted under this inbox by name. Host business: the host
+    /// merges them before the kernel sees the config.
+    #[serde(default, rename = "use")]
+    pub use_: Vec<String>,
     /// Item must carry NONE of these. `["read"]` is the unread view.
     #[serde(default)]
     pub without: Vec<String>,
@@ -170,6 +185,30 @@ impl Config {
                 ..Default::default()
             });
         }
+        self.with_me()
+    }
+
+    /// Every `"me"` in an inbox's `from`, `to`, or `mentions` becomes the
+    /// config's identities, with `"me"` kept for sources that name the
+    /// owner that way.
+    fn with_me(mut self) -> Self {
+        fn expand(ids: &mut Vec<String>, me: &[String]) {
+            if ids.iter().any(|s| s == "me") {
+                ids.retain(|s| s != "me");
+                ids.extend(me.iter().cloned());
+                ids.push("me".into());
+            }
+        }
+        fn walk(inboxes: &mut [Inbox], me: &[String]) {
+            for ib in inboxes {
+                expand(&mut ib.from, me);
+                expand(&mut ib.to, me);
+                expand(&mut ib.mentions, me);
+                walk(&mut ib.inbox, me);
+            }
+        }
+        let me = self.me.clone();
+        walk(&mut self.inbox, &me);
         self
     }
 
@@ -255,6 +294,8 @@ pub struct Question {
     pub from: Option<Vec<String>>,
     /// None = anyone; Some(ids) = a `to` actor is one of them.
     pub to: Option<Vec<String>>,
+    /// None = anyone; Some(ids) = a mention cite names one of them.
+    pub mentions: Option<Vec<String>>,
     /// Item must carry ALL of these.
     pub labels: Vec<String>,
     /// Item must carry NONE of these.
@@ -285,6 +326,7 @@ impl Question {
             q.sources = narrow(q.sources.take(), &ib.sources);
             q.from = narrow(q.from.take(), &ib.from);
             q.to = narrow(q.to.take(), &ib.to);
+            q.mentions = narrow(q.mentions.take(), &ib.mentions);
             q.labels.extend(ib.labels.iter().cloned());
             q.without.extend(ib.without.iter().cloned());
             q.timed |= ib.timed;
@@ -332,6 +374,15 @@ impl Question {
             None => true,
             Some(_) => item.to.iter().any(|a| one_of(&self.to, &a.id)),
         };
+        let mentions_ok = match &self.mentions {
+            None => true,
+            Some(_) => item.cites.iter().any(|c| {
+                c.kind == CiteKind::Mention
+                    && c.actor
+                        .as_ref()
+                        .is_some_and(|a| one_of(&self.mentions, &a.id))
+            }),
+        };
         let labels_ok = self.labels.iter().all(|l| item.has(l));
         let without_ok = self.without.iter().all(|l| !item.has(l));
         let timed_ok = !self.timed || item.when() != item.created_at;
@@ -361,6 +412,7 @@ impl Question {
         source_ok
             && from_ok
             && to_ok
+            && mentions_ok
             && labels_ok
             && without_ok
             && timed_ok

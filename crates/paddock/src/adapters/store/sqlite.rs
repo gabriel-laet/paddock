@@ -715,6 +715,12 @@ fn filter_where(filter: &Question) -> (String, Vec<Value>) {
         "EXISTS (SELECT 1 FROM item_to WHERE item_to.item_id = items.id AND item_to.actor_id IN ({IN}))",
         &filter.to,
     );
+    one_of(
+        &mut clauses,
+        &mut params,
+        "EXISTS (SELECT 1 FROM cites WHERE cites.item_id = items.id AND cites.kind = 'mention' AND cites.actor_id IN ({IN}))",
+        &filter.mentions,
+    );
     for label in &filter.labels {
         clauses.push(
             "EXISTS (SELECT 1 FROM labels WHERE labels.item_id = items.id AND labels.label = ? AND labels.removed = 0)"

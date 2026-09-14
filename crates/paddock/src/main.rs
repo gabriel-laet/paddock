@@ -124,6 +124,8 @@ enum Cmd {
     },
     /// Dump this host for an agent (pipeable)
     Context,
+    /// The skills this host can `use`: yours in the config directory's skills/, and the shipped ones
+    Skills,
     /// Hand the host and a task to the agent in `[agent]`: "add my fastmail", "notify me about invoices"
     Setup {
         /// What to set up, in words. Empty lists the agents found on PATH.
@@ -216,7 +218,13 @@ fn main() -> Result<()> {
             } else {
                 println!("admitted {}, forgot {forgot}", pulled.count);
                 for n in &pulled.notices {
-                    println!("! {}  #{}  {}", n.inbox, n.id, n.title);
+                    println!(
+                        "! {}  #{}  {}{}",
+                        n.inbox,
+                        n.id,
+                        n.title,
+                        labels_suffix(&n.labels)
+                    );
                 }
                 warn(&warnings);
             }
@@ -415,6 +423,16 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Context => context(&paths, &k)?,
+        Cmd::Skills => {
+            let all = paddock::skills(&paths.config_dir);
+            if cli.json {
+                println!("{}", serde_json::to_string(&all)?);
+            } else {
+                for s in all {
+                    println!("{:<12} {:<8} {}", s.name, s.origin, s.about);
+                }
+            }
+        }
         Cmd::Setup { task } => {
             let task = task.join(" ");
             if task.trim().is_empty() {
@@ -486,6 +504,14 @@ fn store_is_empty(paths: &Paths, config: &Config) -> Result<bool> {
 fn secret_key(config: &Config) -> Result<Option<String>> {
     let spec = config.store.clone().unwrap_or_default();
     paddock::adapters::store_key(&spec.settings)
+}
+
+fn labels_suffix(labels: &[String]) -> String {
+    if labels.is_empty() {
+        String::new()
+    } else {
+        format!("  [{}]", labels.join(", "))
+    }
 }
 
 fn warn(warnings: &[String]) {
@@ -654,7 +680,13 @@ fn context(paths: &Paths, k: &Kernel) -> Result<()> {
 /// host's `notify_cmd`.
 fn told(told: &Told, config: &Config) {
     for n in &told.notices {
-        println!("! {}  #{}  {}", n.inbox, n.id, n.title);
+        println!(
+            "! {}  #{}  {}{}",
+            n.inbox,
+            n.id,
+            n.title,
+            labels_suffix(&n.labels)
+        );
     }
     warn(&told.warnings);
     warn(&notify(config, &told.notices));

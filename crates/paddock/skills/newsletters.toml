@@ -1,0 +1,11 @@
+# newsletters: mail with an unsubscribe link, read at leisure.
+
+[[classifier]]
+id = "detect"
+kind = "regex"
+pattern = "(?i)\\bunsubscribe\\b|\\bview (this|it) in (your|a) browser\\b"
+label = "newsletter"
+
+[[inbox]]
+name = "newsletters"
+labels = ["newsletter"]

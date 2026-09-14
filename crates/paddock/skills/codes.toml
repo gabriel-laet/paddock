@@ -1,0 +1,13 @@
+# codes: one-time codes and sign-in confirmations, paged, interesting for an hour.
+
+[[classifier]]
+id = "detect"
+kind = "regex"
+pattern = "(?i)\\b(verification|one-time|security|access|login|sign-in|2fa|otp) code\\b|\\bcode is\\b|\\b\\d{6}\\b"
+label = "code"
+
+[[inbox]]
+name = "codes"
+labels = ["code"]
+newer_than = "1h"
+then = ["notify"]

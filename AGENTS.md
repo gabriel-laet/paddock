@@ -39,7 +39,10 @@ Rules, all checkable:
 - Anything that knows a format of the world (mail, a feed, a chat) is a plugin, not an
   adapter. Adapters are the ports' implementations and know no format.
 - Host-only concerns that live as data in `Config` are marked so (`remote`, `agent`,
-  `notify_cmd`); the kernel reads none of them.
+  `notify_cmd`, `use`); the kernel reads none of them. Skills (`use`) are grafted by the
+  host in `load_config` before the kernel sees the config; classifier ids become
+  `skill/id`. Shipped skills are TOML under `crates/paddock/skills/`, embedded with
+  `include_str!`; a user's live in `<config dir>/skills/`.
 
 ## style the owner wants
 
@@ -61,7 +64,7 @@ Rules, all checkable:
 ## commands
 
 ```
-cargo build --workspace && cargo test --workspace     # 128 tests at handover
+cargo build --workspace && cargo test --workspace     # 126 tests at handover
 cargo build --release                                  # paddock 6.3 MB, plugins 0.5-2.7 MB
 ./target/release/paddock check ./target/release/paddock-maildir --set path=/some/Maildir
 PADDOCK_DIR=/tmp/h ./target/release/paddock init && $EDITOR /tmp/h/config.toml && paddock pull
@@ -76,8 +79,11 @@ Done and pushed on `main`:
 - Kernel: items with parts, actors (`from`/`to`), cites (reply, forward, quote, mention,
   attach) resolved early or late, threads from keys or from cites, labels with provenance
   and hand denial, read as a label, inboxes as nested questions with `without`, `from`,
-  `to`, time terms, text (FTS5) and meaning (vectors), effects on enter once per entry
-  (`label:`, `read`, `send:`, `notify`), personas as top-level inboxes with sources.
+  `to`, `mentions` (a mention cite), time terms, text (FTS5) and meaning (vectors),
+  effects on enter once per entry (`label:`, `read`, `send:`, `notify`; a notice carries
+  the item's labels), `me` identities (`"me"` in `from`/`to`/`mentions` expands to them,
+  keeping the literal for sources that name the owner `me`), personas as top-level
+  inboxes with sources, skills grafted with `use`.
 - Host: sqlite (SQLCipher, key or key_cmd), fs and exec sources, plugins by kind on PATH,
   classifiers regex/script(CEL)/exec/http/llm, model exec/ollama/openai, embedder
   exec/http/ollama/openai/local(Model2Vec, feature `local`), mirror s3/exec, agent setup,

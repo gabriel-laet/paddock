@@ -179,14 +179,14 @@ fn admit_file_reclassifies_on_update() {
 fn admit_file_classifies() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let p = paths.incoming_dir.join("rfc-note.md");
-    fs::write(&p, "see the rfc please").unwrap();
+    let p = paths.incoming_dir.join("todo-note.md");
+    fs::write(&p, "todo: call the bank").unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
     let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let id = k.admit(item_from_file("incoming", &p).unwrap()).unwrap().id;
     let item = store.get(id).unwrap();
-    assert!(item.has("rfc"));
+    assert!(item.has("todo"));
 }
 
 #[test]
@@ -625,6 +625,7 @@ path = "{}"
             id: admitted.id,
             inbox: "all/urgent".into(),
             title: "URGENT: pay".into(),
+            labels: vec!["urgent".into()],
         }]
     );
     assert!(admitted.warnings.is_empty(), "{:?}", admitted.warnings);

@@ -7,6 +7,7 @@
 //! - `embedder`: text to vector (exec, http, ollama, openai)
 //! - `mirror`: a copy of the store elsewhere (s3, any command)
 //! - `agent`: an agent CLI that sets the host up on request; the notice command
+//! - `skills`: named fragments of classifiers and inboxes a config grafts in with `use`
 //! - `host`: the machine (paths, the TOML config, the standard wiring)
 //!
 //! `transport` is the shared plumbing: a child process or an HTTP POST.
@@ -17,6 +18,7 @@ pub mod embedder;
 pub mod host;
 pub mod mirror;
 pub mod model;
+pub mod skills;
 pub mod source;
 pub mod store;
 pub(crate) mod transport;
@@ -28,5 +30,6 @@ pub use host::{
 };
 pub use host::{push_mirror, resolve_secrets};
 pub use mirror::Mirror;
+pub use skills::{skill, skills, Skill};
 pub use source::item_from_file;
 pub use store::Sqlite;

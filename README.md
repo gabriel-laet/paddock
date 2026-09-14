@@ -91,6 +91,7 @@ paddock answer QUESTION [--in INBOX]   # the model answers from the items and ci
 paddock embed                      # embed items that have no vector yet
 paddock check CMD [--set k=v]... [--send]   # speak the protocol to a plugin and validate what it says
 paddock context                    # dump this host for an agent
+paddock skills                     # the skills this host can `use`: yours, then the shipped ones
 paddock mirror [--restore [--force]]   # push a snapshot of the store to [store.mirror], or pull it back
 paddock setup [TASK...]            # hand the host and a task in words to the agent in [agent]; no task lists agents
 ```
@@ -117,6 +118,8 @@ The host part, then one block per inbox, source, classifier, and (optionally) th
 keep = ["todo", "later"]        # stale cleanup asks "without these"
 # forget_after = "30d"          # host default for untimed items
 # remote = "box"                # ssh host for --remote
+me = ["you@example.com", "U0123"]   # who you are across sources; "me" in from/to/mentions means these
+use = ["codes", "mentions"]     # skills grafted under `all` (see below)
 
 [[inbox]]
 name = "all"
@@ -153,7 +156,7 @@ path = "~/.local/share/paddock/incoming"
 
 `then` names what an inbox does to an item that enters it: `label:NAME`, `read`, `send:SOURCE`, or `notify`. What an effect produces (the item a `send:` delivers) is classified like anything else but fires no effects of its own, so an effect cannot chase its own output. An effect runs once per item per inbox, the same way a run-once classifier does; one that fails (a source that is down) is not remembered, so it retries on the next classify or pull and warns each time until it goes through. `send:` stamps `sent`. That is the whole approval flow: an agent drafts into a source, a hand adds `approved`, the inbox sends.
 
-`notify` is how the kernel says *when*: an inbox with it raises a notice (item id, inbox path, title) the first time an item enters, and every verb returns the notices it raised next to its warnings. The host says *how*: `paddock pull` prints them and runs `notify_cmd` once per notice (`{id}`, `{inbox}`, `{title}` substituted and shell-quoted, the notice as JSON on stdin); an app gets them as events. A notice never runs inside matching, so `why` stays true and an inbox is still just a question.
+`notify` is how the kernel says *when*: an inbox with it raises a notice (item id, inbox path, title, the item's labels) the first time an item enters, and every verb returns the notices it raised next to its warnings. The host says *how*: `paddock pull` prints them and runs `notify_cmd` once per notice (`{id}`, `{inbox}`, `{title}`, `{labels}` substituted and shell-quoted, the notice as JSON on stdin); an app gets them as events. A notice never runs inside matching, so `why` stays true and an inbox is still just a question.
 
 ```toml
 notify_cmd = "notify-send 'paddock {inbox}' {title}"   # Omarchy; on macOS: terminal-notifier, or the app
@@ -175,7 +178,7 @@ labels = ["approved"]           # a hand adds this
 then = ["send:mail", "label:done", "read"]
 ```
 
-An item matches an inbox when `(sources empty OR item.source in sources)` and `(labels empty OR item has ALL listed labels)` and `(item has NONE of without)` and (`timed` unset OR the item has `start`) and the age bounds hold, and it matches every ancestor. Stale cleanup is the question `without = keep` and then a passed `end` or an old `created_at`, so `keep` is just a `without`. Lists are queried in SQL, not loaded whole.
+An item matches an inbox when `(sources empty OR item.source in sources)` and `(labels empty OR item has ALL listed labels)` and `(item has NONE of without)` and the actor terms hold (`from` is one of, a `to` is one of, a mention cite names one of `mentions`; `"me"` in any of them means the config's `me`) and (`timed` unset OR the item has `start`) and the age bounds hold, and it matches every ancestor. Stale cleanup is the question `without = keep` and then a passed `end` or an old `created_at`, so `keep` is just a `without`. Lists are queried in SQL, not loaded whole.
 
 ### sources
 
@@ -366,6 +369,30 @@ args = ["-p"]
 ```
 
 `local` needs `cargo install --path . --features local`; it runs a Model2Vec static model on the CPU with no network, and the default build stays small without it. `exec` embedders get the text on stdin and print a JSON array of numbers. `http` embedders are POSTed `{"text": ..., "model": ...}` and may reply with a bare array or an object holding `embedding`, `vector`, or `data[0].embedding`. `exec` models get the system and user prompt on stdin and reply on stdout.
+
+### skills
+
+A skill is a packaged answer to "what matters": one TOML file of classifiers and inboxes, grafted into the config by name with `use`. The kernel never sees skills; the host merges them before the config reaches it, namespacing classifier ids (`codes/detect`) so `why` still says exactly what fired. `use` at the top of the config grafts under the first top-level inbox; `use` on an inbox grafts under that inbox, so a persona can carry its own.
+
+```toml
+use = ["codes", "mentions"]
+
+[[inbox]]
+name = "work"
+sources = ["gmail", "slack"]
+use = ["receipts"]
+```
+
+Shipped: `codes` (one-time codes, paged, interesting for an hour), `mentions` (anything that mentions you, paged; needs `me`), `receipts`, `newsletters`. Yours live in the config directory's `skills/` and win over shipped ones of the same name; `paddock skills` lists both. A skill that needs your people (`family`) is a file you write, or ask the agent to: `paddock setup "page me when Ana or Bo write"`. A fresh `paddock init` uses `codes` and `mentions`.
+
+```toml
+# family: the people who matter, paged.
+
+[[inbox]]
+name = "family"
+from = ["ana@example.com", "5511…@s.whatsapp.net"]
+then = ["notify"]
+```
 
 ### setup by an agent
 

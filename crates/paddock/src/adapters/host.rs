@@ -151,7 +151,8 @@ pub fn load_config(path: &Path) -> Result<Config> {
         fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
     let config: Config =
         toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
-    Ok(config.with_root())
+    let dir = path.parent().unwrap_or(Path::new("."));
+    Ok(super::skills::graft(config, dir)?.with_root())
 }
 
 /// Resolve every spec in the config into a live adapter and hand the kernel
@@ -241,17 +242,16 @@ pub fn default_config_toml(incoming: &str) -> String {
 # classifiers belong to an inbox and run when an item enters it.
 # a label change re-runs classify so children can fire (classify-on-enter).
 
+# skills (`paddock skills`) are fragments of classifiers and inboxes; `use` grafts them.
+
 keep = ["todo", "later"]
 # forget_after = "30d"   # optional host default for untimed
+me = []                  # who you are across sources: "you@example.com", a Slack id, a WhatsApp jid
+use = ["codes", "mentions"]   # page on one-time codes and on being mentioned
+# notify_cmd = "notify-send 'paddock {{inbox}}' {{title}}"
 
 [[inbox]]
 name = "all"
-
-[[inbox.classifier]]
-id = "flag-rfc"
-kind = "regex"
-pattern = "(?i)rfc"
-label = "rfc"
 
 [[inbox.classifier]]
 id = "flag-todo"

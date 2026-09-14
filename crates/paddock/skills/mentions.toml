@@ -1,0 +1,6 @@
+# mentions: anything that mentions you (@you in Slack, WhatsApp, a list), paged. Needs `me` in the config.
+
+[[inbox]]
+name = "mentions"
+mentions = ["me"]
+then = ["notify"]

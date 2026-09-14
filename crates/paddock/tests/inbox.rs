@@ -338,3 +338,89 @@ path = "{}"
     let got: Vec<i64> = store.ask(&from_ana).unwrap().iter().map(|i| i.id).collect();
     assert_eq!(got, vec![ana_work, ana_fam]);
 }
+
+#[test]
+fn mentions_is_a_term_and_me_stands_for_the_config_s_identities() {
+    let (_tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    fs::write(
+        &paths.config_file,
+        format!(
+            r#"
+me = ["gabriel@example.com", "U0G"]
+
+[[inbox]]
+name = "all"
+
+[[inbox.inbox]]
+name = "mine"
+mentions = ["me"]
+
+[[inbox.inbox]]
+name = "to-me"
+to = ["me"]
+
+[[source]]
+id = "incoming"
+kind = "fs"
+path = "{}"
+"#,
+            paths.incoming_dir.display()
+        ),
+    )
+    .unwrap();
+    let (cfg, store) = load(&paths).unwrap();
+    let mine = cfg.chain(&["all", "mine"]).unwrap()[1];
+    assert_eq!(mine.mentions, ["gabriel@example.com", "U0G", "me"]);
+    let k = kernel(&cfg, &store).unwrap();
+    let mention = |who: &str| NewItem {
+        source_id: "incoming".into(),
+        foreign_id: format!("m-{who}"),
+        title: format!("hey {who}"),
+        cites: vec![Cite {
+            kind: CiteKind::Mention,
+            actor: Some(Actor {
+                id: who.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let me = k.admit(mention("U0G")).unwrap().id;
+    let other = k.admit(mention("U0X")).unwrap().id;
+    let addressed = k
+        .admit(NewItem {
+            source_id: "incoming".into(),
+            foreign_id: "t".into(),
+            title: "for you".into(),
+            to: vec![Actor {
+                id: "me".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    let ids = |path: &[&str]| -> Vec<i64> {
+        k.ask(&cfg.chain(path).unwrap())
+            .unwrap()
+            .iter()
+            .map(|i| i.id)
+            .collect()
+    };
+    assert_eq!(
+        ids(&["all", "mine"]),
+        [me],
+        "the store answers the mentions term"
+    );
+    assert_eq!(
+        ids(&["all", "to-me"]),
+        [addressed],
+        "a source's literal `me` still counts"
+    );
+    let q = Question::of(&cfg.chain(&["all", "mine"]).unwrap());
+    assert!(q.matches(&store.get(me).unwrap()));
+    assert!(!q.matches(&store.get(other).unwrap()));
+    assert!(!q.matches(&store.get(addressed).unwrap()));
+}

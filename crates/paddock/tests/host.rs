@@ -23,9 +23,9 @@ fn nested_config_parses() {
     let cfg: Config = toml::from_str(&toml).unwrap();
     assert_eq!(cfg.inbox.len(), 1);
     assert_eq!(cfg.inbox[0].name, "all");
-    assert_eq!(cfg.inbox[0].classifier.len(), 2);
-    assert_eq!(cfg.inbox[0].classifier[0].id, "flag-rfc");
-    assert_eq!(cfg.inbox[0].classifier[1].id, "flag-todo");
+    assert_eq!(cfg.inbox[0].classifier.len(), 1);
+    assert_eq!(cfg.inbox[0].classifier[0].id, "flag-todo");
+    assert_eq!(cfg.use_, ["codes", "mentions"], "skills, grafted at load");
     assert_eq!(cfg.inbox[0].inbox.len(), 3);
     assert_eq!(cfg.inbox[0].inbox[0].name, "later");
     assert_eq!(cfg.inbox[0].inbox[0].labels, vec!["later"]);
@@ -230,4 +230,73 @@ path = "/tmp"
         "and the item is stale"
     );
     assert!(store.get(id).is_err());
+}
+
+#[test]
+fn use_grafts_skills_into_the_config_when_it_loads() {
+    let (_tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    fs::create_dir_all(paths.config_dir.join("skills")).unwrap();
+    fs::write(
+        paths.config_dir.join("skills/family.toml"),
+        "# family: the people who matter\n[[inbox]]\nname = \"family\"\nfrom = [\"ana@example.com\"]\nthen = [\"notify\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        &paths.config_file,
+        format!(
+            r#"
+use = ["codes"]
+
+[[inbox]]
+name = "all"
+
+[[inbox.inbox]]
+name = "personal"
+use = ["family"]
+
+[[source]]
+id = "incoming"
+kind = "fs"
+path = "{}"
+"#,
+            paths.incoming_dir.display()
+        ),
+    )
+    .unwrap();
+    let cfg = load_config(&paths.config_file).unwrap();
+    assert!(
+        cfg.chain(&["all", "codes"]).is_some(),
+        "shipped skill under all"
+    );
+    assert!(
+        cfg.chain(&["all", "personal", "family"]).is_some(),
+        "yours under the persona"
+    );
+    let ids: Vec<String> = cfg.classifiers().iter().map(|c| c.id.clone()).collect();
+    assert_eq!(ids, ["codes/detect"]);
+    let listed = skills(&paths.config_dir);
+    assert_eq!(listed[0].name, "family");
+    assert_eq!(listed[0].about, "the people who matter");
+    assert!(listed
+        .iter()
+        .any(|s| s.name == "codes" && s.origin == "shipped"));
+
+    // A fresh host pages on codes out of the box, and a code carries its label.
+    let (_tmp2, fresh) = temp_paths();
+    init(&fresh).unwrap();
+    let (cfg, store) = load(&fresh).unwrap();
+    assert!(cfg.chain(&["all", "codes"]).is_some());
+    let k = kernel(&cfg, &store).unwrap();
+    let admitted = k
+        .admit(NewItem {
+            source_id: "incoming".into(),
+            foreign_id: "c".into(),
+            title: "Your verification code is 483920".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(admitted.notices.len(), 1);
+    assert_eq!(admitted.notices[0].inbox, "all/codes");
+    assert_eq!(admitted.notices[0].labels, ["code"]);
 }

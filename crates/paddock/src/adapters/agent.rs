@@ -164,7 +164,8 @@ pub fn notify(config: &Config, notices: &[Notice]) -> Vec<String> {
             let cmd = template
                 .replace("{id}", &n.id.to_string())
                 .replace("{inbox}", &quote(&n.inbox))
-                .replace("{title}", &quote(&n.title));
+                .replace("{title}", &quote(&n.title))
+                .replace("{labels}", &quote(&n.labels.join(",")));
             let json = serde_json::to_vec(n).unwrap_or_default();
             super::transport::run("sh", &["-c".to_string(), cmd.clone()], &json)
                 .err()
@@ -193,7 +194,7 @@ pub fn briefing(paths: &Paths, config: &Config, store: &dyn Store) -> Result<Str
     w.push_str("Actor kind is person | group | list | agent.\n");
     w.push_str("Admit upserts on (source_id, foreign_id). Re-admit refreshes the item and keeps read + labels.\n");
     w.push_str("A label remembers who put it there (hand, source, classifier, or an inbox effect). A label a hand removed is denied: nothing but a hand puts it back. Read is the label `read`.\n");
-    w.push_str("An inbox may say `without = [...]` (item carries none) and `then = [...]` (effects on enter, once per item: label:NAME, read, send:SOURCE, notify). `notify` raises a notice the host acts on (notify_cmd, or an app).\n");
+    w.push_str("An inbox may say `without = [...]` (item carries none), `from`/`to`/`mentions = [...]` (actor ids; \"me\" means the config's `me`), `use = [...]` (skills grafted under it), and `then = [...]` (effects on enter, once per item: label:NAME, read, send:SOURCE, notify). `notify` raises a notice the host acts on (notify_cmd, or an app).\n");
     w.push_str("Optional blocks: [embedder] (ollama|openai|http|exec|local), [model] (exec|ollama|openai) for `answer`, [store] (sqlite; key or key_cmd encrypts; [store.mirror] s3|exec), [agent] (the CLI `paddock setup` runs), notify_cmd.\n\n");
 
     w.push_str("## this host\n");
@@ -254,6 +255,11 @@ pub fn briefing(paths: &Paths, config: &Config, store: &dyn Store) -> Result<Str
     })?;
     w.push_str(&format!("total {total}  timed {timed}\n\n"));
 
+    w.push_str("## skills (grafted with `use = [...]` on an inbox, or at the top for `all`)\n");
+    for s in super::skills::skills(&paths.config_dir) {
+        w.push_str(&format!("{}  {}  ({})\n", s.name, s.about, s.origin));
+    }
+    w.push('\n');
     w.push_str("## inboxes\n");
     for node in config.nodes() {
         let (unread, total) = counts(config, store, &node.path);
@@ -318,6 +324,7 @@ mod tests {
             id: 7,
             inbox: "all/todo".into(),
             title: "it's due; \"soon\"".into(),
+            labels: vec!["todo".into()],
         };
         let warnings = notify(&config, std::slice::from_ref(&notice));
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -340,6 +347,7 @@ mod tests {
                 id: 1,
                 inbox: "all".into(),
                 title: "x".into(),
+                labels: Vec::new(),
             }],
         );
         assert_eq!(w.len(), 1);
