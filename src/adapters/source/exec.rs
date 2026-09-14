@@ -1,4 +1,6 @@
-//! Any program that speaks the exec protocol.
+//! Any program that speaks the exec protocol. An item's `cites` are
+//! `{kind, foreign_id?, source_id?, href?, excerpt?, actor?}`; kind is
+//! reply | forward | quote | mention | attach.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -7,7 +9,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use super::{nonempty, opt};
-use crate::kernel::{Actor, ActorKind, Draft, NewItem, NewPart, PartKind, Source};
+use crate::kernel::{Actor, ActorKind, Cite, CiteKind, Draft, NewItem, NewPart, PartKind, Source};
 
 /// Any program. `{cmd} {args...} pull` prints items as JSON (array or NDJSON);
 /// `{cmd} {args...} send` reads a JSON draft on stdin and prints
@@ -41,6 +43,22 @@ struct ExecPart {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+struct ExecCite {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    source_id: Option<String>,
+    #[serde(default)]
+    foreign_id: Option<String>,
+    #[serde(default)]
+    href: Option<String>,
+    #[serde(default)]
+    excerpt: Option<String>,
+    #[serde(default)]
+    actor: Option<ExecActor>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 struct ExecItem {
     #[serde(default)]
     foreign_id: String,
@@ -61,13 +79,7 @@ struct ExecItem {
     #[serde(default)]
     to: Vec<ExecActor>,
     #[serde(default)]
-    in_reply_to: Option<String>,
-    #[serde(default)]
-    forward_of: Option<String>,
-    #[serde(default)]
-    cite_excerpt: Option<String>,
-    #[serde(default)]
-    cite_actor: Option<ExecActor>,
+    cites: Vec<ExecCite>,
     #[serde(default)]
     parts: Vec<ExecPart>,
     #[serde(default)]
@@ -226,12 +238,21 @@ impl Exec {
             parts: it.parts.into_iter().map(part_in).collect(),
             from: it.from.map(actor_in),
             to: it.to.into_iter().map(actor_in).collect(),
-            in_reply_to: opt(it.in_reply_to),
-            forward_of: opt(it.forward_of),
-            cite_excerpt: opt(it.cite_excerpt),
-            cite_actor: it.cite_actor.map(actor_in),
+            cites: it.cites.into_iter().map(cite_in).collect(),
             read: it.read,
         }
+    }
+}
+
+fn cite_in(c: ExecCite) -> Cite {
+    Cite {
+        kind: CiteKind::parse(&c.kind),
+        source_id: opt(c.source_id),
+        foreign_id: opt(c.foreign_id),
+        id: None,
+        href: opt(c.href),
+        excerpt: opt(c.excerpt),
+        actor: c.actor.map(actor_in),
     }
 }
 

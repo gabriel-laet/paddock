@@ -8,12 +8,13 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::kernel::{
-    Actor, ActorKind, By, Fact, Item, Label, NewItem, NewPart, Part, PartKind, Question, StaleHint,
-    Store,
+    Actor, ActorKind, By, Cite, CiteKind, Fact, Item, Label, NewItem, NewPart, Part, PartKind,
+    Question, StaleHint, Store,
 };
 
 const ITEM_COLS: &str =
-    "id, source_id, foreign_id, title, body, href, start, end, created_at, read, thread,      from_id, from_name, from_kind, in_reply_to, forward_of, cite_excerpt,      cite_actor_id, cite_actor_name, cite_actor_kind";
+    "id, source_id, foreign_id, title, body, href, start, end, created_at, read, thread, \
+     from_id, from_name, from_kind";
 
 #[derive(Clone)]
 pub struct Sqlite {
@@ -55,84 +56,68 @@ impl Sqlite {
                 thread TEXT,
                 created_at TEXT NOT NULL,
                 read INTEGER NOT NULL DEFAULT 0,
+                from_id TEXT,
+                from_name TEXT,
+                from_kind TEXT,
                 UNIQUE(source_id, foreign_id)
             );
+            CREATE INDEX IF NOT EXISTS idx_items_thread ON items(thread);
+            CREATE INDEX IF NOT EXISTS idx_items_start ON items(start);
+            CREATE INDEX IF NOT EXISTS idx_items_created ON items(created_at);
             CREATE TABLE IF NOT EXISTS labels (
-                item_id INTEGER NOT NULL,
+                item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
                 label TEXT NOT NULL,
-                PRIMARY KEY (item_id, label),
-                FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+                by TEXT NOT NULL,
+                at TEXT NOT NULL,
+                removed INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (item_id, label)
             );
             CREATE TABLE IF NOT EXISTS parts (
                 id INTEGER PRIMARY KEY,
-                item_id INTEGER NOT NULL,
+                item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
                 seq INTEGER NOT NULL,
                 kind TEXT NOT NULL,
                 mime TEXT NOT NULL,
                 text TEXT,
-                blob BLOB,
-                FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+                blob BLOB
             );
+            CREATE INDEX IF NOT EXISTS idx_parts_item ON parts(item_id);
             CREATE TABLE IF NOT EXISTS item_to (
-                item_id INTEGER NOT NULL,
+                item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
                 actor_id TEXT NOT NULL,
                 name TEXT,
                 kind TEXT NOT NULL,
-                PRIMARY KEY (item_id, actor_id),
-                FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+                PRIMARY KEY (item_id, actor_id)
             );
-            CREATE TABLE IF NOT EXISTS llm_classified (
-                item_id INTEGER NOT NULL,
+            CREATE TABLE IF NOT EXISTS cites (
+                id INTEGER PRIMARY KEY,
+                item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                source_id TEXT,
+                foreign_id TEXT,
+                target_id INTEGER,
+                href TEXT,
+                excerpt TEXT,
+                actor_id TEXT,
+                actor_name TEXT,
+                actor_kind TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_cites_item ON cites(item_id);
+            CREATE INDEX IF NOT EXISTS idx_cites_target ON cites(target_id);
+            CREATE INDEX IF NOT EXISTS idx_cites_foreign ON cites(source_id, foreign_id);
+            CREATE TABLE IF NOT EXISTS classified (
+                item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
                 classifier_id TEXT NOT NULL,
-                PRIMARY KEY (item_id, classifier_id),
-                FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+                PRIMARY KEY (item_id, classifier_id)
             );
-            CREATE INDEX IF NOT EXISTS idx_parts_item ON parts(item_id);
-            CREATE INDEX IF NOT EXISTS idx_item_to_item ON item_to(item_id);
+            CREATE TABLE IF NOT EXISTS vectors (
+                item_id INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+                data BLOB NOT NULL
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(item_id UNINDEXED, title, text);
             "#,
         )?;
-        ensure_column(&conn, "items", "start", "TEXT")?;
-        ensure_column(&conn, "items", "end", "TEXT")?;
-        ensure_column(&conn, "items", "thread", "TEXT")?;
-        ensure_column(&conn, "items", "from_id", "TEXT")?;
-        ensure_column(&conn, "items", "from_name", "TEXT")?;
-        ensure_column(&conn, "items", "from_kind", "TEXT")?;
-        ensure_column(&conn, "items", "in_reply_to", "INTEGER")?;
-        ensure_column(&conn, "items", "forward_of", "INTEGER")?;
-        ensure_column(&conn, "items", "cite_excerpt", "TEXT")?;
-        ensure_column(&conn, "items", "cite_actor_id", "TEXT")?;
-        ensure_column(&conn, "items", "cite_actor_name", "TEXT")?;
-        ensure_column(&conn, "items", "cite_actor_kind", "TEXT")?;
-        ensure_column(&conn, "items", "in_reply_to_foreign", "TEXT")?;
-        ensure_column(&conn, "items", "forward_of_foreign", "TEXT")?;
-        ensure_column(&conn, "parts", "blob", "BLOB")?;
-        ensure_column(&conn, "labels", "by", "TEXT NOT NULL DEFAULT 'hand'")?;
-        ensure_column(&conn, "labels", "at", "TEXT NOT NULL DEFAULT ''")?;
-        ensure_column(&conn, "labels", "removed", "INTEGER NOT NULL DEFAULT 0")?;
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_items_thread ON items(thread);
-             CREATE INDEX IF NOT EXISTS idx_items_reply_foreign ON items(source_id, in_reply_to_foreign);
-             CREATE INDEX IF NOT EXISTS idx_items_fwd_foreign ON items(source_id, forward_of_foreign);
-             CREATE INDEX IF NOT EXISTS idx_items_start ON items(start);
-             CREATE INDEX IF NOT EXISTS idx_items_created ON items(created_at);",
-        )?;
-        backfill_parts(&conn)?;
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(item_id UNINDEXED, title, text);
-             CREATE TABLE IF NOT EXISTS vectors (
-                item_id INTEGER PRIMARY KEY,
-                data BLOB NOT NULL,
-                FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
-             );",
-        )?;
-        let indexed: i64 = conn.query_row("SELECT COUNT(*) FROM items_fts", [], |r| r.get(0))?;
-        if indexed == 0 {
-            conn.execute_batch("DELETE FROM items_fts;")?;
-            conn.execute(
-                &format!("INSERT INTO items_fts(item_id, title, text) {FTS_ROWS}"),
-                [],
-            )?;
-        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -151,21 +136,10 @@ impl Store for Sqlite {
         let thread = trim_thread(item.thread.as_deref());
         let to_write = parts_to_insert(item);
         let (from_id, from_name, from_kind) = actor_cols(item.from.as_ref());
-        let (cite_id, cite_name, cite_kind) = actor_cols(item.cite_actor.as_ref());
-        let reply_f = trim_opt(item.in_reply_to.as_deref());
-        let fwd_f = trim_opt(item.forward_of.as_deref());
         let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
-        let reply_id = match reply_f.as_deref() {
-            Some(f) => lookup_id(&tx, &item.source_id, f)?,
-            None => None,
-        };
-        let fwd_id = match fwd_f.as_deref() {
-            Some(f) => lookup_id(&tx, &item.source_id, f)?,
-            None => None,
-        };
         let existing = lookup_id(&tx, &item.source_id, &item.foreign_id)?;
         let (id, created) = if let Some(id) = existing {
             tx.execute(
@@ -175,52 +149,22 @@ impl Store for Sqlite {
             if item.read == Some(true) {
                 tx.execute("UPDATE items SET read = 1 WHERE id = ?1", params![id])?;
             }
-            if thread.is_some() {
-                tx.execute(
-                    "UPDATE items SET thread = ?1 WHERE id = ?2",
-                    params![thread, id],
-                )?;
-            }
-            if item.start.is_some() {
-                tx.execute(
-                    "UPDATE items SET start = ?1 WHERE id = ?2",
-                    params![item.start, id],
-                )?;
-            }
-            if item.end.is_some() {
-                tx.execute(
-                    "UPDATE items SET end = ?1 WHERE id = ?2",
-                    params![item.end, id],
-                )?;
+            for (col, val) in [
+                ("thread", &thread),
+                ("start", &item.start),
+                ("end", &item.end),
+            ] {
+                if val.is_some() {
+                    tx.execute(
+                        &format!("UPDATE items SET {col} = ?1 WHERE id = ?2"),
+                        params![val, id],
+                    )?;
+                }
             }
             if item.from.is_some() {
                 tx.execute(
                     "UPDATE items SET from_id = ?1, from_name = ?2, from_kind = ?3 WHERE id = ?4",
                     params![from_id, from_name, from_kind, id],
-                )?;
-            }
-            if reply_f.is_some() {
-                tx.execute(
-                    "UPDATE items SET in_reply_to_foreign = ?1, in_reply_to = ?2 WHERE id = ?3",
-                    params![reply_f, reply_id, id],
-                )?;
-            }
-            if fwd_f.is_some() {
-                tx.execute(
-                    "UPDATE items SET forward_of_foreign = ?1, forward_of = ?2 WHERE id = ?3",
-                    params![fwd_f, fwd_id, id],
-                )?;
-            }
-            if trim_opt(item.cite_excerpt.as_deref()).is_some() {
-                tx.execute(
-                    "UPDATE items SET cite_excerpt = ?1 WHERE id = ?2",
-                    params![trim_opt(item.cite_excerpt.as_deref()), id],
-                )?;
-            }
-            if item.cite_actor.is_some() {
-                tx.execute(
-                    "UPDATE items SET cite_actor_id = ?1, cite_actor_name = ?2, cite_actor_kind = ?3 WHERE id = ?4",
-                    params![cite_id, cite_name, cite_kind, id],
                 )?;
             }
             if !to_write.is_empty() {
@@ -233,15 +177,17 @@ impl Store for Sqlite {
                 tx.execute("DELETE FROM item_to WHERE item_id = ?1", params![id])?;
                 insert_to_rows(&tx, id, &item.to)?;
             }
+            if !item.cites.is_empty() {
+                tx.execute("DELETE FROM cites WHERE item_id = ?1", params![id])?;
+                insert_cites(&tx, id, &item.source_id, &item.cites)?;
+            }
             (id, false)
         } else {
             tx.execute(
                 "INSERT INTO items
                     (source_id, foreign_id, title, body, href, start, end, thread, created_at, read,
-                     from_id, from_name, from_kind, in_reply_to, forward_of, cite_excerpt,
-                     cite_actor_id, cite_actor_name, cite_actor_kind,
-                     in_reply_to_foreign, forward_of_foreign)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                     from_id, from_name, from_kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     item.source_id,
                     item.foreign_id,
@@ -256,14 +202,6 @@ impl Store for Sqlite {
                     from_id,
                     from_name,
                     from_kind,
-                    reply_id,
-                    fwd_id,
-                    trim_opt(item.cite_excerpt.as_deref()),
-                    cite_id,
-                    cite_name,
-                    cite_kind,
-                    reply_f,
-                    fwd_f
                 ],
             )?;
             let id = tx.last_insert_rowid();
@@ -271,9 +209,14 @@ impl Store for Sqlite {
                 insert_part_row(&tx, id, seq as i64, part)?;
             }
             insert_to_rows(&tx, id, &item.to)?;
+            insert_cites(&tx, id, &item.source_id, &item.cites)?;
             (id, true)
         };
-        stitch_cites(&tx, &item.source_id, &item.foreign_id, id)?;
+        // A cite that named this item before it arrived now points at it.
+        tx.execute(
+            "UPDATE cites SET target_id = ?1 WHERE source_id = ?2 AND foreign_id = ?3 AND target_id IS NULL",
+            params![id, item.source_id, item.foreign_id],
+        )?;
         index_text(&tx, id)?;
         tx.commit()?;
         Ok((id, created))
@@ -289,7 +232,7 @@ impl Store for Sqlite {
         (item.labels, item.denied) = labels_for(&conn, id)?;
         item.parts = parts_for(&conn, id)?;
         item.to = to_for(&conn, id)?;
-        ensure_text_part(&conn, &mut item)?;
+        item.cites = cites_for(&conn, id)?;
         Ok(item)
     }
 
@@ -410,7 +353,7 @@ impl Store for Sqlite {
             }
             Fact::Classified(classifier_id) => {
                 conn.execute(
-                    "INSERT OR IGNORE INTO llm_classified (item_id, classifier_id) VALUES (?1, ?2)",
+                    "INSERT OR IGNORE INTO classified (item_id, classifier_id) VALUES (?1, ?2)",
                     params![id, classifier_id],
                 )?;
             }
@@ -422,6 +365,20 @@ impl Store for Sqlite {
             }
         }
         Ok(())
+    }
+
+    fn citing(&self, id: i64) -> Result<Vec<Item>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ITEM_COLS} FROM items WHERE id IN (SELECT item_id FROM cites WHERE target_id = ?1)
+             ORDER BY created_at DESC, id DESC"
+        ))?;
+        let mut items: Vec<Item> = stmt
+            .query_map(params![id], row_item)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        hydrate(&conn, &mut items)?;
+        Ok(items)
     }
 
     fn blob(&self, part_id: i64) -> Result<Vec<u8>> {
@@ -456,7 +413,7 @@ impl Store for Sqlite {
         let conn = self.lock()?;
         let hit: Option<i64> = conn
             .query_row(
-                "SELECT 1 FROM llm_classified WHERE item_id = ?1 AND classifier_id = ?2",
+                "SELECT 1 FROM classified WHERE item_id = ?1 AND classifier_id = ?2",
                 params![id, classifier_id],
                 |r| r.get(0),
             )
@@ -615,15 +572,66 @@ fn row_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
         read: row.get::<_, i64>(9)? != 0,
         thread: row.get(10)?,
         from: actor_from_cols(row.get(11)?, row.get(12)?, row.get(13)?),
-        in_reply_to: row.get(14)?,
-        forward_of: row.get(15)?,
-        cite_excerpt: row.get(16)?,
-        cite_actor: actor_from_cols(row.get(17)?, row.get(18)?, row.get(19)?),
-        labels: Vec::new(),
-        denied: Vec::new(),
-        parts: Vec::new(),
-        to: Vec::new(),
+        ..Default::default()
     })
+}
+
+fn insert_cites(conn: &Connection, item_id: i64, own_source: &str, cites: &[Cite]) -> Result<()> {
+    for (seq, c) in cites.iter().enumerate() {
+        let source = c
+            .source_id
+            .clone()
+            .unwrap_or_else(|| own_source.to_string());
+        let foreign = trim_opt(c.foreign_id.as_deref());
+        let target = match &foreign {
+            Some(f) => lookup_id(conn, &source, f)?,
+            None => None,
+        };
+        let (aid, aname, akind) = actor_cols(c.actor.as_ref());
+        conn.execute(
+            "INSERT INTO cites (item_id, seq, kind, source_id, foreign_id, target_id, href, excerpt,
+                                actor_id, actor_name, actor_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                item_id,
+                seq as i64,
+                c.kind.as_str(),
+                foreign.as_ref().map(|_| source.clone()),
+                foreign,
+                target,
+                trim_opt(c.href.as_deref()),
+                trim_opt(c.excerpt.as_deref()),
+                aid,
+                aname,
+                akind
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn row_cite(row: &rusqlite::Row<'_>) -> rusqlite::Result<Cite> {
+    let kind: String = row.get(0)?;
+    Ok(Cite {
+        kind: CiteKind::parse(&kind),
+        source_id: row.get(1)?,
+        foreign_id: row.get(2)?,
+        id: row.get(3)?,
+        href: row.get(4)?,
+        excerpt: row.get(5)?,
+        actor: actor_from_cols(row.get(6)?, row.get(7)?, row.get(8)?),
+    })
+}
+
+const CITE_COLS: &str =
+    "kind, source_id, foreign_id, target_id, href, excerpt, actor_id, actor_name, actor_kind";
+
+fn cites_for(conn: &Connection, id: i64) -> Result<Vec<Cite>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {CITE_COLS} FROM cites WHERE item_id = ?1 ORDER BY seq, id"
+    ))?;
+    let rows = stmt.query_map(params![id], row_cite)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// (live, denied) labels of one item.
@@ -895,33 +903,10 @@ fn hydrate(conn: &Connection, items: &mut [Item]) -> Result<()> {
 
     for item in items {
         (item.labels, item.denied) = lab_map.remove(&item.id).unwrap_or_default();
+        item.cites = cites_for(conn, item.id)?;
         item.parts = part_map.remove(&item.id).unwrap_or_default();
         item.to = to_map.remove(&item.id).unwrap_or_default();
     }
-    Ok(())
-}
-
-fn ensure_text_part(conn: &Connection, item: &mut Item) -> Result<()> {
-    if item.parts.is_empty() && !item.body.is_empty() {
-        conn.execute(
-            "INSERT INTO parts (item_id, seq, kind, mime, text, blob)
-             VALUES (?1, 0, 'text', 'text/plain', ?2, NULL)",
-            params![item.id, item.body],
-        )?;
-        item.parts = parts_for(conn, item.id)?;
-    }
-    Ok(())
-}
-
-fn backfill_parts(conn: &Connection) -> Result<()> {
-    conn.execute(
-        "INSERT INTO parts (item_id, seq, kind, mime, text, blob)
-         SELECT id, 0, 'text', 'text/plain', body, NULL
-         FROM items
-         WHERE body != ''
-           AND NOT EXISTS (SELECT 1 FROM parts WHERE parts.item_id = items.id)",
-        [],
-    )?;
     Ok(())
 }
 
@@ -934,32 +919,4 @@ fn lookup_id(conn: &Connection, source_id: &str, foreign_id: &str) -> Result<Opt
         )
         .optional()?;
     Ok(id)
-}
-
-fn stitch_cites(conn: &Connection, source_id: &str, foreign_id: &str, id: i64) -> Result<()> {
-    conn.execute(
-        "UPDATE items SET in_reply_to = ?1
-         WHERE source_id = ?2 AND in_reply_to_foreign = ?3",
-        params![id, source_id, foreign_id],
-    )?;
-    conn.execute(
-        "UPDATE items SET forward_of = ?1
-         WHERE source_id = ?2 AND forward_of_foreign = ?3",
-        params![id, source_id, foreign_id],
-    )?;
-    Ok(())
-}
-
-fn ensure_column(conn: &Connection, table: &str, name: &str, decl: &str) -> Result<()> {
-    let sql = format!("PRAGMA table_info({table})");
-    let mut stmt = conn.prepare(&sql)?;
-    let exists = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .filter_map(|r| r.ok())
-        .any(|n| n == name);
-    drop(stmt);
-    if !exists {
-        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {name} {decl}"), [])?;
-    }
-    Ok(())
 }

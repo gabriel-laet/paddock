@@ -71,6 +71,9 @@ fn item_value(item: &Item) -> serde_json::Value {
         "parts": item.parts.iter().map(|p| p.kind.as_str()).collect::<Vec<_>>(),
         "from": item.from.as_ref().map(actor).unwrap_or(serde_json::Value::Null),
         "to": item.to.iter().map(actor).collect::<Vec<_>>(),
+        "cites": item.cites.iter().map(|c| serde_json::json!({
+            "kind": c.kind.as_str(), "id": c.id, "href": s(&c.href)
+        })).collect::<Vec<_>>(),
     })
 }
 

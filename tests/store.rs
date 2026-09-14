@@ -32,38 +32,6 @@ fn unique_on_source_and_foreign_id() {
 }
 
 #[test]
-fn opens_legacy_db_without_thread_column() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("old.db");
-    {
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch(
-            r#"
-            CREATE TABLE items (
-                id INTEGER PRIMARY KEY,
-                source_id TEXT NOT NULL,
-                foreign_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                body TEXT NOT NULL,
-                href TEXT,
-                created_at TEXT NOT NULL,
-                read INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(source_id, foreign_id)
-            );
-            INSERT INTO items (source_id, foreign_id, title, body, created_at, read)
-            VALUES ('incoming', 'a.md', 'a', 'hello', '2026-01-01T00:00:00Z', 0);
-            "#,
-        )
-        .unwrap();
-    }
-    let store = Sqlite::open(&db, None).unwrap();
-    let items = store.ask(&Question::default()).unwrap();
-    assert_eq!(items.len(), 1);
-    assert!(items[0].thread.is_none());
-    assert_eq!(items[0].body, "hello");
-}
-
-#[test]
 fn store_roundtrip_start_end() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
@@ -231,31 +199,6 @@ fn set_thread_and_items_in_thread() {
 }
 
 #[test]
-fn backfill_parts_from_body() {
-    let (_tmp, paths) = temp_paths();
-    init(&paths).unwrap();
-    let _ = Sqlite::open(&paths.db_path, None).unwrap();
-    {
-        let conn = rusqlite::Connection::open(&paths.db_path).unwrap();
-        conn.execute(
-            "INSERT INTO items (source_id, foreign_id, title, body, created_at, read)
-             VALUES ('incoming', 'old.md', 'old', 'legacy body', '2026-01-01T00:00:00Z', 0)",
-            [],
-        )
-        .unwrap();
-    }
-    let store = Sqlite::open(&paths.db_path, None).unwrap();
-    let items = store.ask(&Question::default()).unwrap();
-    let item = items.iter().find(|i| i.foreign_id == "old.md").unwrap();
-    assert_eq!(item.body, "legacy body");
-    assert_eq!(item.parts.len(), 1);
-    assert_eq!(item.parts[0].kind, PartKind::Text);
-    assert_eq!(item.parts[0].text.as_deref(), Some("legacy body"));
-    let again = store.get(item.id).unwrap();
-    assert_eq!(again.parts.len(), 1);
-}
-
-#[test]
 fn insert_from_to_actors() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
@@ -377,32 +320,6 @@ fn forget_deletes_the_row() {
     assert!(store.delete(id).unwrap());
     assert!(store.ask(&Question::default()).unwrap().is_empty());
     assert!(!store.delete(id).unwrap());
-}
-
-#[test]
-fn text_index_is_rebuilt_for_an_old_store() {
-    let (_tmp, paths) = temp_paths();
-    init(&paths).unwrap();
-    let (cfg, store) = load(&paths).unwrap();
-    let k = kernel(&cfg, &store).unwrap();
-    k.admit(NewItem {
-        source_id: "incoming".into(),
-        foreign_id: "a".into(),
-        title: "Invoice".into(),
-        body: "x".into(),
-        ..Default::default()
-    })
-    .unwrap();
-    drop(store);
-    let conn = rusqlite::Connection::open(&paths.db_path).unwrap();
-    conn.execute_batch("DROP TABLE items_fts;").unwrap();
-    drop(conn);
-    let store = Sqlite::open(&paths.db_path, None).unwrap();
-    let q = Question {
-        text: Some("invoice".into()),
-        ..Default::default()
-    };
-    assert_eq!(store.count(&q).unwrap(), 1);
 }
 
 #[test]

@@ -58,8 +58,10 @@ enum Cmd {
     },
     /// One item in full
     Show { id: i64 },
-    /// Every item in the same thread as ID
+    /// Every item in the same thread as ID: the source's thread, else what replies join
     Thread { id: i64 },
+    /// Items that cite ID
+    Cited { id: i64 },
     /// The bytes of a part, to stdout
     Part { id: i64 },
     /// Add (+l or l) and remove (-l) labels, then reclassify
@@ -210,14 +212,8 @@ fn main() -> Result<()> {
                 show(&it)?;
             }
         }
-        Cmd::Thread { id } => {
-            let it = store.get(id)?;
-            let items = match it.thread.as_deref() {
-                Some(t) => store.thread(t)?,
-                None => vec![it],
-            };
-            list(&items, cli.json)?;
-        }
+        Cmd::Thread { id } => list(&k.thread(id)?, cli.json)?,
+        Cmd::Cited { id } => list(&store.citing(id)?, cli.json)?,
         Cmd::Part { id } => {
             out.write_all(&store.blob(id)?)?;
         }
@@ -442,19 +438,27 @@ fn show(it: &Item) -> Result<()> {
             writeln!(w, "{k:<8} {v}")?;
         }
     }
-    if let Some(p) = it.in_reply_to {
-        writeln!(w, "reply-to #{p}")?;
-    }
-    if let Some(p) = it.forward_of {
-        writeln!(w, "forward  #{p}")?;
-    }
-    if let Some(ex) = &it.cite_excerpt {
-        let who = it
-            .cite_actor
+    for c in &it.cites {
+        let target = match (c.id, &c.foreign_id, &c.href) {
+            (Some(id), _, _) => format!("#{id}"),
+            (None, Some(f), _) => format!(
+                "{}/{f} (not here)",
+                c.source_id.as_deref().unwrap_or(&it.source_id)
+            ),
+            (None, None, Some(h)) => h.clone(),
+            _ => "?".into(),
+        };
+        let who = c
+            .actor
             .as_ref()
-            .map(|a| format!("{}: ", actor(a)))
+            .map(|a| format!(" {}:", actor(a)))
             .unwrap_or_default();
-        writeln!(w, "cites    {who}{ex}")?;
+        let excerpt = c
+            .excerpt
+            .as_deref()
+            .map(|e| format!(" \"{e}\""))
+            .unwrap_or_default();
+        writeln!(w, "{:<8} {target}{who}{excerpt}", c.kind.as_str())?;
     }
     writeln!(w, "read     {}", it.read)?;
     let labels: Vec<String> = it.labels.iter().map(label_with_by).collect();
@@ -507,10 +511,7 @@ fn context(paths: &Paths, k: &Kernel) -> Result<()> {
         "Inbox kernel. Four nouns: item, source, label, inbox. No other product nouns."
     )?;
     writeln!(w, "An item is source-shaped data stripped: foreign_id, title, body, href, start, end, thread, parts, from, to[], cites.")?;
-    writeln!(
-        w,
-        "A cite arrives as a foreign id and resolves on admit (late parent still stitches)."
-    )?;
+    writeln!(w, "A cite is {{kind: reply|forward|quote|mention|attach, foreign_id or href, excerpt?, actor?}}; it resolves to an id when the cited item is here, early or late.")?;
     writeln!(w, "A source admits items and may send. kinds: fs, rss, exec. rss cannot send. exec runs `{{cmd}} {{args}} pull|send`.")?;
     writeln!(w, "Inboxes nest. A child is a tighter question over the parent. Match: sources AND labels (all) AND timed (start set) AND age.")?;
     writeln!(w, "Classifiers are per-inbox, ordered, kinds regex | script (CEL) | llm. They stamp labels. They are not sources.")?;
@@ -564,7 +565,7 @@ fn context(paths: &Paths, k: &Kernel) -> Result<()> {
         writeln!(w)?;
     }
     writeln!(w, "\n## use")?;
-    writeln!(w, "paddock pull | inboxes | ls [INBOX] [--unread] [--text WORDS] [--like TEXT] | answer QUESTION [--in INBOX] | embed | show ID | thread ID | part ID | label ID [+l|-l]... | read ID | unread ID | forget ID | classify ID | why ID [INBOX] | send [--title T] [--reply ID] [--to A]... [BODY]")?;
+    writeln!(w, "paddock pull | inboxes | ls [INBOX] [--unread] [--text WORDS] [--like TEXT] | answer QUESTION [--in INBOX] | embed | show ID | thread ID | cited ID | part ID | label ID [+l|-l]... | read ID | unread ID | forget ID | classify ID | why ID [INBOX] | send [--title T] [--reply ID] [--to A]... [BODY]")?;
     writeln!(w, "Add --json to any command for machine output. Edit config.toml, then `paddock pull`. Do not invent nouns.")?;
     Ok(())
 }

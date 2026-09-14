@@ -57,7 +57,7 @@ fn send_draft_fs_writes_file_and_text_part() {
     assert_eq!(item.parts[0].kind, PartKind::Text);
     assert_eq!(item.parts[0].text.as_deref(), Some("the body"));
     assert!(item.thread.is_none());
-    assert!(item.in_reply_to.is_none());
+    assert!(item.cites.is_empty());
 }
 
 #[test]

@@ -24,7 +24,7 @@ src/main.rs               the CLI
 
 Items may have parts (text, file, image, audio, video) and an optional thread. `body` is the preview; the full text is the first text part. Part bytes live in the store, not on disk beside it.
 
-Actors and cites are kernel: an item can have `from` / `to` (a person, a group, or a list) and may cite another item. A reply cites an item (`in_reply_to` + thread).
+Actors and cites are kernel: an item can have `from` / `to` (a person, a group, or a list) and `cites`. A cite is one shape for a reply, a forward, a quote, a mention, or an attachment: it names an item by its source's id (resolved to ours when that item is here, early or late) or something outside the pile by `href`, with an optional excerpt and actor. A thread is the source's key when it has one, else whatever replies and forwards join.
 
 A label a hand removed stays denied: no classifier puts it back until a hand does. `why` shows who stamped each label and what is denied.
 
@@ -44,7 +44,8 @@ paddock pull                       # pull sources, classify new items, forget st
 paddock inboxes                    # tree with unread/total
 paddock ls [INBOX] [--unread] [--text WORDS] [--like TEXT] [--limit N]
 paddock show ID                    # one item in full
-paddock thread ID                  # every item in the same thread
+paddock thread ID                  # the source's thread, else what replies and forwards join
+paddock cited ID                   # items that cite ID
 paddock part ID > file             # the bytes of a non-text part
 paddock label ID [+l|-l]...        # add / remove labels, then reclassify
 paddock read ID | unread ID
@@ -179,7 +180,7 @@ model = "llama3.2"
 label = "urgent"                # with a single label the model answers yes or no
 ```
 
-A script sees `item.title`, `body`, `source`, `href`, `start`, `end`, `thread`, `read`, `labels`, `parts` (kinds), `from`, `to`. Absent strings are `""`. CEL cannot loop or do IO.
+A script sees `item.title`, `body`, `source`, `href`, `start`, `end`, `thread`, `read`, `labels`, `parts` (kinds), `from`, `to`, `cites` (`{kind, id, href}`). Absent strings are `""`. CEL cannot loop or do IO.
 
 A label reply is its first token; `NONE` or nothing means no label; a JSON reply may say `{"label": "..."}`. A classifier that fails (a program that exits non-zero, a service that is down) is a warning, not a verdict, and is tried again next time.
 
@@ -246,10 +247,10 @@ Models never run inside matching. An inbox is deterministic and `why` stays true
 
 `kind = "exec"` is the plugin interface. The host runs:
 
-- `{cmd} {args...} pull` — stdout is a JSON array (or NDJSON) of items: `foreign_id` (required), `title`, `body`, `href`, `start`, `end`, `thread`, `from`, `to[]`, `in_reply_to`, `forward_of`, `cite_excerpt`, `cite_actor`, `parts[]`, `read`. Actors are `{id, name?, kind?}`; parts are `{kind, mime, text?, path?}`.
+- `{cmd} {args...} pull` — stdout is a JSON array (or NDJSON) of items: `foreign_id` (required), `title`, `body`, `href`, `start`, `end`, `thread`, `from`, `to[]`, `cites[]`, `parts[]`, `read`. Actors are `{id, name?, kind?}`; parts are `{kind, mime, text?, path?}`; cites are `{kind, foreign_id?, source_id?, href?, excerpt?, actor?}` with kind `reply | forward | quote | mention | attach`.
 - `{cmd} {args...} send` — stdin is a JSON draft `{title, body, thread?, reply_to_foreign?, to[], parts[]}`; stdout is `{foreign_id, start?, end?}`. Exit 2 (or print `source cannot send`) if the source is read-only.
 
-Admit upserts on `(source_id, foreign_id)`. Re-admit refreshes what the source sent and keeps read state and labels. Cites arrive as foreign ids and resolve on admit; a late parent still stitches.
+Admit upserts on `(source_id, foreign_id)`. Re-admit refreshes what the source sent and keeps read state and labels. A cite to an item not here yet resolves when it arrives.
 
 ## license
 

@@ -115,6 +115,78 @@ impl Label {
     }
 }
 
+/// How one item points at another thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CiteKind {
+    Reply,
+    Forward,
+    Quote,
+    #[default]
+    Mention,
+    Attach,
+}
+
+impl CiteKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reply => "reply",
+            Self::Forward => "forward",
+            Self::Quote => "quote",
+            Self::Mention => "mention",
+            Self::Attach => "attach",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "reply" => Self::Reply,
+            "forward" => Self::Forward,
+            "quote" => Self::Quote,
+            "attach" => Self::Attach,
+            _ => Self::Mention,
+        }
+    }
+}
+
+/// One item pointing at another thing: an item in the pile (by the source's
+/// name for it, resolved to our `id` once it is here, early or late), or
+/// something outside it by `href`. One shape for replies, forwards, quotes,
+/// mentions, and attachments.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct Cite {
+    pub kind: CiteKind,
+    /// The cited item's source. None means the citing item's own.
+    pub source_id: Option<String>,
+    /// How that source names the cited item.
+    pub foreign_id: Option<String>,
+    /// Our id for it, once it is in the pile.
+    pub id: Option<i64>,
+    /// Something outside the pile: a URL, a path.
+    pub href: Option<String>,
+    pub excerpt: Option<String>,
+    pub actor: Option<Actor>,
+}
+
+impl Cite {
+    /// A cite to an item of the same source.
+    pub fn to(kind: CiteKind, foreign_id: &str) -> Self {
+        Self {
+            kind,
+            foreign_id: Some(foreign_id.into()),
+            ..Default::default()
+        }
+    }
+
+    pub fn reply(foreign_id: &str) -> Self {
+        Self::to(CiteKind::Reply, foreign_id)
+    }
+
+    pub fn forward(foreign_id: &str) -> Self {
+        Self::to(CiteKind::Forward, foreign_id)
+    }
+}
+
 /// One piece of an item's content. Text is inline; anything else is bytes
 /// the store keeps, `size` long, read back with `Store::blob`.
 #[derive(Debug, Clone, Serialize)]
@@ -159,13 +231,18 @@ pub struct Item {
     pub parts: Vec<Part>,
     pub from: Option<Actor>,
     pub to: Vec<Actor>,
-    pub in_reply_to: Option<i64>,
-    pub forward_of: Option<i64>,
-    pub cite_excerpt: Option<String>,
-    pub cite_actor: Option<Actor>,
+    pub cites: Vec<Cite>,
 }
 
 impl Item {
+    /// The item this one replies to, when that item is in the pile.
+    pub fn reply_to(&self) -> Option<i64> {
+        self.cites
+            .iter()
+            .find(|c| c.kind == CiteKind::Reply)
+            .and_then(|c| c.id)
+    }
+
     pub fn has(&self, label: &str) -> bool {
         self.labels.iter().any(|l| l.name == label)
     }
@@ -218,12 +295,9 @@ pub struct NewItem {
     pub parts: Vec<NewPart>,
     pub from: Option<Actor>,
     pub to: Vec<Actor>,
-    /// Foreign id on the same source. Resolved to a local id on admit.
-    pub in_reply_to: Option<String>,
-    /// Foreign id on the same source. Resolved to a local id on admit.
-    pub forward_of: Option<String>,
-    pub cite_excerpt: Option<String>,
-    pub cite_actor: Option<Actor>,
+    /// Resolved to local ids on admit; a cite to an item not here yet
+    /// resolves when that item arrives.
+    pub cites: Vec<Cite>,
     /// Read state the source tracks, if any. `None` means the source has no opinion.
     pub read: Option<bool>,
 }

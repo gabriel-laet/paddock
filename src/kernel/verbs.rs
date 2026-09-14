@@ -6,10 +6,11 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 
 use super::inbox::{parse_duration, parse_when, rfc3339, ClassifierSpec, Config, Inbox, Question};
-use super::item::{By, Draft, Item, Label, NewItem};
+use super::item::{By, Cite, CiteKind, Draft, Item, Label, NewItem};
 use super::ports::{Brief, Classifier, Embedder, Fact, Model, Source, StaleHint, Store};
 
 const ANSWER_ITEMS: usize = 12;
+const THREAD_LIMIT: usize = 500;
 
 pub struct Kernel<'a> {
     pub config: &'a Config,
@@ -253,7 +254,9 @@ impl Kernel<'_> {
         let mut item = source.send(&draft, reply_foreign.as_deref())?;
         item.source_id = id.clone();
         item.thread = draft.thread.clone();
-        item.in_reply_to = reply_foreign;
+        if let Some(f) = &reply_foreign {
+            item.cites.push(Cite::reply(f));
+        }
         item.to = draft.to.clone();
         self.admit(item)
     }
@@ -331,6 +334,38 @@ impl Kernel<'_> {
             cites,
             considered,
         })
+    }
+
+    /// Everything in the item's thread: the source's thread key when it has
+    /// one, else whatever is joined to it by reply and forward cites, in
+    /// either direction. Newest first.
+    pub fn thread(&self, id: i64) -> Result<Vec<Item>> {
+        let item = self.store.get(id)?;
+        if let Some(key) = item.thread.as_deref().filter(|k| !k.is_empty()) {
+            return self.store.thread(key);
+        }
+        let joins = |c: &Cite| matches!(c.kind, CiteKind::Reply | CiteKind::Forward);
+        let mut seen = std::collections::BTreeMap::new();
+        let mut todo = vec![item];
+        while let Some(it) = todo.pop() {
+            if seen.contains_key(&it.id) || seen.len() >= THREAD_LIMIT {
+                continue;
+            }
+            for c in it.cites.iter().filter(|c| joins(c)) {
+                if let Some(parent) = c.id.filter(|p| !seen.contains_key(p)) {
+                    todo.push(self.store.get(parent)?);
+                }
+            }
+            for child in self.store.citing(it.id)? {
+                if child.cites.iter().any(|c| joins(c) && c.id == Some(it.id)) {
+                    todo.push(child);
+                }
+            }
+            seen.insert(it.id, it);
+        }
+        let mut out: Vec<Item> = seen.into_values().collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        Ok(out)
     }
 
     /// The chain's labels the item carries, with who put each one there, and
