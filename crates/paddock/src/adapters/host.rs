@@ -290,3 +290,49 @@ fn toml_string(s: &str) -> String {
         .collect();
     format!("\"{escaped}\"")
 }
+
+/// Every `NAME_cmd` anywhere in the config run once, so a long-lived
+/// caller (an app) does not run `pass` on every verb. The result lives in
+/// memory only; the file on disk keeps its commands.
+pub fn resolve_secrets(mut config: Config) -> Result<Config> {
+    fn walk(inboxes: &mut [crate::kernel::Inbox]) -> Result<()> {
+        for ib in inboxes {
+            for c in &mut ib.classifier {
+                c.settings = resolve_cmds(&c.settings)?;
+            }
+            walk(&mut ib.inbox)?;
+        }
+        Ok(())
+    }
+    for s in &mut config.source {
+        s.settings = resolve_cmds(&s.settings).with_context(|| format!("source {}", s.id))?;
+    }
+    for c in &mut config.classifier {
+        c.settings = resolve_cmds(&c.settings)?;
+    }
+    walk(&mut config.inbox)?;
+    for spec in [
+        &mut config.embedder,
+        &mut config.model,
+        &mut config.store,
+        &mut config.agent,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        spec.settings = resolve_cmds(&spec.settings)?;
+    }
+    Ok(config)
+}
+
+/// Snapshot the store beside itself and hand the snapshot to the mirror.
+/// Returns where it went.
+pub fn push_mirror(paths: &Paths, config: &Config, store: &Sqlite) -> Result<String> {
+    let m = mirror(config)?.ok_or_else(|| anyhow::anyhow!("no [store.mirror] in config"))?;
+    let snapshot = paths.db_path.with_extension("db.snapshot");
+    store.snapshot(&snapshot)?;
+    let pushed = m.push(&snapshot);
+    let _ = fs::remove_file(&snapshot);
+    pushed?;
+    Ok(m.describe())
+}

@@ -16,8 +16,10 @@ crates/
   protocol/           paddock-protocol the exec protocol's types and the Message shape.
                                        Plugins depend on this and on nothing else here.
   paddock/            paddock          the binary: adapters (sqlite store; fs and exec
-                                       sources; classifiers; models; embedders; host)
-                                       and the CLI. Integration tests live here too.
+                                       sources; classifiers; models; embedders; mirror;
+                                       agent; host) and the CLI. Integration tests too.
+  app/                paddock-app      the façade a native app talks to: one Session per
+                                       host, every verb as a method, events, change.
 plugins/
   rss/                paddock-rss      a feed
   mail/               paddock-mail     a library: RFC 822 bytes as a Message (maildir and imap share it)
@@ -88,6 +90,7 @@ paddock embed                      # embed items that have no vector yet
 paddock check CMD [--set k=v]... [--send]   # speak the protocol to a plugin and validate what it says
 paddock context                    # dump this host for an agent
 paddock mirror [--restore [--force]]   # push a snapshot of the store to [store.mirror], or pull it back
+paddock setup [TASK...]            # hand the host and a task in words to the agent in [agent]; no task lists agents
 ```
 
 `--json` on any command prints machine output. `--dir DIR` names the host directory. `--remote[=HOST]` re-runs the same command over ssh (host from the flag, else `remote` in config); `--local` forces this machine.
@@ -146,7 +149,18 @@ path = "~/.local/share/paddock/incoming"
 
 ### effects
 
-`then` names what an inbox does to an item that enters it: `label:NAME`, `read`, or `send:SOURCE`. What an effect produces (the item a `send:` delivers) is classified like anything else but fires no effects of its own, so an effect cannot chase its own output. An effect runs once per item per inbox, the same way a run-once classifier does; one that fails (a source that is down) is not remembered, so it retries on the next classify or pull and warns each time until it goes through. `send:` stamps `sent`. That is the whole approval flow: an agent drafts into a source, a hand adds `approved`, the inbox sends.
+`then` names what an inbox does to an item that enters it: `label:NAME`, `read`, `send:SOURCE`, or `notify`. What an effect produces (the item a `send:` delivers) is classified like anything else but fires no effects of its own, so an effect cannot chase its own output. An effect runs once per item per inbox, the same way a run-once classifier does; one that fails (a source that is down) is not remembered, so it retries on the next classify or pull and warns each time until it goes through. `send:` stamps `sent`. That is the whole approval flow: an agent drafts into a source, a hand adds `approved`, the inbox sends.
+
+`notify` is how the kernel says *when*: an inbox with it raises a notice (item id, inbox path, title) the first time an item enters, and every verb returns the notices it raised next to its warnings. The host says *how*: `paddock pull` prints them and runs `notify_cmd` once per notice (`{id}`, `{inbox}`, `{title}` substituted and shell-quoted, the notice as JSON on stdin); an app gets them as events. A notice never runs inside matching, so `why` stays true and an inbox is still just a question.
+
+```toml
+notify_cmd = "notify-send 'paddock {inbox}' {title}"   # Omarchy; on macOS: terminal-notifier, or the app
+
+[[inbox.inbox]]
+name = "urgent"
+labels = ["urgent"]
+then = ["notify"]
+```
 
 ```toml
 [[inbox]]
@@ -344,6 +358,22 @@ args = ["-p"]
 ```
 
 `local` needs `cargo install --path . --features local`; it runs a Model2Vec static model on the CPU with no network, and the default build stays small without it. `exec` embedders get the text on stdin and print a JSON array of numbers. `http` embedders are POSTed `{"text": ..., "model": ...}` and may reply with a bare array or an object holding `embedding`, `vector`, or `data[0].embedding`. `exec` models get the system and user prompt on stdin and reply on stdout.
+
+### setup by an agent
+
+Settings are a task in words, not a screen. `[agent]` names an agent CLI; `paddock setup "add my fastmail, notify me about invoices"` briefs it with `paddock context` (what paddock is, this host's files, the config as it is, the plugins and agents on PATH, the commands) and the task, from the config directory, and the agent edits `config.toml`, runs `paddock check` on what it added, then `paddock pull`. The host reloads the config after and refuses one it cannot parse. The briefing tells the agent never to write a secret inline, only `NAME_cmd`.
+
+```toml
+[agent]
+cmd = "claude"
+args = ["-p", "--allowedTools", "Bash(paddock:*),Edit,Write,Read"]
+```
+
+`paddock setup` with no task lists the agents found on PATH (claude, codex, opencode, gemini) with the arguments this host would use, so picking one is copying a line.
+
+## the app
+
+`crates/app` is the façade a native app talks to, and the one place a GUI touches: `Session::open(dir)` opens a host (secrets resolved once), every verb of the CLI is a method returning owned data, `subscribe` delivers `Changed`, `Notice`, `Warning`, and `Setup` events, and `poll` / `watch` notice writes from another process (the CLI, a cron `paddock pull`) through SQLite's data version, so views refresh without a daemon. `setup` runs the agent and streams its lines. Nothing in it has a lifetime, so bindings generate cleanly: on Linux (Omarchy, GTK or a Rust toolkit) a GUI uses the crate directly; on macOS a Swift package is generated over it with UniFFI. Both apps open the same host directory the CLI uses.
 
 ## search
 

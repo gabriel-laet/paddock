@@ -1,0 +1,21 @@
+# `paddock-app`: the façade a native app talks to. One `Session` per host,
+# every verb of the CLI as a method, a subscription for change. GUIs on
+# Linux use it directly; other languages through generated bindings.
+
+[package]
+name = "paddock-app"
+description = "The paddock façade for native apps: a Session over one host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+paddock = { path = "../paddock" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3.15"

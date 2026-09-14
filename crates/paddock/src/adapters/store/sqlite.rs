@@ -22,6 +22,14 @@ pub struct Sqlite {
 }
 
 impl Sqlite {
+    /// A number that changes when another connection (another process)
+    /// commits to this store. Compare two readings to know whether anyone
+    /// else wrote in between; this connection's own writes do not move it.
+    pub fn data_version(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row("PRAGMA data_version", [], |r| r.get(0))?)
+    }
+
     /// A consistent copy of the whole store in one file at `dest`, WAL
     /// folded in, encrypted the same way. What a mirror pushes.
     pub fn snapshot(&self, dest: &Path) -> Result<()> {

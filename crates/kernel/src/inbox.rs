@@ -35,6 +35,13 @@ pub struct Config {
     /// Where items live. Missing means sqlite, unencrypted.
     #[serde(default)]
     pub store: Option<AdapterSpec>,
+    /// An agent CLI that sets this host up on request (`paddock setup`).
+    /// Host business, like `remote`: the kernel never runs it.
+    #[serde(default)]
+    pub agent: Option<AdapterSpec>,
+    /// A command the host runs per notice an inbox raises. Host business.
+    #[serde(default)]
+    pub notify_cmd: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

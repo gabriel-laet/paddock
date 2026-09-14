@@ -1559,6 +1559,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "paddock-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "paddock",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "paddock-gog"
 version = "0.1.0"
 dependencies = [

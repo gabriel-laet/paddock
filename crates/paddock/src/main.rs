@@ -5,8 +5,8 @@ use anyhow::Context as _;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use paddock::{
-    init, kernel, load, load_config, mirror, mirror_after_pull, Actor, Config, Draft, Item, Kernel,
-    Paths, Question, Sqlite, Store,
+    agents_on_path, briefing, init, kernel, load, load_config, mirror, mirror_after_pull, notify,
+    push_mirror, setup, Actor, Config, Draft, Item, Kernel, Paths, Question, Sqlite, Store, Told,
 };
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -124,6 +124,11 @@ enum Cmd {
     },
     /// Dump this host for an agent (pipeable)
     Context,
+    /// Hand the host and a task to the agent in `[agent]`: "add my fastmail", "notify me about invoices"
+    Setup {
+        /// What to set up, in words. Empty lists the agents found on PATH.
+        task: Vec<String>,
+    },
     /// Push a snapshot of the store to its mirror ([store.mirror]); --restore pulls it back
     Mirror {
         /// Pull the mirrored store into this host (refuses to overwrite one that holds items without --force)
@@ -202,13 +207,17 @@ fn main() -> Result<()> {
                     warnings.push(format!("mirror: {e:#}"));
                 }
             }
+            warnings.extend(notify(&config, &pulled.notices));
             if cli.json {
                 println!(
                     "{}",
-                    serde_json::json!({ "admitted": pulled.count, "forgot": forgot, "warnings": warnings })
+                    serde_json::json!({ "admitted": pulled.count, "forgot": forgot, "warnings": warnings, "notices": pulled.notices })
                 );
             } else {
                 println!("admitted {}, forgot {forgot}", pulled.count);
+                for n in &pulled.notices {
+                    println!("! {}  #{}  {}", n.inbox, n.id, n.title);
+                }
                 warn(&warnings);
             }
         }
@@ -282,15 +291,15 @@ fn main() -> Result<()> {
                 .map(|l| l.trim_start_matches('+').to_string())
                 .collect();
             let remove: Vec<String> = remove.iter().map(|l| l[1..].to_string()).collect();
-            warn(&k.label(id, &add, &remove)?);
+            told(&k.label(id, &add, &remove)?, &config);
             emit(id)?;
         }
         Cmd::Read { id } => {
-            warn(&k.read(id, true)?);
+            told(&k.read(id, true)?, &config);
             emit(id)?;
         }
         Cmd::Unread { id } => {
-            warn(&k.read(id, false)?);
+            told(&k.read(id, false)?, &config);
             emit(id)?;
         }
         Cmd::Forget { id } => {
@@ -302,7 +311,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Classify { id } => {
-            warn(&k.classify(id)?);
+            told(&k.classify(id)?, &config);
             emit(id)?;
         }
         Cmd::Why { id, inbox } => {
@@ -406,20 +415,32 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Context => context(&paths, &k)?,
+        Cmd::Setup { task } => {
+            let task = task.join(" ");
+            if task.trim().is_empty() {
+                for a in agents_on_path() {
+                    println!("{}  args={}", a.cmd, a.args.join(" "));
+                }
+                if config.agent.is_none() {
+                    println!(
+                        "(pick one: `[agent]` with `cmd` and `args` in {})",
+                        paths.config_file.display()
+                    );
+                }
+                return Ok(());
+            }
+            let brief = briefing(&paths, &config, &store)?;
+            let status = setup(&config, &paths, &brief, &task, &mut |line| {
+                println!("{line}")
+            })?;
+            if status != 0 {
+                bail!("agent exited {status}");
+            }
+            load_config(&paths.config_file).context("the config the agent left")?;
+        }
         Cmd::Mirror { .. } => unreachable!(),
     }
     Ok(())
-}
-
-/// Snapshot the store beside itself and hand the snapshot to the mirror.
-fn push_mirror(paths: &Paths, config: &Config, store: &Sqlite) -> Result<String> {
-    let m = mirror(config)?.ok_or_else(|| anyhow::anyhow!("no [store.mirror] in config"))?;
-    let snapshot = paths.db_path.with_extension("db.snapshot");
-    store.snapshot(&snapshot)?;
-    let pushed = m.push(&snapshot);
-    let _ = std::fs::remove_file(&snapshot);
-    pushed?;
-    Ok(m.describe())
 }
 
 /// `paddock mirror`: push. `--restore`: pull the copy into this host's
@@ -625,74 +646,18 @@ fn actor(a: &Actor) -> String {
 
 /// Agent-ready dump of this host. No secrets. Safe to pipe.
 fn context(paths: &Paths, k: &Kernel) -> Result<()> {
-    let config = k.config;
-    let store = k.store;
-    let out = std::io::stdout();
-    let mut w = out.lock();
-    writeln!(w, "# paddock\n")?;
-    writeln!(
-        w,
-        "Inbox kernel. Four nouns: item, source, label, inbox. No other product nouns."
-    )?;
-    writeln!(w, "An item is source-shaped data stripped: foreign_id, title, body, href, start, end, thread, parts, from, to[], cites.")?;
-    writeln!(w, "A cite is {{kind: reply|forward|quote|mention|attach, foreign_id or href, excerpt?, actor?}}; it resolves to an id when the cited item is here, early or late.")?;
-    writeln!(w, "A source admits items and may send. kinds: fs, rss, exec. rss cannot send. exec runs `{{cmd}} {{args}} pull|send`.")?;
-    writeln!(w, "Inboxes nest. A child is a tighter question over the parent. Match: sources AND from AND to AND labels (all) AND without (none) AND timed (start set) AND age.")?;
-    writeln!(w, "Classifiers are per-inbox, ordered, kinds regex | script (CEL) | llm. They stamp labels. They are not sources.")?;
-    writeln!(w, "Actor kind is person | group | list.")?;
-    writeln!(w, "Admit upserts on (source_id, foreign_id). Re-admit refreshes the item and keeps read + labels.")?;
-    writeln!(w, "A label remembers who put it there (hand, source, classifier, or an inbox effect). A label a hand removed is denied: nothing but a hand puts it back. Read is the label `read`.")?;
-    writeln!(w, "An inbox may say `without = [...]` (item carries none) and `then = [...]` (effects on enter: label:NAME, read, send:SOURCE).\n")?;
-    writeln!(w, "## this host")?;
-    writeln!(w, "config   {}", paths.config_file.display())?;
-    writeln!(w, "db       {}", paths.db_path.display())?;
-    writeln!(w, "data     {}", paths.data_dir.display())?;
-    writeln!(w, "incoming {}\n", paths.incoming_dir.display())?;
-    writeln!(w, "## sources")?;
-    let by_src: std::collections::BTreeMap<String, i64> =
-        store.counts_by_source()?.into_iter().collect();
-    for src in &config.source {
-        let n = by_src.get(&src.id).copied().unwrap_or(0);
-        let extra = ["path", "url", "cmd"]
-            .into_iter()
-            .find_map(|k| paddock::setting(&src.settings, k))
-            .unwrap_or_default();
-        writeln!(w, "{}  kind={}  items={n}  {extra}", src.id, src.kind)?;
-    }
-    for (id, n) in &by_src {
-        if config.source(id).is_none() {
-            writeln!(w, "{id}  items={n}  (not in config)")?;
-        }
-    }
-    let total = store.count(&Question::default())?;
-    let timed = store.count(&Question {
-        timed: true,
-        ..Default::default()
-    })?;
-    writeln!(w, "total {total}  timed {timed}\n")?;
-    writeln!(w, "## inboxes")?;
-    for node in config.nodes() {
-        let (unread, total) = counts(config, store, &node.path);
-        let ib = &node.inbox;
-        write!(w, "{}  unread={unread}  items={total}", node.path.join("/"))?;
-        if ib.timed {
-            write!(w, "  timed")?;
-        }
-        for (k, v) in [("labels", &ib.labels), ("sources", &ib.sources)] {
-            if !v.is_empty() {
-                write!(w, "  {k}={}", v.join(","))?;
-            }
-        }
-        if !ib.classifier.is_empty() {
-            let ids: Vec<&str> = ib.classifier.iter().map(|c| c.id.as_str()).collect();
-            write!(w, "  classifiers={}", ids.join(","))?;
-        }
-        writeln!(w)?;
-    }
-    writeln!(w, "\n## use")?;
-    writeln!(w, "paddock pull | inboxes | ls [INBOX] [--unread] [--from ID] [--to ID] [--text WORDS] [--like TEXT] | answer QUESTION [--in INBOX] | embed | show ID | thread ID | cited ID | part ID | label ID [+l|-l]... | read ID | unread ID | forget ID | classify ID | why ID [INBOX] | send [--title T] [--reply ID] [--to A]... [--in INBOX] [BODY]")?;
-    writeln!(w, "Add --json to any command for machine output. Edit config.toml, then `paddock pull`. Do not invent nouns.")?;
+    print!("{}", briefing(paths, k.config, k.store)?);
     Ok(())
+}
+
+/// What a pass said: warnings to stderr, notices to stdout and to the
+/// host's `notify_cmd`.
+fn told(told: &Told, config: &Config) {
+    for n in &told.notices {
+        println!("! {}  #{}  {}", n.inbox, n.id, n.title);
+    }
+    warn(&told.warnings);
+    warn(&notify(config, &told.notices));
 }
 
 /// Speak the protocol to a plugin and say what came back. This is the only

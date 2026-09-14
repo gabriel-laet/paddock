@@ -19,4 +19,4 @@ pub use item::{
     READ, SENT,
 };
 pub use ports::{Brief, Classifier, Embedder, Fact, Model, Source, StaleHint, Store};
-pub use verbs::{reply_title, Admitted, Answer, Kernel, Report, Why};
+pub use verbs::{reply_title, Admitted, Answer, Kernel, Notice, Report, Told, Why};

@@ -411,8 +411,8 @@ args = ["{}"]
         "nothing sent yet"
     );
 
-    let warnings = k.label(draft, &["approved".into()], &[]).unwrap();
-    assert!(warnings.is_empty(), "{warnings:?}");
+    let told = k.label(draft, &["approved".into()], &[]).unwrap();
+    assert!(told.warnings.is_empty(), "{:?}", told.warnings);
     let it = store.get(draft).unwrap();
     assert!(it.has(SENT) && it.has("done") && it.read());
     assert_eq!(
@@ -560,8 +560,8 @@ args = ["-c", "test -e {} || exit 1; cat >/dev/null; echo '{{\"foreign_id\":\"ok
     );
 
     fs::write(&flag, "").unwrap();
-    let warnings = k.classify(admitted.id).unwrap();
-    assert!(warnings.is_empty(), "{warnings:?}");
+    let told = k.classify(admitted.id).unwrap();
+    assert!(told.warnings.is_empty(), "{:?}", told.warnings);
     assert!(
         store.get(admitted.id).unwrap().has(SENT),
         "retried once the source was up"
@@ -575,4 +575,81 @@ args = ["-c", "test -e {} || exit 1; cat >/dev/null; echo '{{\"foreign_id\":\"ok
         .filter(|i| i.source_id == "flaky")
         .count();
     assert_eq!(delivered, 1, "once per entry, not once per classify");
+}
+
+#[test]
+fn a_notify_effect_raises_a_notice_once_per_entry_and_names_the_inbox() {
+    let (_tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    fs::write(
+        &paths.config_file,
+        format!(
+            r#"
+[[inbox]]
+name = "all"
+
+[[inbox.classifier]]
+id = "flag-urgent"
+kind = "regex"
+pattern = "(?i)urgent"
+label = "urgent"
+
+[[inbox.inbox]]
+name = "urgent"
+labels = ["urgent"]
+then = ["notify", "label:seen-it"]
+
+[[source]]
+id = "incoming"
+kind = "fs"
+path = "{}"
+"#,
+            paths.incoming_dir.display()
+        ),
+    )
+    .unwrap();
+    let (cfg, store) = load(&paths).unwrap();
+    let k = kernel(&cfg, &store).unwrap();
+    let admitted = k
+        .admit(NewItem {
+            source_id: "incoming".into(),
+            foreign_id: "u1".into(),
+            title: "URGENT: pay".into(),
+            body: "now".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        admitted.notices,
+        vec![Notice {
+            id: admitted.id,
+            inbox: "all/urgent".into(),
+            title: "URGENT: pay".into(),
+        }]
+    );
+    assert!(admitted.warnings.is_empty(), "{:?}", admitted.warnings);
+    assert!(
+        store.get(admitted.id).unwrap().has("seen-it"),
+        "the other effect ran too"
+    );
+    assert!(
+        k.classify(admitted.id).unwrap().notices.is_empty(),
+        "once per entry"
+    );
+    let quiet = k
+        .admit(NewItem {
+            source_id: "incoming".into(),
+            foreign_id: "q1".into(),
+            title: "calm".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(quiet.notices.is_empty());
+    let told = k.label(quiet.id, &["urgent".into()], &[]).unwrap();
+    assert_eq!(
+        told.notices.len(),
+        1,
+        "a hand's label opens the inbox: notice"
+    );
+    assert_eq!(told.notices[0].id, quiet.id);
 }

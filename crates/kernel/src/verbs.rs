@@ -25,19 +25,38 @@ pub struct Kernel<'a> {
     pub now: chrono::DateTime<chrono::Utc>,
 }
 
-/// An item is in. Warnings are things that did not stop it: a classifier
-/// that could not decide, an embedder that was down.
+/// An inbox with `then = ["notify"]` raised its hand for an item, once.
+/// The kernel says when; the host says how (a desktop notification, a
+/// sound, a command). Carries the title so a notifier need not look it up.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Notice {
+    pub id: i64,
+    pub inbox: String,
+    pub title: String,
+}
+
+/// What a pass through the inboxes said: warnings (a classifier that could
+/// not decide, an embedder that was down), and the notices inboxes raised.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Told {
+    pub warnings: Vec<String>,
+    pub notices: Vec<Notice>,
+}
+
+/// An item is in. Warnings are things that did not stop it.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Admitted {
     pub id: i64,
     pub warnings: Vec<String>,
+    pub notices: Vec<Notice>,
 }
 
-/// A count, and what went wrong along the way.
+/// A count, and what was said along the way.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Report {
     pub count: usize,
     pub warnings: Vec<String>,
+    pub notices: Vec<Notice>,
 }
 
 /// Why an item is in an inbox: the chain's labels it carries, each with who
@@ -75,28 +94,31 @@ impl Kernel<'_> {
                     .note(id, Fact::Label(self.stamp(READ, By::Source)))?;
             }
         }
-        let mut warnings = self.classify_with(id, effects)?;
+        let mut told = self.classify_with(id, effects)?;
         if let Err(e) = self.embed(id) {
-            warnings.push(format!("embed #{id}: {e:#}"));
+            told.warnings.push(format!("embed #{id}: {e:#}"));
         }
-        Ok(Admitted { id, warnings })
+        Ok(Admitted {
+            id,
+            warnings: told.warnings,
+            notices: told.notices,
+        })
     }
 
     /// Enter the root, run its classifiers, then every child the item now
     /// matches, recursively. A label stamped on the way down can open a child.
-    /// Returns warnings from classifiers that could not decide.
-    pub fn classify(&self, id: i64) -> Result<Vec<String>> {
+    pub fn classify(&self, id: i64) -> Result<Told> {
         self.classify_with(id, true)
     }
 
-    fn classify_with(&self, id: i64, effects: bool) -> Result<Vec<String>> {
+    fn classify_with(&self, id: i64, effects: bool) -> Result<Told> {
         let mut item = self.store.get(id)?;
-        let mut warnings = Vec::new();
-        self.apply(&self.config.classifier, &mut item, &mut warnings)?;
+        let mut told = Told::default();
+        self.apply(&self.config.classifier, &mut item, &mut told)?;
         for inbox in &self.config.inbox {
-            self.enter(inbox, &inbox.name, effects, &mut item, &mut warnings)?;
+            self.enter(inbox, &inbox.name, effects, &mut item, &mut told)?;
         }
-        Ok(warnings)
+        Ok(told)
     }
 
     fn enter(
@@ -105,38 +127,32 @@ impl Kernel<'_> {
         path: &str,
         effects: bool,
         item: &mut Item,
-        warnings: &mut Vec<String>,
+        told: &mut Told,
     ) -> Result<()> {
         if !Question::of_at(&[inbox], self.now).matches(item) {
             return Ok(());
         }
-        self.apply(&inbox.classifier, item, warnings)?;
+        self.apply(&inbox.classifier, item, told)?;
         for effect in inbox.then.iter().filter(|_| effects) {
             // Once per entry. A failed effect is not remembered, so it retries.
             let key = format!("then:{path}:{effect}");
             if self.store.seen(item.id, &key)? {
                 continue;
             }
-            if self.effect(effect, path, item, warnings)? {
+            if self.effect(effect, path, item, told)? {
                 self.store.note(item.id, Fact::Seen(key))?;
             }
         }
         for child in &inbox.inbox {
             let path = format!("{path}/{}", child.name);
-            self.enter(child, &path, effects, item, warnings)?;
+            self.enter(child, &path, effects, item, told)?;
         }
         Ok(())
     }
 
     /// What an inbox does to an item that enters it. Returns whether it is
     /// done: a label already there counts, a send that failed does not.
-    fn effect(
-        &self,
-        effect: &str,
-        path: &str,
-        item: &mut Item,
-        warnings: &mut Vec<String>,
-    ) -> Result<bool> {
+    fn effect(&self, effect: &str, path: &str, item: &mut Item, told: &mut Told) -> Result<bool> {
         let by = By::Inbox(path.to_string());
         let put = |name: &str, item: &mut Item| -> Result<()> {
             if item.has(name) || item.denies(name) {
@@ -150,6 +166,14 @@ impl Kernel<'_> {
         match effect.split_once(':').unwrap_or((effect, "")) {
             ("read", "") => put(READ, item).map(|_| true),
             ("label", name) if !name.is_empty() => put(name, item).map(|_| true),
+            ("notify", "") => {
+                told.notices.push(Notice {
+                    id: item.id,
+                    inbox: path.to_string(),
+                    title: item.title.clone(),
+                });
+                Ok(true)
+            }
             ("send", source) if !source.is_empty() => {
                 if item.has(SENT) {
                     return Ok(true);
@@ -165,17 +189,20 @@ impl Kernel<'_> {
                 };
                 match self.send_with(draft, false) {
                     Ok(sent) => {
-                        warnings.extend(sent.warnings);
+                        told.warnings.extend(sent.warnings);
+                        told.notices.extend(sent.notices);
                         put(SENT, item).map(|_| true)
                     }
                     Err(e) => {
-                        warnings.push(format!("{path}: send:{source} #{}: {e:#}", item.id));
+                        told.warnings
+                            .push(format!("{path}: send:{source} #{}: {e:#}", item.id));
                         Ok(false)
                     }
                 }
             }
             _ => {
-                warnings.push(format!("{path}: unknown effect `{effect}`"));
+                told.warnings
+                    .push(format!("{path}: unknown effect `{effect}`"));
                 Ok(false)
             }
         }
@@ -191,7 +218,7 @@ impl Kernel<'_> {
 
     /// A hand marks an item read or unread. Unread is remembered: a source
     /// saying "read" later does not override it.
-    pub fn read(&self, id: i64, read: bool) -> Result<Vec<String>> {
+    pub fn read(&self, id: i64, read: bool) -> Result<Told> {
         let name = READ.to_string();
         if read {
             self.label(id, &[name], &[])
@@ -209,12 +236,8 @@ impl Kernel<'_> {
             .find_map(|ib| ib.sources.first().cloned())
     }
 
-    fn apply(
-        &self,
-        specs: &[ClassifierSpec],
-        item: &mut Item,
-        warnings: &mut Vec<String>,
-    ) -> Result<()> {
+    fn apply(&self, specs: &[ClassifierSpec], item: &mut Item, told: &mut Told) -> Result<()> {
+        let warnings = &mut told.warnings;
         for spec in specs {
             let Some(classifier) = self.classifiers.get(&spec.id) else {
                 warnings.push(format!("classifier {}: not resolved", spec.id));
@@ -255,7 +278,7 @@ impl Kernel<'_> {
 
     /// A hand adds and removes labels, then classify runs so a newly matching
     /// child can fire. A removal is remembered: classifiers will not undo it.
-    pub fn label(&self, id: i64, add: &[String], remove: &[String]) -> Result<Vec<String>> {
+    pub fn label(&self, id: i64, add: &[String], remove: &[String]) -> Result<Told> {
         let by_hand = |name: &String| Label {
             name: name.clone(),
             by: By::Hand,
@@ -286,6 +309,7 @@ impl Kernel<'_> {
                 let admitted = self.admit(item)?;
                 report.count += usize::from(!existed);
                 report.warnings.extend(admitted.warnings);
+                report.notices.extend(admitted.notices);
             }
         }
         Ok(report)
