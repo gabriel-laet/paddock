@@ -8,6 +8,7 @@
 //! - `mirror`: a copy of the store elsewhere (s3, any command)
 //! - `agent`: an agent CLI that sets the host up on request; the notice command
 //! - `skills`: named fragments of classifiers and inboxes a config grafts in with `use`
+//! - `replay`: what a candidate config would change, run on a copy of the store
 //! - `host`: the machine (paths, the TOML config, the standard wiring)
 //!
 //! `transport` is the shared plumbing: a child process or an HTTP POST.
@@ -18,6 +19,7 @@ pub mod embedder;
 pub mod host;
 pub mod mirror;
 pub mod model;
+pub mod replay;
 pub mod skills;
 pub mod source;
 pub mod store;
@@ -25,11 +27,12 @@ pub(crate) mod transport;
 
 pub use agent::{agents_on_path, briefing, notify, plugins_on_path, setup, AgentSpec};
 pub use host::{
-    default_config_toml, expand_path, init, kernel, kernel_at, load, load_config, mirror,
-    mirror_after_pull, store_key, Paths,
+    default_config_toml, expand_path, init, kernel, kernel_at, load, load_config, load_config_in,
+    mirror, mirror_after_pull, store_key, Paths,
 };
 pub use host::{push_mirror, resolve_secrets};
 pub use mirror::Mirror;
+pub use replay::{replay, Change, Replay};
 pub use skills::{skill, skills, Skill};
 pub use source::item_from_file;
 pub use store::Sqlite;

@@ -126,6 +126,17 @@ enum Cmd {
     Context,
     /// The skills this host can `use`: yours in the config directory's skills/, and the shipped ones
     Skills,
+    /// What a config would change on your items, written nowhere: labels and inboxes, before and after
+    Replay {
+        /// The candidate config (default: this host's config as it is now)
+        #[arg(long, value_name = "FILE")]
+        config: Option<String>,
+        /// Only the items this inbox answers to (default all)
+        inbox: Option<String>,
+        /// At most this many items (run-once classifiers run again, so an llm one costs a call each)
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Hand the host and a task to the agent in `[agent]`: "add my fastmail", "notify me about invoices"
     Setup {
         /// What to set up, in words. Empty lists the agents found on PATH.
@@ -423,6 +434,39 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Context => context(&paths, &k)?,
+        Cmd::Replay {
+            config: candidate,
+            inbox,
+            limit,
+        } => {
+            let candidate = match candidate {
+                Some(f) => paddock::load_config_in(&paddock::expand_path(&f), &paths.config_dir)?,
+                None => config.clone(),
+            };
+            let r = paddock::replay(&paths, &config, &store, &candidate, inbox.as_deref(), limit)?;
+            if cli.json {
+                println!("{}", serde_json::to_string(&r)?);
+            } else {
+                for c in &r.changes {
+                    println!("{}", c.line());
+                }
+                for n in &r.notices {
+                    println!(
+                        "! {}  #{}  {}{}",
+                        n.inbox,
+                        n.id,
+                        n.title,
+                        labels_suffix(&n.labels)
+                    );
+                }
+                println!(
+                    "replayed {} items, {} would change",
+                    r.items,
+                    r.changes.len()
+                );
+                warn(&r.warnings);
+            }
+        }
         Cmd::Skills => {
             let all = paddock::skills(&paths.config_dir);
             if cli.json {

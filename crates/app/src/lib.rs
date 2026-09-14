@@ -14,9 +14,9 @@
 use anyhow::{Context, Result};
 use paddock::adapters::agent::counts;
 use paddock::{
-    agents_on_path, briefing, kernel, load, load_config, mirror_after_pull, push_mirror,
-    resolve_secrets, setup, Admitted, AgentSpec, Answer, Config, Draft, Item, Kernel, Notice,
-    Paths, Question, Report, Sqlite, Store, Told, Why, READ,
+    agents_on_path, briefing, kernel, load, load_config, load_config_in, mirror_after_pull,
+    push_mirror, resolve_secrets, setup, Admitted, AgentSpec, Answer, Config, Draft, Item, Kernel,
+    Notice, Paths, Question, Report, Sqlite, Store, Told, Why, READ,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -270,6 +270,19 @@ impl Session {
             self.emit(&Event::Changed);
         }
         Ok(report)
+    }
+
+    /// What `candidate` (a config file) would change on this host's items,
+    /// written nowhere. See `paddock replay`.
+    pub fn replay(
+        &self,
+        candidate: &Path,
+        inbox: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<paddock::Replay> {
+        let candidate = resolve_secrets(load_config_in(candidate, &self.paths.config_dir)?)?;
+        let config = self.config.read().unwrap();
+        paddock::replay(&self.paths, &config, &self.store, &candidate, inbox, limit)
     }
 
     // ----- setup by an agent -----

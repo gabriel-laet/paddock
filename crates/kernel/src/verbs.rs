@@ -78,16 +78,36 @@ pub struct Answer {
     pub considered: Vec<i64>,
 }
 
+/// Which of an inbox's `then` effects a pass may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Effects {
+    /// Every effect: a normal pass.
+    All,
+    /// Everything but `send:`: labels, read, and notices, nothing leaves.
+    Local,
+    /// None: what an effect itself produced is classified, but fires no
+    /// effects of its own, so an effect cannot chase its own output.
+    None,
+}
+
+impl Effects {
+    fn allows(self, effect: &str) -> bool {
+        match self {
+            Effects::All => true,
+            Effects::Local => !effect.starts_with("send:"),
+            Effects::None => false,
+        }
+    }
+}
+
 impl Kernel<'_> {
     /// Upsert, take the source's word on read, classify from the root down,
     /// then embed if the host has an embedder.
     pub fn admit(&self, item: NewItem) -> Result<Admitted> {
-        self.admit_with(item, true)
+        self.admit_with(item, Effects::All)
     }
 
-    /// `effects: false` is for what an effect itself produced: it is
-    /// classified like anything else, but fires no effects of its own.
-    fn admit_with(&self, item: NewItem, effects: bool) -> Result<Admitted> {
+    fn admit_with(&self, item: NewItem, effects: Effects) -> Result<Admitted> {
         let (id, _) = self.store.upsert(&item)?;
         if item.read == Some(true) {
             let current = self.store.get(id)?;
@@ -110,10 +130,17 @@ impl Kernel<'_> {
     /// Enter the root, run its classifiers, then every child the item now
     /// matches, recursively. A label stamped on the way down can open a child.
     pub fn classify(&self, id: i64) -> Result<Told> {
-        self.classify_with(id, true)
+        self.classify_with(id, Effects::All)
     }
 
-    fn classify_with(&self, id: i64, effects: bool) -> Result<Told> {
+    /// A rehearsal: classify with every effect but `send:`, so what would
+    /// be labelled, read, and paged shows, and nothing leaves. What a
+    /// replay runs on its copy of the store.
+    pub fn rehearse(&self, id: i64) -> Result<Told> {
+        self.classify_with(id, Effects::Local)
+    }
+
+    fn classify_with(&self, id: i64, effects: Effects) -> Result<Told> {
         let mut item = self.store.get(id)?;
         let mut told = Told::default();
         self.apply(&self.config.classifier, &mut item, &mut told)?;
@@ -127,7 +154,7 @@ impl Kernel<'_> {
         &self,
         inbox: &Inbox,
         path: &str,
-        effects: bool,
+        effects: Effects,
         item: &mut Item,
         told: &mut Told,
     ) -> Result<()> {
@@ -135,7 +162,7 @@ impl Kernel<'_> {
             return Ok(());
         }
         self.apply(&inbox.classifier, item, told)?;
-        for effect in inbox.then.iter().filter(|_| effects) {
+        for effect in inbox.then.iter().filter(|e| effects.allows(e)) {
             // Once per entry. A failed effect is not remembered, so it retries.
             let key = format!("then:{path}:{effect}");
             if self.store.seen(item.id, &key)? {
@@ -190,7 +217,7 @@ impl Kernel<'_> {
                     to: item.to.clone(),
                     ..Default::default()
                 };
-                match self.send_with(draft, false) {
+                match self.send_with(draft, Effects::None) {
                     Ok(sent) => {
                         told.warnings.extend(sent.warnings);
                         told.notices.extend(sent.notices);
@@ -365,10 +392,10 @@ impl Kernel<'_> {
     /// Hand the draft to its source, then admit what came back. A reply
     /// joins the parent's thread, starting one if the parent had none.
     pub fn send(&self, draft: Draft) -> Result<Admitted> {
-        self.send_with(draft, true)
+        self.send_with(draft, Effects::All)
     }
 
-    fn send_with(&self, draft: Draft, effects: bool) -> Result<Admitted> {
+    fn send_with(&self, draft: Draft, effects: Effects) -> Result<Admitted> {
         let mut draft = draft;
         let mut reply_foreign = None;
         if let Some(pid) = draft.reply_to {

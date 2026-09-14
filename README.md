@@ -92,6 +92,7 @@ paddock embed                      # embed items that have no vector yet
 paddock check CMD [--set k=v]... [--send]   # speak the protocol to a plugin and validate what it says
 paddock context                    # dump this host for an agent
 paddock skills                     # the skills this host can `use`: yours, then the shipped ones
+paddock replay [INBOX] [--config FILE] [--limit N]   # what a config would change on your items, written nowhere
 paddock mirror [--restore [--force]]   # push a snapshot of the store to [store.mirror], or pull it back
 paddock setup [TASK...]            # hand the host and a task in words to the agent in [agent]; no task lists agents
 ```
@@ -393,6 +394,20 @@ name = "family"
 from = ["ana@example.com", "5511…@s.whatsapp.net"]
 then = ["notify"]
 ```
+
+### replay: the eval
+
+`paddock replay --config candidate.toml` is how you find out what a change would do before you make it: the store is snapshotted, the copy forgets its run-once marks, every item in scope is classified again under the candidate with every effect but `send:`, and each item whose labels or inboxes would differ is printed, plus the notices the candidate would have raised. Nothing is written to the real store. With no `--config` it replays the config as it is now, which shows what changed since the items were last classified. An `llm` classifier runs again per item, so scope with an inbox path or `--limit`.
+
+```
+$ paddock replay --config candidate.toml all/work --limit 200
+#412  Invoice 2026-091           +money  → all/work/money
+#398  Weekly digest              +newsletter -todo  → all/work/newsletters  ← all/work/todo
+! all/work/money  #412  Invoice 2026-091  [money]
+replayed 200 items, 2 would change
+```
+
+This is the eval loop for a skill or a prompt: edit, replay, read the diff, on your own mail rather than a fixture. `--json` gives `{items, changes, notices, warnings}` for an agent doing the same.
 
 ### setup by an agent
 

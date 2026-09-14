@@ -146,13 +146,19 @@ pub fn load(paths: &Paths) -> Result<(Config, Sqlite)> {
     Ok((config, store))
 }
 
+/// Read a config; its skills come from the `skills/` beside it.
 pub fn load_config(path: &Path) -> Result<Config> {
+    load_config_in(path, path.parent().unwrap_or(Path::new(".")))
+}
+
+/// Read a config file that may live anywhere (a candidate for `replay`),
+/// with skills resolved against `config_dir`, the host's.
+pub fn load_config_in(path: &Path, config_dir: &Path) -> Result<Config> {
     let text =
         fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
     let config: Config =
         toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
-    let dir = path.parent().unwrap_or(Path::new("."));
-    Ok(super::skills::graft(config, dir)?.with_root())
+    Ok(super::skills::graft(config, config_dir)?.with_root())
 }
 
 /// Resolve every spec in the config into a live adapter and hand the kernel

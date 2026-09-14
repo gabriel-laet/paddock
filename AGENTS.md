@@ -64,7 +64,7 @@ Rules, all checkable:
 ## commands
 
 ```
-cargo build --workspace && cargo test --workspace     # 126 tests at handover
+cargo build --workspace && cargo test --workspace     # 127 tests at handover
 cargo build --release                                  # paddock 6.3 MB, plugins 0.5-2.7 MB
 ./target/release/paddock check ./target/release/paddock-maildir --set path=/some/Maildir
 PADDOCK_DIR=/tmp/h ./target/release/paddock init && $EDITOR /tmp/h/config.toml && paddock pull
@@ -84,7 +84,9 @@ Done and pushed on `main`:
   the item's labels), `me` identities (`"me"` in `from`/`to`/`mentions` expands to them,
   keeping the literal for sources that name the owner `me`), personas as top-level
   inboxes with sources, skills grafted with `use`.
-- Host: sqlite (SQLCipher, key or key_cmd), fs and exec sources, plugins by kind on PATH,
+- Host: replay (`paddock replay`: a candidate config rehearsed on a snapshot of the
+  store, labels and inboxes diffed per item; the eval loop for skills and prompts),
+  sqlite (SQLCipher, key or key_cmd), fs and exec sources, plugins by kind on PATH,
   classifiers regex/script(CEL)/exec/http/llm, model exec/ollama/openai, embedder
   exec/http/ollama/openai/local(Model2Vec, feature `local`), mirror s3/exec, agent setup,
   notify_cmd, `--remote` over ssh, `--json` on every command.
@@ -133,5 +135,6 @@ Next, in the order agreed with the owner:
 - `VACUUM INTO` keeps SQLCipher encryption; that is what the mirror pushes.
 - The S3 signer is hand-rolled SigV4, unit-tested against AWS's worked example
   (`crates/paddock/src/adapters/mirror.rs`). Path-style URLs, `UNSIGNED-PAYLOAD`.
-- An effect's output (`send:`) is admitted with `effects = false`, else it chases itself.
+- Effects run in one of three modes: all, local (everything but `send:`, what a replay
+  runs on its copy), none (what a `send:` delivered, else it chases itself).
 - Do not add a settings UI, a TUI, a web UI, or a daemon. The owner removed all of those.

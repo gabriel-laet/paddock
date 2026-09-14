@@ -30,6 +30,13 @@ impl Sqlite {
         Ok(conn.query_row("PRAGMA data_version", [], |r| r.get(0))?)
     }
 
+    /// Forget every run-once mark, so classifiers and effects that ran once
+    /// run again. A replay does this on its copy of the store.
+    pub fn clear_seen(&self) -> Result<()> {
+        self.conn.lock().unwrap().execute("DELETE FROM seen", [])?;
+        Ok(())
+    }
+
     /// A consistent copy of the whole store in one file at `dest`, WAL
     /// folded in, encrypted the same way. What a mirror pushes.
     pub fn snapshot(&self, dest: &Path) -> Result<()> {
