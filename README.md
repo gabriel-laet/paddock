@@ -212,10 +212,14 @@ Optional. The embedder turns text into a vector, once per item on admit, and aga
 
 ```toml
 [embedder]
-kind = "ollama"                 # or "openai" | "http" | "exec"
+kind = "ollama"                 # or "openai" | "http" | "exec" | "local"
 model = "nomic-embed-text"
 # url = "http://127.0.0.1:11434"
 # key = "..."
+
+# [embedder]
+# kind = "local"                # in-process Model2Vec; build with --features local
+# model = "~/models/potion-base-8M"   # a folder with model.safetensors, tokenizer.json, config.json
 
 [model]
 kind = "exec"                   # or "ollama" | "openai"
@@ -224,7 +228,7 @@ args = ["-p"]
 # url, model, key for the http kinds
 ```
 
-`exec` embedders get the text on stdin and print a JSON array of numbers. `http` embedders are POSTed `{"text": ..., "model": ...}` and may reply with a bare array or an object holding `embedding`, `vector`, or `data[0].embedding`. `exec` models get the system and user prompt on stdin and reply on stdout.
+`local` needs `cargo install --path . --features local`; it runs a Model2Vec static model on the CPU with no network, and the default build stays small without it. `exec` embedders get the text on stdin and print a JSON array of numbers. `http` embedders are POSTed `{"text": ..., "model": ...}` and may reply with a bare array or an object holding `embedding`, `vector`, or `data[0].embedding`. `exec` models get the system and user prompt on stdin and reply on stdout.
 
 ## search
 

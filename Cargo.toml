@@ -14,6 +14,7 @@ cel-interpreter = "0.10.0"
 chrono = { version = "0.4.39", default-features = false, features = ["clock", "std"] }
 clap = { version = "=4.5.28", features = ["derive"] }
 dirs = "5.0"
+model2vec-rs = { version = "0.2.1", optional = true }
 regex = "1.11"
 reqwest = { version = "=0.12.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 rss = "=2.0.12"
@@ -30,3 +31,7 @@ lto = true
 codegen-units = 1
 opt-level = "z"
 strip = true
+
+[features]
+# `kind = "local"` embedder: Model2Vec static embeddings, no network, no ONNX.
+local = ["dep:model2vec-rs"]

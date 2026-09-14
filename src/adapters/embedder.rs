@@ -68,6 +68,36 @@ impl Embedder for Http {
     }
 }
 
+/// Model2Vec static embeddings, in-process. Loaded once when the kernel is
+/// resolved; `model` is a folder holding `model.safetensors`,
+/// `tokenizer.json`, and `config.json` (or a Hugging Face repo id, which
+/// downloads on first use).
+#[cfg(feature = "local")]
+pub struct Local {
+    model: model2vec_rs::model::StaticModel,
+}
+
+#[cfg(feature = "local")]
+impl Local {
+    pub fn load(path: &str) -> Result<Self> {
+        let model = model2vec_rs::model::StaticModel::from_pretrained(path, None, None, None)
+            .map_err(|e| anyhow::anyhow!("load model2vec `{path}`: {e}"))?;
+        Ok(Self { model })
+    }
+}
+
+#[cfg(feature = "local")]
+impl Embedder for Local {
+    fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        self.model
+            .encode(&[text.to_string()])
+            .into_iter()
+            .next()
+            .filter(|v| !v.is_empty())
+            .context("model2vec returned no vector")
+    }
+}
+
 /// A bare array, or `embedding`, `vector`, or `data[0].embedding`.
 fn vector(v: &serde_json::Value) -> Option<Vec<f32>> {
     let arr = v
@@ -128,7 +158,18 @@ pub fn build(spec: &AdapterSpec) -> Result<Box<dyn Embedder>> {
             model: Some(model.unwrap_or_else(|| "text-embedding-3-small".into())),
             key,
         }),
-        other => bail!("unknown embedder kind `{other}` (exec, http, ollama, openai)"),
+        #[cfg(feature = "local")]
+        "local" => {
+            let Some(model) = model else {
+                bail!("embedder local needs model (a folder with model.safetensors)")
+            };
+            Box::new(Local::load(
+                &super::host::expand_path(&model).display().to_string(),
+            )?)
+        }
+        #[cfg(not(feature = "local"))]
+        "local" => bail!("embedder kind `local` needs a build with `--features local`"),
+        other => bail!("unknown embedder kind `{other}` (exec, http, ollama, openai, local)"),
     })
 }
 
@@ -146,6 +187,17 @@ mod tests {
         assert_eq!(vector(&oll), Some(vec![0.5]));
         assert_eq!(vector(&oai), Some(vec![1.0, 2.0, 3.0]));
         assert_eq!(vector(&bad), None);
+    }
+
+    #[test]
+    fn local_kind_explains_itself() {
+        let spec = AdapterSpec {
+            kind: "local".into(),
+            ..Default::default()
+        };
+        let err = build(&spec).err().expect("no model, or no feature");
+        let msg = err.to_string();
+        assert!(msg.contains("local"), "{msg}");
     }
 
     #[test]
