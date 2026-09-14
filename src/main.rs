@@ -4,7 +4,8 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use paddock::{
-    init, kernel, load, load_config, Actor, Config, Draft, Item, Kernel, Paths, Question, Store,
+    init, kernel, load, load_config, Actor, Config, Draft, Fact, Item, Kernel, Paths, Question,
+    Store,
 };
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -102,16 +103,11 @@ fn main() -> Result<()> {
     let paths = Paths::from_env();
     if !cli.local && !matches!(cli.cmd, Cmd::Init { .. }) {
         let from_config = load_config(&paths.config_file).ok().and_then(|c| c.remote);
-        let from_env = std::env::var("PADDOCK_REMOTE").ok();
-        let host = [
-            cli.remote.as_deref(),
-            from_env.as_deref(),
-            from_config.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .map(str::trim)
-        .find(|h| !h.is_empty());
+        let host = [cli.remote.as_deref(), from_config.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|h| !h.is_empty());
         if let Some(host) = host {
             return run_remote(host);
         }
@@ -132,7 +128,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let (config, store) = load(&paths)?;
-    let k = kernel(&config, &store);
+    let k = kernel(&config, &store)?;
     let out = std::io::stdout();
     let mut out = out.lock();
     let mut emit = |id: i64| -> Result<()> {
@@ -147,19 +143,16 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Init { .. } => unreachable!(),
         Cmd::Pull => {
-            let admitted = k.pull()?;
+            let pulled = k.pull()?;
             let forgot = k.forget_stale()?;
-            let warnings = k.take_warnings();
             if cli.json {
                 println!(
                     "{}",
-                    serde_json::json!({ "admitted": admitted, "forgot": forgot, "warnings": warnings })
+                    serde_json::json!({ "admitted": pulled.count, "forgot": forgot, "warnings": pulled.warnings })
                 );
             } else {
-                println!("admitted {admitted}, forgot {forgot}");
-                for w in warnings {
-                    eprintln!("warning: {w}");
-                }
+                println!("admitted {}, forgot {forgot}", pulled.count);
+                warn(&pulled.warnings);
             }
         }
         Cmd::Inboxes => {
@@ -192,7 +185,7 @@ fn main() -> Result<()> {
             limit,
         } => {
             let path = split_path(inbox.as_deref());
-            let mut q = Question::of(&chain(&config, &path)?);
+            let mut q = k.question(&chain(&config, &path)?);
             q.unread = unread;
             q.text = text;
             q.limit = limit;
@@ -225,15 +218,15 @@ fn main() -> Result<()> {
                 .map(|l| l.trim_start_matches('+').to_string())
                 .collect();
             let remove: Vec<String> = remove.iter().map(|l| l[1..].to_string()).collect();
-            k.label(id, &add, &remove)?;
+            warn(&k.label(id, &add, &remove)?);
             emit(id)?;
         }
         Cmd::Read { id } => {
-            store.set_read(id, true)?;
+            store.note(id, Fact::Read(true))?;
             emit(id)?;
         }
         Cmd::Unread { id } => {
-            store.set_read(id, false)?;
+            store.note(id, Fact::Read(false))?;
             emit(id)?;
         }
         Cmd::Forget { id } => {
@@ -245,13 +238,30 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Classify { id } => {
-            k.classify(id)?;
+            warn(&k.classify(id)?);
             emit(id)?;
         }
         Cmd::Why { id, inbox } => {
             let it = store.get(id)?;
             let path = split_path(inbox.as_deref());
-            println!("{}  {}", path.join("/"), k.why(&it, &path));
+            let why = k.why(&it, &path);
+            if cli.json {
+                println!("{}", serde_json::to_string(&why)?);
+            } else {
+                let dash = |v: &[String]| {
+                    if v.is_empty() {
+                        "-".to_string()
+                    } else {
+                        v.join(" ")
+                    }
+                };
+                println!(
+                    "{}  labels: {}  classifiers: {}",
+                    path.join("/"),
+                    dash(&why.matched),
+                    dash(&why.fired)
+                );
+            }
         }
         Cmd::Send {
             title,
@@ -294,22 +304,17 @@ fn main() -> Result<()> {
                     .collect(),
                 ..Default::default()
             };
-            let id = k.send(draft)?;
-            emit(id)?;
+            let sent = k.send(draft)?;
+            warn(&sent.warnings);
+            emit(sent.id)?;
         }
         Cmd::Embed => {
-            let n = k.embed_missing()?;
-            let warnings = k.take_warnings();
+            let done = k.embed_missing()?;
             if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({ "embedded": n, "warnings": warnings })
-                );
+                println!("{}", serde_json::to_string(&done)?);
             } else {
-                println!("embedded {n}");
-                for w in warnings {
-                    eprintln!("warning: {w}");
-                }
+                println!("embedded {}", done.count);
+                warn(&done.warnings);
             }
         }
         Cmd::Answer { question, inbox } => {
@@ -330,6 +335,12 @@ fn main() -> Result<()> {
         Cmd::Context => context(&paths, &k)?,
     }
     Ok(())
+}
+
+fn warn(warnings: &[String]) {
+    for w in warnings {
+        eprintln!("warning: {w}");
+    }
 }
 
 fn split_path(s: Option<&str>) -> Vec<String> {
@@ -485,12 +496,10 @@ fn context(paths: &Paths, k: &Kernel) -> Result<()> {
         store.counts_by_source()?.into_iter().collect();
     for src in &config.source {
         let n = by_src.get(&src.id).copied().unwrap_or(0);
-        let extra = src
-            .path
-            .as_deref()
-            .or(src.url.as_deref())
-            .or(src.cmd.as_deref())
-            .unwrap_or("");
+        let extra = ["path", "url", "cmd"]
+            .into_iter()
+            .find_map(|k| paddock::setting(&src.settings, k))
+            .unwrap_or_default();
         writeln!(w, "{}  kind={}  items={n}  {extra}", src.id, src.kind)?;
     }
     for (id, n) in &by_src {

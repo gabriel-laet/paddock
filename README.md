@@ -2,7 +2,7 @@
 
 An inbox kernel with a CLI. No UI. Meant to be driven by hand, by scripts, and by agents.
 
-The kernel is pure: four nouns, the questions inboxes ask, and the verbs. Everything that touches the world is an adapter behind a port.
+The kernel is pure: four nouns, the questions inboxes ask, and the verbs. It reads no clock, no file, no network, and no config format; the host resolves every adapter up front and hands the kernel a config, a store, sources, classifiers, an embedder, a model, and the time. Every verb returns what happened, warnings included.
 
 ```
 src/kernel/               item, inbox + question, classify (regex), verbs, ports
@@ -47,7 +47,7 @@ paddock label ID [+l|-l]...        # add / remove labels, then reclassify
 paddock read ID | unread ID
 paddock forget ID                  # delete
 paddock classify ID                # re-run classifiers
-paddock why ID [INBOX]             # labels matched, classifiers that fired
+paddock why ID [INBOX]             # labels matched, classifiers that could have fired
 paddock send [--title T] [--reply ID] [--to A]... [--source S] [BODY]   # body from arg or stdin
 paddock answer QUESTION [--in INBOX]   # the model answers from the items and cites them
 paddock embed                      # embed items that have no vector yet
@@ -132,7 +132,7 @@ forget_after = "14d"
 
 ### classifiers
 
-What stamps labels. A classifier belongs to an inbox (`[[inbox.classifier]]`, or `[[inbox.inbox.classifier]]` deeper) and runs when an item enters it; a top-level `[[classifier]]` runs on everything. Every classifier has an `id` and a `kind`. Since it runs on entry, an `llm` classifier on `all` sees every item as it lands.
+What stamps labels. A classifier belongs to an inbox (`[[inbox.classifier]]`, or `[[inbox.inbox.classifier]]` deeper) and runs when an item enters it; a top-level `[[classifier]]` runs on everything. The kernel reads `id`, `kind`, `label`, `labels`, and `once`; every other key belongs to the adapter for that kind. Since it runs on entry, an `llm` classifier on `all` sees every item as it lands. A bad spec fails when the config loads, not when an item arrives.
 
 ```toml
 [[inbox.classifier]]

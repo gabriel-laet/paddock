@@ -1,7 +1,7 @@
 //! The pure core. Four nouns (item, source, label, inbox), the questions
-//! inboxes ask, the classifiers that stamp labels, and the verbs. Nothing in
-//! here touches a database, a file, a network, or a config format; those come
-//! in through `ports`.
+//! inboxes ask, the verbs, and the ports the verbs run through. Nothing in
+//! here touches a database, a file, a network, a clock, or a config format;
+//! the host resolves all of that and hands it in.
 
 pub mod classify;
 pub mod inbox;
@@ -9,11 +9,11 @@ pub mod item;
 pub mod ports;
 pub mod verbs;
 
-pub use classify::{run_classifier, sanitize_label, Classifier};
+pub use classify::{run_classifier, sanitize_label, RegexClassifier};
 pub use inbox::{
-    parse_duration, parse_when, rfc3339, ClassifierSpec, Config, Inbox, ModelSpec, Node, Question,
-    SourceSpec,
+    parse_duration, parse_when, rfc3339, setting, setting_list, ClassifierSpec, Config, Inbox,
+    ModelSpec, Node, Question, Settings, SourceSpec,
 };
 pub use item::{Actor, ActorKind, Draft, Item, NewItem, NewPart, Part, PartKind};
-pub use ports::{Adapters, Embedder, Model, Source, StaleHint, Store};
-pub use verbs::{reply_title, Answer, Kernel};
+pub use ports::{Brief, Classifier, Embedder, Fact, Model, Source, StaleHint, Store};
+pub use verbs::{reply_title, Admitted, Answer, Kernel, Report, Why};

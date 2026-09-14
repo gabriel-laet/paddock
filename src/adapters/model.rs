@@ -1,5 +1,6 @@
 //! A chat model behind the `Model` port: a CLI that reads the prompt on
-//! stdin, or Ollama / an OpenAI-compatible service over HTTP.
+//! stdin, or Ollama / an OpenAI-compatible service over HTTP. The prompts
+//! live here, not in the kernel.
 //!
 //! ```toml
 //! [model]
@@ -14,7 +15,12 @@
 use anyhow::{bail, Result};
 
 use super::transport::{join, post_json, run};
-use crate::kernel::{Model, ModelSpec};
+use crate::kernel::{setting, setting_list, Brief, Model, ModelSpec};
+
+const ANSWER_SYSTEM: &str =
+    "You answer a question from someone's inbox using only the items given. \
+Cite every item you rely on as #id. If the items do not answer the question, say so plainly.";
+const ANSWER_CLIP: usize = 1500;
 
 /// Prompt on stdin, reply on stdout.
 pub struct Exec {
@@ -26,6 +32,10 @@ impl Model for Exec {
     fn complete(&self, system: &str, user: &str) -> Result<String> {
         let stdin = format!("{system}\n\n{user}");
         run(&self.cmd, &self.args, stdin.as_bytes())
+    }
+
+    fn answer(&self, brief: &Brief) -> Result<String> {
+        self.complete(ANSWER_SYSTEM, &render(brief))
     }
 }
 
@@ -64,6 +74,39 @@ impl Model for Chat {
         let v = post_json(&url, key.as_deref(), &body)?;
         content(&v).ok_or_else(|| anyhow::anyhow!("model reply has no content"))
     }
+
+    fn answer(&self, brief: &Brief) -> Result<String> {
+        self.complete(ANSWER_SYSTEM, &render(brief))
+    }
+}
+
+/// The user message for a brief: the question, then every item with its id.
+fn render(brief: &Brief) -> String {
+    let mut s = format!("question: {}\n\nitems:\n", brief.question);
+    for it in &brief.items {
+        let from = it
+            .from
+            .as_ref()
+            .map(|a| a.name.clone().unwrap_or_else(|| a.id.clone()))
+            .unwrap_or_default();
+        s.push_str(&format!(
+            "\n### #{} {}\nfrom: {from}  when: {}  source: {}\n{}\n",
+            it.id,
+            it.title,
+            it.when(),
+            it.source_id,
+            clip(&it.text(), ANSWER_CLIP)
+        ));
+    }
+    s
+}
+
+fn clip(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 fn content(v: &serde_json::Value) -> Option<String> {
@@ -80,23 +123,25 @@ fn content(v: &serde_json::Value) -> Option<String> {
 /// `kind` picks the transport. Missing kind means exec when `cmd` is set,
 /// else openai when `key` is set, else ollama.
 pub fn build(spec: &ModelSpec) -> Result<Box<dyn Model>> {
-    let cmd = spec.cmd.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let s = &spec.settings;
+    let cmd = setting(s, "cmd");
+    let key = setting(s, "key");
     let kind = match spec.kind.trim().to_ascii_lowercase().as_str() {
         "" if cmd.is_some() => "exec".to_string(),
-        "" if spec.key.is_some() => "openai".to_string(),
+        "" if key.is_some() => "openai".to_string(),
         "" => "ollama".to_string(),
         k => k.to_string(),
     };
-    let url = spec.url.clone();
-    let model = spec.model.clone();
+    let url = setting(s, "url");
+    let model = setting(s, "model");
     Ok(match kind.as_str() {
         "exec" => {
             let Some(cmd) = cmd else {
                 bail!("model exec needs cmd")
             };
             Box::new(Exec {
-                cmd: cmd.to_string(),
-                args: spec.args.clone(),
+                cmd,
+                args: setting_list(s, "args"),
             })
         }
         "ollama" => Box::new(Chat {
@@ -109,7 +154,7 @@ pub fn build(spec: &ModelSpec) -> Result<Box<dyn Model>> {
             shape: Shape::OpenAi,
             url: url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
             model: model.unwrap_or_else(|| "gpt-4o-mini".into()),
-            key: spec.key.clone(),
+            key,
         }),
         other => bail!("unknown model kind `{other}` (exec, ollama, openai)"),
     })
@@ -129,6 +174,21 @@ mod tests {
     }
 
     #[test]
+    fn brief_renders_every_item_with_its_id() {
+        let mut it = crate::kernel::Item::default();
+        it.id = 7;
+        it.title = "Invoice".into();
+        it.body = "pay".into();
+        let s = render(&Brief {
+            question: "what?".into(),
+            items: vec![it],
+        });
+        assert!(s.contains("question: what?"));
+        assert!(s.contains("### #7 Invoice"));
+        assert!(s.contains("pay"));
+    }
+
+    #[test]
     fn content_reads_every_shape() {
         let oai = serde_json::json!({"choices":[{"message":{"content":"a"}}]});
         let oll = serde_json::json!({"message":{"content":"b"}});
@@ -141,7 +201,9 @@ mod tests {
     #[test]
     fn kind_defaults_to_exec_when_cmd_is_set() {
         let spec = ModelSpec {
-            cmd: Some("true".into()),
+            settings: [("cmd".to_string(), serde_json::json!("true"))]
+                .into_iter()
+                .collect(),
             ..Default::default()
         };
         assert!(build(&spec).is_ok());

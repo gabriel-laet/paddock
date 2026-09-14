@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::kernel::{
-    Actor, ActorKind, Item, NewItem, NewPart, Part, PartKind, Question, StaleHint, Store,
+    Actor, ActorKind, Fact, Item, NewItem, NewPart, Part, PartKind, Question, StaleHint, Store,
 };
 
 const ITEM_COLS: &str =
@@ -349,15 +349,6 @@ impl Store for Sqlite {
         Ok(n as usize)
     }
 
-    fn set_vector(&self, id: i64, vector: &[f32]) -> Result<()> {
-        let conn = self.lock()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO vectors (item_id, data) VALUES (?1, ?2)",
-            params![id, to_blob(vector)],
-        )?;
-        Ok(())
-    }
-
     fn unembedded(&self) -> Result<Vec<i64>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
@@ -378,6 +369,54 @@ impl Store for Sqlite {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    fn note(&self, id: i64, fact: Fact) -> Result<()> {
+        let conn = self.lock()?;
+        match fact {
+            Fact::Read(read) => {
+                conn.execute(
+                    "UPDATE items SET read = ?1 WHERE id = ?2",
+                    params![if read { 1 } else { 0 }, id],
+                )?;
+            }
+            Fact::Label(label) => {
+                let label = label.trim();
+                if label.is_empty() {
+                    return Ok(());
+                }
+                conn.execute(
+                    "INSERT OR IGNORE INTO labels (item_id, label) VALUES (?1, ?2)",
+                    params![id, label],
+                )?;
+            }
+            Fact::Unlabel(label) => {
+                conn.execute(
+                    "DELETE FROM labels WHERE item_id = ?1 AND label = ?2",
+                    params![id, label.as_str()],
+                )?;
+            }
+            Fact::Thread(thread) => {
+                let thread = trim_thread(thread.as_deref());
+                conn.execute(
+                    "UPDATE items SET thread = ?1 WHERE id = ?2",
+                    params![thread, id],
+                )?;
+            }
+            Fact::Classified(classifier_id) => {
+                conn.execute(
+                    "INSERT OR IGNORE INTO llm_classified (item_id, classifier_id) VALUES (?1, ?2)",
+                    params![id, classifier_id],
+                )?;
+            }
+            Fact::Vector(vector) => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO vectors (item_id, data) VALUES (?1, ?2)",
+                    params![id, to_blob(&vector)],
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn delete(&self, id: i64) -> Result<bool> {
@@ -403,37 +442,6 @@ impl Store for Sqlite {
         Ok(conn.changes() > 0)
     }
 
-    fn set_read(&self, id: i64, read: bool) -> Result<()> {
-        let conn = self.lock()?;
-        conn.execute(
-            "UPDATE items SET read = ?1 WHERE id = ?2",
-            params![if read { 1 } else { 0 }, id],
-        )?;
-        Ok(())
-    }
-
-    fn add_label(&self, id: i64, label: &str) -> Result<()> {
-        let label = label.trim();
-        if label.is_empty() {
-            return Ok(());
-        }
-        let conn = self.lock()?;
-        conn.execute(
-            "INSERT OR IGNORE INTO labels (item_id, label) VALUES (?1, ?2)",
-            params![id, label],
-        )?;
-        Ok(())
-    }
-
-    fn remove_label(&self, id: i64, label: &str) -> Result<()> {
-        let conn = self.lock()?;
-        conn.execute(
-            "DELETE FROM labels WHERE item_id = ?1 AND label = ?2",
-            params![id, label],
-        )?;
-        Ok(())
-    }
-
     fn classified(&self, id: i64, classifier_id: &str) -> Result<bool> {
         let conn = self.lock()?;
         let hit: Option<i64> = conn
@@ -446,15 +454,6 @@ impl Store for Sqlite {
         Ok(hit.is_some())
     }
 
-    fn mark_classified(&self, id: i64, classifier_id: &str) -> Result<()> {
-        let conn = self.lock()?;
-        conn.execute(
-            "INSERT OR IGNORE INTO llm_classified (item_id, classifier_id) VALUES (?1, ?2)",
-            params![id, classifier_id],
-        )?;
-        Ok(())
-    }
-
     fn find(&self, source_id: &str, foreign_id: &str) -> Result<Option<i64>> {
         let conn = self.lock()?;
         let id = conn
@@ -465,16 +464,6 @@ impl Store for Sqlite {
             )
             .optional()?;
         Ok(id)
-    }
-
-    fn set_thread(&self, item_id: i64, thread: Option<&str>) -> Result<()> {
-        let thread = trim_thread(thread);
-        let conn = self.lock()?;
-        conn.execute(
-            "UPDATE items SET thread = ?1 WHERE id = ?2",
-            params![thread, item_id],
-        )?;
-        Ok(())
     }
 
     fn thread(&self, thread: &str) -> Result<Vec<Item>> {

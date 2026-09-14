@@ -14,7 +14,7 @@
 use anyhow::{bail, Context, Result};
 
 use super::transport::{join, post_json, run};
-use crate::kernel::{Embedder, ModelSpec};
+use crate::kernel::{setting, setting_list, Embedder, ModelSpec};
 
 pub struct Exec {
     pub cmd: String,
@@ -84,22 +84,25 @@ fn vector(v: &serde_json::Value) -> Option<Vec<f32>> {
 }
 
 pub fn build(spec: &ModelSpec) -> Result<Box<dyn Embedder>> {
-    let cmd = spec.cmd.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let s = &spec.settings;
+    let cmd = setting(s, "cmd");
+    let key = setting(s, "key");
     let kind = match spec.kind.trim().to_ascii_lowercase().as_str() {
         "" if cmd.is_some() => "exec".to_string(),
-        "" if spec.key.is_some() => "openai".to_string(),
+        "" if key.is_some() => "openai".to_string(),
         "" => "ollama".to_string(),
         k => k.to_string(),
     };
-    let url = spec.url.clone();
+    let url = setting(s, "url");
+    let model = setting(s, "model");
     Ok(match kind.as_str() {
         "exec" => {
             let Some(cmd) = cmd else {
                 bail!("embedder exec needs cmd")
             };
             Box::new(Exec {
-                cmd: cmd.to_string(),
-                args: spec.args.clone(),
+                cmd,
+                args: setting_list(s, "args"),
             })
         }
         "http" => {
@@ -109,29 +112,21 @@ pub fn build(spec: &ModelSpec) -> Result<Box<dyn Embedder>> {
             Box::new(Http {
                 shape: Shape::Plain,
                 url,
-                model: spec.model.clone(),
-                key: spec.key.clone(),
+                model,
+                key,
             })
         }
         "ollama" => Box::new(Http {
             shape: Shape::Ollama,
             url: url.unwrap_or_else(|| "http://127.0.0.1:11434".into()),
-            model: Some(
-                spec.model
-                    .clone()
-                    .unwrap_or_else(|| "nomic-embed-text".into()),
-            ),
+            model: Some(model.unwrap_or_else(|| "nomic-embed-text".into())),
             key: None,
         }),
         "openai" => Box::new(Http {
             shape: Shape::OpenAi,
             url: url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
-            model: Some(
-                spec.model
-                    .clone()
-                    .unwrap_or_else(|| "text-embedding-3-small".into()),
-            ),
-            key: spec.key.clone(),
+            model: Some(model.unwrap_or_else(|| "text-embedding-3-small".into())),
+            key,
         }),
         other => bail!("unknown embedder kind `{other}` (exec, http, ollama, openai)"),
     })

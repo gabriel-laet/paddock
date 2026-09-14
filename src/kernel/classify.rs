@@ -1,22 +1,12 @@
-//! Classifiers stamp labels. The kernel knows one pure kind, regex; the
-//! adapters bring the rest (script, llm).
+//! The one classifier the kernel carries: a regex over title or body.
+//! Everything else stamps labels from an adapter.
 
 use anyhow::{Context, Result};
 
-use super::inbox::ClassifierSpec;
+use super::inbox::{setting, ClassifierSpec};
 use super::item::Item;
+use super::ports::Classifier;
 
-pub trait Classifier {
-    fn id(&self) -> &str;
-    /// The label to stamp, or nothing. An error means "could not decide".
-    fn classify(&self, item: &Item) -> Result<Option<String>>;
-    /// Expensive classifiers run once per item and the verdict is remembered.
-    fn once(&self) -> bool {
-        false
-    }
-}
-
-/// Regex over title or body.
 pub struct RegexClassifier {
     id: String,
     re: regex::Regex,
@@ -25,12 +15,10 @@ pub struct RegexClassifier {
 
 impl RegexClassifier {
     pub fn new(spec: &ClassifierSpec) -> Result<Self> {
-        let pattern = spec
-            .pattern
-            .as_deref()
-            .context("regex classifier needs pattern")?;
+        let pattern =
+            setting(&spec.settings, "pattern").context("regex classifier needs pattern")?;
         let label = spec.label.clone().context("regex classifier needs label")?;
-        let re = regex::Regex::new(pattern)
+        let re = regex::Regex::new(&pattern)
             .with_context(|| format!("classifier {}: bad pattern", spec.id))?;
         Ok(Self {
             id: spec.id.clone(),
@@ -51,19 +39,9 @@ impl Classifier for RegexClassifier {
     }
 }
 
-/// Kernel-known kinds only. `None` means "ask the adapters".
-pub fn build(spec: &ClassifierSpec) -> Result<Option<Box<dyn Classifier>>> {
-    Ok(match spec.kind.as_str() {
-        "regex" => Some(Box::new(RegexClassifier::new(spec)?)),
-        _ => None,
-    })
-}
-
-/// Run a kernel-known classifier once, for tests and one-offs.
+/// Run a regex spec once, for tests and one-offs.
 pub fn run_classifier(spec: &ClassifierSpec, item: &Item) -> Result<Option<String>> {
-    build(spec)?
-        .with_context(|| format!("unknown classifier kind `{}`", spec.kind))?
-        .classify(item)
+    RegexClassifier::new(spec)?.classify(item)
 }
 
 /// Lowercase ascii letters, digits, `_` and `-`, at most 40 chars. Else nothing.
@@ -92,8 +70,10 @@ mod tests {
         let spec = ClassifierSpec {
             id: "r".into(),
             kind: "regex".into(),
-            pattern: Some("(?i)invoice".into()),
             label: Some("money".into()),
+            settings: [("pattern".to_string(), serde_json::json!("(?i)invoice"))]
+                .into_iter()
+                .collect(),
             ..Default::default()
         };
         let mut it = Item::default();

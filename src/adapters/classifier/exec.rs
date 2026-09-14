@@ -3,17 +3,18 @@
 //!
 //! ```toml
 //! [[inbox.classifier]]
-//! id = "by-script"
+//! id = "by-program"
 //! kind = "exec"
 //! cmd = "~/bin/label-it"
 //! args = ["--strict"]
 //! once = true            # remember the verdict per item
 //! ```
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use super::{label_of, run};
-use crate::kernel::{Classifier, ClassifierSpec, Item};
+use super::label_of;
+use crate::adapters::transport::run;
+use crate::kernel::{setting_list, Classifier, ClassifierSpec, Item};
 
 pub struct ExecClassifier {
     id: String,
@@ -27,7 +28,7 @@ impl ExecClassifier {
         Self {
             id: spec.id.clone(),
             cmd,
-            args: spec.args.clone(),
+            args: setting_list(&spec.settings, "args"),
             once: spec.once,
         }
     }
@@ -44,8 +45,7 @@ impl Classifier for ExecClassifier {
 
     fn classify(&self, item: &Item) -> Result<Option<String>> {
         let stdin = serde_json::to_vec(item)?;
-        let reply = run(&self.cmd, &self.args, &stdin)
-            .with_context(|| format!("classifier {}", self.id))?;
+        let reply = run(&self.cmd, &self.args, &stdin)?;
         Ok(label_of(&reply))
     }
 }
@@ -54,20 +54,21 @@ impl Classifier for ExecClassifier {
 mod tests {
     use super::*;
 
-    fn spec(script: &str) -> (ClassifierSpec, String) {
+    fn classifier(script: &str) -> ExecClassifier {
         let spec = ClassifierSpec {
             id: "x".into(),
             kind: "exec".into(),
-            args: vec!["-c".into(), script.into()],
+            settings: [("args".to_string(), serde_json::json!(["-c", script]))]
+                .into_iter()
+                .collect(),
             ..Default::default()
         };
-        (spec, "sh".into())
+        ExecClassifier::new(&spec, "sh".into())
     }
 
     #[test]
     fn program_reads_item_json_and_answers() {
-        let (spec, cmd) = spec(r#"grep -q '"title":"pay invoice"' && echo money || echo NONE"#);
-        let c = ExecClassifier::new(&spec, cmd);
+        let c = classifier(r#"grep -q '"title":"pay invoice"' && echo money || echo NONE"#);
         let mut it = Item::default();
         it.title = "pay invoice".into();
         assert_eq!(c.classify(&it).unwrap(), Some("money".into()));
@@ -77,8 +78,6 @@ mod tests {
 
     #[test]
     fn failure_is_an_error_not_a_verdict() {
-        let (spec, cmd) = spec("exit 1");
-        let c = ExecClassifier::new(&spec, cmd);
-        assert!(c.classify(&Item::default()).is_err());
+        assert!(classifier("exit 1").classify(&Item::default()).is_err());
     }
 }

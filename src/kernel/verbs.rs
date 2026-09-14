@@ -1,19 +1,51 @@
 //! The verbs: admit, classify, label, forget, pull, send, ask, why, embed, answer.
-//! Every one runs through a `Kernel`, which is a config plus the ports.
+//! Every one runs on a `Kernel`: the config, a clock, and the resolved ports.
+//! Verbs return what happened, warnings included; nothing is kept on the side.
 
 use anyhow::{Context, Result};
-use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
-use super::classify;
-use super::inbox::{parse_duration, parse_when, Config, Inbox, Question};
+use super::inbox::{parse_duration, parse_when, ClassifierSpec, Config, Inbox, Question};
 use super::item::{Draft, Item, NewItem};
-use super::ports::{Adapters, StaleHint, Store};
+use super::ports::{Brief, Classifier, Embedder, Fact, Model, Source, StaleHint, Store};
 
 const ANSWER_ITEMS: usize = 12;
-const ANSWER_CLIP: usize = 1500;
-const ANSWER_SYSTEM: &str =
-    "You answer a question from someone's inbox using only the items given. \
-Cite every item you rely on as #id. If the items do not answer the question, say so plainly.";
+
+pub struct Kernel<'a> {
+    pub config: &'a Config,
+    pub store: &'a dyn Store,
+    /// In config order. `pull` walks them; `send` picks one by id.
+    pub sources: Vec<(String, Box<dyn Source>)>,
+    /// By spec id. Every spec in the config has one.
+    pub classifiers: HashMap<String, Box<dyn Classifier>>,
+    pub embedder: Option<Box<dyn Embedder>>,
+    pub model: Option<Box<dyn Model>>,
+    /// The moment every verb runs at. Set by the host, so tests can pick it.
+    pub now: chrono::DateTime<chrono::Utc>,
+}
+
+/// An item is in. Warnings are things that did not stop it: a classifier
+/// that could not decide, an embedder that was down.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Admitted {
+    pub id: i64,
+    pub warnings: Vec<String>,
+}
+
+/// A count, and what went wrong along the way.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Report {
+    pub count: usize,
+    pub warnings: Vec<String>,
+}
+
+/// Why an item is in an inbox: the chain's labels it carries, and the
+/// classifiers on the way down that could have stamped them.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Why {
+    pub matched: Vec<String>,
+    pub fired: Vec<String>,
+}
 
 /// What `answer` returns: the model's text, the items it cited, and every
 /// item it was shown.
@@ -24,180 +56,72 @@ pub struct Answer {
     pub considered: Vec<i64>,
 }
 
-pub struct Kernel<'a> {
-    pub config: &'a Config,
-    pub store: &'a dyn Store,
-    adapters: &'a dyn Adapters,
-    warnings: RefCell<Vec<String>>,
-}
-
-impl<'a> Kernel<'a> {
-    pub fn new(config: &'a Config, store: &'a dyn Store, adapters: &'a dyn Adapters) -> Self {
-        Self {
-            config,
-            store,
-            adapters,
-            warnings: RefCell::new(Vec::new()),
-        }
-    }
-
-    /// Things that went wrong but did not stop a verb, such as a classifier
-    /// that could not decide. Drained on read.
-    pub fn take_warnings(&self) -> Vec<String> {
-        std::mem::take(&mut self.warnings.borrow_mut())
-    }
-
-    fn warn(&self, msg: String) {
-        self.warnings.borrow_mut().push(msg);
-    }
-
+impl Kernel<'_> {
     /// Upsert, classify from the root down, then embed if the host has an embedder.
-    pub fn admit(&self, item: NewItem) -> Result<i64> {
+    pub fn admit(&self, item: NewItem) -> Result<Admitted> {
         let (id, _) = self.store.upsert(&item)?;
-        self.classify(id)?;
+        let mut warnings = self.classify(id)?;
         if let Err(e) = self.embed(id) {
-            self.warn(format!("embed #{id}: {e:#}"));
+            warnings.push(format!("embed #{id}: {e:#}"));
         }
-        Ok(id)
-    }
-
-    /// Store the item's vector. Nothing happens without an embedder in the
-    /// config. Returns whether a vector was written.
-    pub fn embed(&self, id: i64) -> Result<bool> {
-        let Some(spec) = &self.config.embedder else {
-            return Ok(false);
-        };
-        if !self.store.unembedded()?.contains(&id) {
-            return Ok(false);
-        }
-        let item = self.store.get(id)?;
-        let vector = self.adapters.embedder(spec)?.embed(&item.text())?;
-        self.store.set_vector(id, &vector)?;
-        Ok(true)
-    }
-
-    /// Embed every item that has no vector yet. Failures are warnings.
-    pub fn embed_missing(&self) -> Result<usize> {
-        let mut n = 0;
-        for id in self.store.unembedded()? {
-            match self.embed(id) {
-                Ok(true) => n += 1,
-                Ok(false) => {}
-                Err(e) => self.warn(format!("embed #{id}: {e:#}")),
-            }
-        }
-        Ok(n)
-    }
-
-    /// A query's vector, in the same space as the items'.
-    pub fn near(&self, text: &str) -> Result<Vec<f32>> {
-        let spec = self
-            .config
-            .embedder
-            .as_ref()
-            .context("no embedder in config")?;
-        self.adapters.embedder(spec)?.embed(text)
-    }
-
-    /// Ask the model a question over an inbox: retrieve by words and by
-    /// meaning, hand the model the items, and keep the ids it cites.
-    pub fn answer(&self, chain: &[&Inbox], question: &str) -> Result<Answer> {
-        let spec = self.config.model.as_ref().context("no model in config")?;
-        let model = self.adapters.model(spec)?;
-        let mut considered: Vec<Item> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut take = |items: Vec<Item>| {
-            for it in items {
-                if seen.insert(it.id) && considered.len() < ANSWER_ITEMS {
-                    considered.push(it);
-                }
-            }
-        };
-        let mut by_words = Question::of(chain);
-        by_words.text = Some(question.to_string());
-        by_words.limit = Some(ANSWER_ITEMS);
-        take(self.store.ask(&by_words)?);
-        if self.config.embedder.is_some() {
-            let mut by_meaning = Question::of(chain);
-            by_meaning.near = Some(self.near(question)?);
-            by_meaning.limit = Some(ANSWER_ITEMS);
-            take(self.store.ask(&by_meaning)?);
-        }
-        let mut user = format!("question: {question}\n\nitems:\n");
-        for it in &considered {
-            let from = it
-                .from
-                .as_ref()
-                .map(|a| a.name.clone().unwrap_or_else(|| a.id.clone()))
-                .unwrap_or_default();
-            user.push_str(&format!(
-                "\n### #{} {}\nfrom: {from}  when: {}  source: {}\n{}\n",
-                it.id,
-                it.title,
-                it.when(),
-                it.source_id,
-                clip(&it.text(), ANSWER_CLIP)
-            ));
-        }
-        let text = model.complete(ANSWER_SYSTEM, &user)?;
-        let cites = cited_ids(&text)
-            .into_iter()
-            .filter(|id| seen.contains(id))
-            .collect();
-        Ok(Answer {
-            text,
-            cites,
-            considered: considered.iter().map(|i| i.id).collect(),
-        })
+        Ok(Admitted { id, warnings })
     }
 
     /// Enter the root, run its classifiers, then every child the item now
     /// matches, recursively. A label stamped on the way down can open a child.
-    pub fn classify(&self, id: i64) -> Result<()> {
+    /// Returns warnings from classifiers that could not decide.
+    pub fn classify(&self, id: i64) -> Result<Vec<String>> {
         let mut item = self.store.get(id)?;
-        self.apply(&self.config.classifier, &mut item)?;
+        let mut warnings = Vec::new();
+        self.apply(&self.config.classifier, &mut item, &mut warnings)?;
         for inbox in &self.config.inbox {
-            self.enter(inbox, &mut item)?;
+            self.enter(inbox, &mut item, &mut warnings)?;
         }
-        Ok(())
+        Ok(warnings)
     }
 
-    fn enter(&self, inbox: &Inbox, item: &mut Item) -> Result<()> {
-        if !Question::of(&[inbox]).matches(item) {
+    fn enter(&self, inbox: &Inbox, item: &mut Item, warnings: &mut Vec<String>) -> Result<()> {
+        if !Question::of_at(&[inbox], self.now).matches(item) {
             return Ok(());
         }
-        self.apply(&inbox.classifier, item)?;
+        self.apply(&inbox.classifier, item, warnings)?;
         for child in &inbox.inbox {
-            self.enter(child, item)?;
+            self.enter(child, item, warnings)?;
         }
         Ok(())
     }
 
-    fn apply(&self, specs: &[super::inbox::ClassifierSpec], item: &mut Item) -> Result<()> {
+    fn apply(
+        &self,
+        specs: &[ClassifierSpec],
+        item: &mut Item,
+        warnings: &mut Vec<String>,
+    ) -> Result<()> {
         for spec in specs {
-            let classifier = match classify::build(spec)? {
-                Some(c) => c,
-                None => self.adapters.classifier(spec)?,
+            let Some(classifier) = self.classifiers.get(&spec.id) else {
+                warnings.push(format!("classifier {}: not resolved", spec.id));
+                continue;
             };
-            if classifier.once() && self.store.classified(item.id, spec.id.as_str())? {
+            if classifier.once() && self.store.classified(item.id, &spec.id)? {
                 continue;
             }
             let label = match classifier.classify(item) {
                 Ok(label) => {
                     if classifier.once() {
-                        self.store.mark_classified(item.id, &spec.id)?;
+                        self.store
+                            .note(item.id, Fact::Classified(spec.id.clone()))?;
                     }
                     label
                 }
                 Err(e) => {
                     // Not remembered, so the next pass tries again.
-                    self.warn(format!("classifier {}: {e:#}", spec.id));
+                    warnings.push(format!("classifier {}: {e:#}", spec.id));
                     None
                 }
             };
             if let Some(label) = label {
                 if !item.labels.contains(&label) {
-                    self.store.add_label(item.id, &label)?;
+                    self.store.note(item.id, Fact::Label(label.clone()))?;
                     item.labels.push(label);
                 }
             }
@@ -206,12 +130,12 @@ impl<'a> Kernel<'a> {
     }
 
     /// Add and remove labels, then classify so a newly matching child can fire.
-    pub fn label(&self, id: i64, add: &[String], remove: &[String]) -> Result<()> {
+    pub fn label(&self, id: i64, add: &[String], remove: &[String]) -> Result<Vec<String>> {
         for l in add {
-            self.store.add_label(id, l)?;
+            self.store.note(id, Fact::Label(l.clone()))?;
         }
         for l in remove {
-            self.store.remove_label(id, l)?;
+            self.store.note(id, Fact::Unlabel(l.clone()))?;
         }
         self.classify(id)
     }
@@ -220,49 +144,53 @@ impl<'a> Kernel<'a> {
         self.store.delete(id)
     }
 
-    /// Pull every source. Returns how many items were new.
-    pub fn pull(&self) -> Result<usize> {
-        let mut new = 0;
-        for spec in &self.config.source {
-            let source = self.adapters.source(spec)?;
+    /// Pull every source. Counts the items that were new.
+    pub fn pull(&self) -> Result<Report> {
+        let mut report = Report::default();
+        for (_, source) in &self.sources {
             for item in source.pull()? {
                 let existed = self
                     .store
                     .find(&item.source_id, &item.foreign_id)?
                     .is_some();
-                self.admit(item)?;
-                new += usize::from(!existed);
+                let admitted = self.admit(item)?;
+                report.count += usize::from(!existed);
+                report.warnings.extend(admitted.warnings);
             }
         }
-        Ok(new)
+        Ok(report)
     }
 
     /// Items answering an inbox chain, newest first (or by start when timed).
     pub fn ask(&self, chain: &[&Inbox]) -> Result<Vec<Item>> {
-        self.store.ask(&Question::of(chain))
+        self.store.ask(&self.question(chain))
+    }
+
+    /// The chain's question, as of this kernel's `now`.
+    pub fn question(&self, chain: &[&Inbox]) -> Question {
+        Question::of_at(chain, self.now)
     }
 
     /// Drop stale items: a passed `end`, or an untimed item older than the
     /// source's (else the host's) `forget_after`. Kept labels never go.
     pub fn forget_stale(&self) -> Result<usize> {
         let keep = self.config.keep();
-        let now = chrono::Utc::now();
         let mut n = 0;
         for hint in self.store.stale()? {
             if hint.labels.iter().any(|l| keep.contains(l)) {
                 continue;
             }
-            if self.is_stale(&hint, now) && self.store.delete(hint.id)? {
+            if self.is_stale(&hint) && self.store.delete(hint.id)? {
                 n += 1;
             }
         }
         Ok(n)
     }
 
-    fn is_stale(&self, hint: &StaleHint, now: chrono::DateTime<chrono::Utc>) -> bool {
+    fn is_stale(&self, hint: &StaleHint) -> bool {
         // `end` is a deadline; a start-only item is just a moment.
         if let Some(end) = nonempty(hint.end.as_deref()) {
-            return parse_when(end).is_some_and(|dt| dt < now);
+            return parse_when(end).is_some_and(|dt| dt < self.now);
         }
         let after = self
             .config
@@ -271,14 +199,14 @@ impl<'a> Kernel<'a> {
             .or(self.config.forget_after.as_deref())
             .and_then(parse_duration);
         match (after, parse_when(&hint.created_at)) {
-            (Some(after), Some(created)) => now.signed_duration_since(created) > after,
+            (Some(after), Some(created)) => self.now.signed_duration_since(created) > after,
             _ => false,
         }
     }
 
     /// Hand the draft to its source, then admit what came back. A reply
     /// joins the parent's thread, starting one if the parent had none.
-    pub fn send(&self, draft: Draft) -> Result<i64> {
+    pub fn send(&self, draft: Draft) -> Result<Admitted> {
         let mut draft = draft;
         let mut reply_foreign = None;
         if let Some(pid) = draft.reply_to {
@@ -295,7 +223,7 @@ impl<'a> Kernel<'a> {
                 .or(parent.thread.clone())
                 .unwrap_or_else(|| format!("{}:{}", parent.source_id, parent.foreign_id));
             if parent.thread.is_none() {
-                self.store.set_thread(pid, Some(&thread))?;
+                self.store.note(pid, Fact::Thread(Some(thread.clone())))?;
             }
             draft.thread = Some(thread);
             reply_foreign = Some(parent.foreign_id);
@@ -303,49 +231,116 @@ impl<'a> Kernel<'a> {
         if draft.title.trim().is_empty() {
             draft.title = "untitled".into();
         }
-        let spec = if draft.source_id.is_empty() {
-            self.config.source.first()
+        let (id, source) = if draft.source_id.is_empty() {
+            self.sources.first()
         } else {
-            self.config.source(&draft.source_id)
+            self.sources.iter().find(|(id, _)| *id == draft.source_id)
         }
         .with_context(|| format!("no source `{}`", draft.source_id))?;
-        let source = self.adapters.source(spec)?;
         let mut item = source.send(&draft, reply_foreign.as_deref())?;
-        item.source_id = spec.id.clone();
+        item.source_id = id.clone();
         item.thread = draft.thread.clone();
         item.in_reply_to = reply_foreign;
         item.to = draft.to.clone();
         self.admit(item)
     }
 
+    /// Store the item's vector. Nothing happens without an embedder.
+    /// Returns whether a vector was written.
+    pub fn embed(&self, id: i64) -> Result<bool> {
+        let Some(embedder) = &self.embedder else {
+            return Ok(false);
+        };
+        if !self.store.unembedded()?.contains(&id) {
+            return Ok(false);
+        }
+        let item = self.store.get(id)?;
+        let vector = embedder.embed(&item.text())?;
+        self.store.note(id, Fact::Vector(vector))?;
+        Ok(true)
+    }
+
+    /// Embed every item that has no vector yet. Failures are warnings.
+    pub fn embed_missing(&self) -> Result<Report> {
+        let mut report = Report::default();
+        for id in self.store.unembedded()? {
+            match self.embed(id) {
+                Ok(true) => report.count += 1,
+                Ok(false) => {}
+                Err(e) => report.warnings.push(format!("embed #{id}: {e:#}")),
+            }
+        }
+        Ok(report)
+    }
+
+    /// A query's vector, in the same space as the items'.
+    pub fn near(&self, text: &str) -> Result<Vec<f32>> {
+        self.embedder
+            .as_ref()
+            .context("no embedder in config")?
+            .embed(text)
+    }
+
+    /// Ask the model a question over an inbox: retrieve by words and by
+    /// meaning, hand the model the items, and keep the ids it cites.
+    pub fn answer(&self, chain: &[&Inbox], question: &str) -> Result<Answer> {
+        let model = self.model.as_ref().context("no model in config")?;
+        let mut items: Vec<Item> = Vec::new();
+        let mut seen = HashSet::new();
+        let mut take = |found: Vec<Item>| {
+            for it in found {
+                if seen.insert(it.id) && items.len() < ANSWER_ITEMS {
+                    items.push(it);
+                }
+            }
+        };
+        let mut by_words = self.question(chain);
+        by_words.text = Some(question.to_string());
+        by_words.limit = Some(ANSWER_ITEMS);
+        take(self.store.ask(&by_words)?);
+        if self.embedder.is_some() {
+            let mut by_meaning = self.question(chain);
+            by_meaning.near = Some(self.near(question)?);
+            by_meaning.limit = Some(ANSWER_ITEMS);
+            take(self.store.ask(&by_meaning)?);
+        }
+        let considered: Vec<i64> = items.iter().map(|i| i.id).collect();
+        let text = model.answer(&Brief {
+            question: question.to_string(),
+            items,
+        })?;
+        let cites = cited_ids(&text)
+            .into_iter()
+            .filter(|id| considered.contains(id))
+            .collect();
+        Ok(Answer {
+            text,
+            cites,
+            considered,
+        })
+    }
+
     /// Which of the chain's labels the item carries, and which classifiers on
     /// the way down could have stamped them. A label can also come from a hand.
-    pub fn why(&self, item: &Item, path: &[String]) -> String {
+    pub fn why(&self, item: &Item, path: &[String]) -> Why {
         let refs: Vec<&str> = path.iter().map(String::as_str).collect();
         let chain = self.config.chain(&refs).unwrap_or_default();
         let has = |l: &str| item.labels.iter().any(|x| x == l);
-        let matched: Vec<&str> = chain
+        let matched = chain
             .iter()
             .flat_map(|ib| ib.labels.iter())
-            .map(String::as_str)
             .filter(|l| has(l))
+            .cloned()
             .collect();
-        let fired: Vec<&str> = self
+        let fired = self
             .config
             .classifier
             .iter()
             .chain(chain.iter().flat_map(|ib| ib.classifier.iter()))
             .filter(|c| c.label.as_deref().is_some_and(has) || c.labels.iter().any(|l| has(l)))
-            .map(|c| c.id.as_str())
+            .map(|c| c.id.clone())
             .collect();
-        let dash = |v: Vec<&str>| {
-            if v.is_empty() {
-                "-".to_string()
-            } else {
-                v.join(" ")
-            }
-        };
-        format!("labels: {}  classifiers: {}", dash(matched), dash(fired))
+        Why { matched, fired }
     }
 }
 
@@ -375,14 +370,6 @@ fn cited_ids(text: &str) -> Vec<i64> {
         }
     }
     out
-}
-
-fn clip(s: &str, max: usize) -> &str {
-    let mut end = max.min(s.len());
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 fn nonempty(s: Option<&str>) -> Option<&str> {

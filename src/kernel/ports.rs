@@ -1,10 +1,10 @@
 //! What the kernel needs from the outside world. Adapters implement these;
-//! the kernel never names SQLite, files, HTTP, or a config format.
+//! the kernel never names SQLite, files, HTTP, or a config format, and it
+//! never builds an adapter: the host resolves them and hands them in.
 
 use anyhow::Result;
 
-use super::classify::Classifier;
-use super::inbox::{ClassifierSpec, ModelSpec, Question, SourceSpec};
+use super::inbox::Question;
 use super::item::{Draft, Item, NewItem};
 
 /// Thin row for stale cleanup: no body, parts, or actors.
@@ -18,6 +18,18 @@ pub struct StaleHint {
     pub labels: Vec<String>,
 }
 
+/// Something the kernel learned about an item and wants kept.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fact {
+    Read(bool),
+    Label(String),
+    Unlabel(String),
+    Thread(Option<String>),
+    /// A run-once classifier has seen this item.
+    Classified(String),
+    Vector(Vec<f32>),
+}
+
 /// Where items live.
 pub trait Store {
     /// Insert, or refresh the row with the same (source_id, foreign_id).
@@ -28,20 +40,13 @@ pub trait Store {
     fn ask(&self, q: &Question) -> Result<Vec<Item>>;
     fn count(&self, q: &Question) -> Result<usize>;
     fn thread(&self, thread: &str) -> Result<Vec<Item>>;
-    fn set_thread(&self, id: i64, thread: Option<&str>) -> Result<()>;
-    fn set_read(&self, id: i64, read: bool) -> Result<()>;
-    fn add_label(&self, id: i64, label: &str) -> Result<()>;
-    fn remove_label(&self, id: i64, label: &str) -> Result<()>;
+    fn note(&self, id: i64, fact: Fact) -> Result<()>;
     fn delete(&self, id: i64) -> Result<bool>;
     fn stale(&self) -> Result<Vec<StaleHint>>;
-    /// Has a run-once classifier already seen this item?
     fn classified(&self, id: i64, classifier_id: &str) -> Result<bool>;
-    fn mark_classified(&self, id: i64, classifier_id: &str) -> Result<()>;
-    fn counts_by_source(&self) -> Result<Vec<(String, i64)>>;
-    /// Remember the item's vector. `ask` with `near` ranks by it.
-    fn set_vector(&self, id: i64, vector: &[f32]) -> Result<()>;
     /// Items with no vector yet.
     fn unembedded(&self) -> Result<Vec<i64>>;
+    fn counts_by_source(&self) -> Result<Vec<(String, i64)>>;
 }
 
 /// Where items come from, and where a draft goes.
@@ -52,21 +57,33 @@ pub trait Source {
     fn send(&self, draft: &Draft, reply_to_foreign: Option<&str>) -> Result<NewItem>;
 }
 
+/// Stamps a label, or not. An error means "could not decide".
+pub trait Classifier {
+    fn id(&self) -> &str;
+    fn classify(&self, item: &Item) -> Result<Option<String>>;
+    /// Expensive classifiers run once per item and the verdict is remembered.
+    fn once(&self) -> bool {
+        false
+    }
+}
+
 /// Text to a vector. Items and queries share one embedder, so one space.
 pub trait Embedder {
     fn embed(&self, text: &str) -> Result<Vec<f32>>;
 }
 
-/// A chat model: a system and a user message in, text out.
-pub trait Model {
-    fn complete(&self, system: &str, user: &str) -> Result<String>;
+/// What `answer` hands a model: the question and the items it may draw on.
+/// The adapter turns this into a prompt; the kernel holds no prose.
+#[derive(Debug, Clone)]
+pub struct Brief {
+    pub question: String,
+    pub items: Vec<Item>,
 }
 
-/// Turns specs into live sources, classifiers, embedders, and models. The
-/// kernel builds the classifier kinds it knows (regex) and asks here for the rest.
-pub trait Adapters {
-    fn source(&self, spec: &SourceSpec) -> Result<Box<dyn Source>>;
-    fn classifier(&self, spec: &ClassifierSpec) -> Result<Box<dyn Classifier>>;
-    fn embedder(&self, spec: &ModelSpec) -> Result<Box<dyn Embedder>>;
-    fn model(&self, spec: &ModelSpec) -> Result<Box<dyn Model>>;
+/// A chat model.
+pub trait Model {
+    /// A system and a user message in, text out.
+    fn complete(&self, system: &str, user: &str) -> Result<String>;
+    /// Answer from the items, citing them as `#id`.
+    fn answer(&self, brief: &Brief) -> Result<String>;
 }

@@ -1,18 +1,16 @@
 //! A host on disk: where the config, store, and incoming directory live, how
-//! the TOML config is read, and the standard set of adapters wired together.
+//! the TOML config is read, and how a config becomes a resolved kernel.
+//! This is the only place adapters are chosen.
 
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::classifier::{CelClassifier, ExecClassifier, HttpClassifier, LlmClassifier};
 use super::source::{Exec, Fs, Rss};
 use super::store::Sqlite;
-use super::{embedder, model};
-use crate::kernel::{
-    Adapters, Classifier, ClassifierSpec, Config, Embedder, Kernel, Model, ModelSpec, Source,
-    SourceSpec, Store,
-};
+use super::{classifier, embedder, model};
+use crate::kernel::{setting, setting_list, Config, Kernel, Source, SourceSpec, Store};
 
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -139,78 +137,64 @@ pub fn load_config(path: &Path) -> Result<Config> {
     Ok(config.with_root())
 }
 
-/// A kernel over the standard adapters.
-pub fn kernel<'a>(config: &'a Config, store: &'a dyn Store) -> Kernel<'a> {
-    Kernel::new(config, store, &STD)
+/// Resolve every spec in the config into a live adapter and hand the kernel
+/// the lot, as of now. A bad spec fails here, before any verb runs.
+pub fn kernel<'a>(config: &'a Config, store: &'a dyn Store) -> Result<Kernel<'a>> {
+    kernel_at(config, store, chrono::Utc::now())
 }
 
-/// fs, rss, and exec sources; script, exec, http, and llm classifiers;
-/// exec, http, ollama, and openai embedders and models.
-pub struct Std;
+pub fn kernel_at<'a>(
+    config: &'a Config,
+    store: &'a dyn Store,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Kernel<'a>> {
+    let sources = config
+        .source
+        .iter()
+        .map(|spec| Ok((spec.id.clone(), source(spec)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let classifiers = config
+        .classifiers()
+        .into_iter()
+        .map(|spec| Ok((spec.id.clone(), classifier::build(spec)?)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    let embedder = config.embedder.as_ref().map(embedder::build).transpose()?;
+    let model = config.model.as_ref().map(model::build).transpose()?;
+    Ok(Kernel {
+        config,
+        store,
+        sources,
+        classifiers,
+        embedder,
+        model,
+        now,
+    })
+}
 
-pub static STD: Std = Std;
-
-impl Adapters for Std {
-    fn source(&self, spec: &SourceSpec) -> Result<Box<dyn Source>> {
-        let id = spec.id.clone();
-        let need = |field: Option<&str>, what: &str| {
-            field
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .ok_or_else(|| anyhow::anyhow!("source {id} {} needs {what}", spec.kind))
-        };
-        Ok(match spec.kind.as_str() {
-            "fs" => Box::new(Fs {
-                id: spec.id.clone(),
-                dir: expand_path(&need(spec.path.as_deref(), "path")?),
-            }),
-            "rss" => Box::new(Rss {
-                id: spec.id.clone(),
-                url: need(spec.url.as_deref(), "url")?,
-            }),
-            "exec" => Box::new(Exec {
-                id: spec.id.clone(),
-                cmd: expand_path(&need(spec.cmd.as_deref(), "cmd")?),
-                args: spec.args.clone(),
-                dir: spec
-                    .dir
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(expand_path),
-            }),
-            other => bail!("unknown source kind `{other}` on {}", spec.id),
-        })
-    }
-
-    fn classifier(&self, spec: &ClassifierSpec) -> Result<Box<dyn Classifier>> {
-        let need = |field: Option<&str>, what: &str| {
-            field
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .ok_or_else(|| anyhow::anyhow!("classifier {} {} needs {what}", spec.id, spec.kind))
-        };
-        Ok(match spec.kind.as_str() {
-            "script" => Box::new(CelClassifier::new(spec)?),
-            "exec" => {
-                let cmd = expand_path(&need(spec.cmd.as_deref(), "cmd")?);
-                Box::new(ExecClassifier::new(spec, cmd.display().to_string()))
-            }
-            "http" => Box::new(HttpClassifier::new(spec, need(spec.url.as_deref(), "url")?)),
-            "llm" => Box::new(LlmClassifier::new(spec)?),
-            other => bail!("unknown classifier kind `{other}` (regex, script, exec, http, llm)"),
-        })
-    }
-
-    fn embedder(&self, spec: &ModelSpec) -> Result<Box<dyn Embedder>> {
-        embedder::build(spec)
-    }
-
-    fn model(&self, spec: &ModelSpec) -> Result<Box<dyn Model>> {
-        model::build(spec)
-    }
+/// fs, rss, or exec.
+fn source(spec: &SourceSpec) -> Result<Box<dyn Source>> {
+    let s = &spec.settings;
+    let need = |key: &str| {
+        setting(s, key)
+            .ok_or_else(|| anyhow::anyhow!("source {} {} needs {key}", spec.id, spec.kind))
+    };
+    Ok(match spec.kind.as_str() {
+        "fs" => Box::new(Fs {
+            id: spec.id.clone(),
+            dir: expand_path(&need("path")?),
+        }),
+        "rss" => Box::new(Rss {
+            id: spec.id.clone(),
+            url: need("url")?,
+        }),
+        "exec" => Box::new(Exec {
+            id: spec.id.clone(),
+            cmd: expand_path(&need("cmd")?),
+            args: setting_list(s, "args"),
+            dir: setting(s, "dir").map(|d| expand_path(&d)),
+        }),
+        other => bail!("unknown source kind `{other}` on {}", spec.id),
+    })
 }
 
 pub fn default_config_toml(incoming: &str) -> String {

@@ -15,8 +15,10 @@ pub mod host;
 pub mod model;
 pub mod source;
 pub mod store;
-mod transport;
+pub(crate) mod transport;
 
-pub use host::{default_config_toml, expand_path, init, kernel, load, load_config, Paths, Std};
+pub use host::{
+    default_config_toml, expand_path, init, kernel, kernel_at, load, load_config, Paths,
+};
 pub use source::item_from_file;
 pub use store::Sqlite;

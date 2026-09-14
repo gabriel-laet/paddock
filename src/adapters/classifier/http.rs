@@ -6,15 +6,15 @@
 //! id = "by-service"
 //! kind = "http"
 //! url = "http://127.0.0.1:8080/label"
+//! key = "..."            # bearer token, optional
 //! once = true
 //! ```
-//!
-//! `key` is sent as a bearer token when set.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use super::{label_of, post};
-use crate::kernel::{Classifier, ClassifierSpec, Item};
+use super::label_of;
+use crate::adapters::transport::post;
+use crate::kernel::{setting, Classifier, ClassifierSpec, Item};
 
 pub struct HttpClassifier {
     id: String,
@@ -28,7 +28,7 @@ impl HttpClassifier {
         Self {
             id: spec.id.clone(),
             url,
-            key: spec.key.clone(),
+            key: setting(&spec.settings, "key"),
             once: spec.once,
         }
     }
@@ -45,8 +45,7 @@ impl Classifier for HttpClassifier {
 
     fn classify(&self, item: &Item) -> Result<Option<String>> {
         let body = serde_json::to_value(item)?;
-        let reply = post(&self.url, self.key.as_deref(), &body)
-            .with_context(|| format!("classifier {}", self.id))?;
+        let reply = post(&self.url, self.key.as_deref(), &body)?;
         Ok(label_of(&reply))
     }
 }

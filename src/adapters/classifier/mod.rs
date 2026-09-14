@@ -4,7 +4,7 @@
 //! - `exec`: run a program with the item as JSON on stdin; stdout is the label
 //! - `http`: POST the item as JSON; the body is the label
 //! - `script`: a CEL expression over the item, in-process
-//! - `llm`: a prompt built from the item, sent over exec or http, one token back
+//! - `llm`: a prompt built from the item, sent to a `Model`, one token back
 //!
 //! A label reply is its first token; `NONE` or nothing means no label.
 //! A JSON object reply may say `{"label": "..."}` instead.
@@ -14,14 +14,28 @@ pub mod exec;
 pub mod http;
 pub mod llm;
 
-pub use cel::CelClassifier;
-pub use exec::ExecClassifier;
-pub use http::HttpClassifier;
-pub use llm::LlmClassifier;
+use anyhow::{bail, Result};
 
-pub(crate) use super::transport::{post, run};
+use crate::kernel::{sanitize_label, setting, Classifier, ClassifierSpec, RegexClassifier};
 
-use crate::kernel::sanitize_label;
+/// Every classifier kind, the kernel's regex included.
+pub fn build(spec: &ClassifierSpec) -> Result<Box<dyn Classifier>> {
+    let need = |key: &str| {
+        setting(&spec.settings, key)
+            .ok_or_else(|| anyhow::anyhow!("classifier {} {} needs {key}", spec.id, spec.kind))
+    };
+    Ok(match spec.kind.as_str() {
+        "regex" => Box::new(RegexClassifier::new(spec)?),
+        "script" => Box::new(cel::CelClassifier::new(spec, &need("script")?)?),
+        "exec" => Box::new(exec::ExecClassifier::new(spec, need("cmd")?)),
+        "http" => Box::new(http::HttpClassifier::new(spec, need("url")?)),
+        "llm" => Box::new(llm::LlmClassifier::new(spec)?),
+        other => bail!(
+            "unknown classifier kind `{other}` on {} (regex, script, exec, http, llm)",
+            spec.id
+        ),
+    })
+}
 
 /// A reply's label: `{"label": "x"}` if it is JSON, else the first token.
 /// `NONE`, empty, or JSON null means no label.

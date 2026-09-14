@@ -58,80 +58,76 @@ pub struct Inbox {
     pub inbox: Vec<Inbox>,
 }
 
-/// A classifier as declared. `kind` picks the implementation.
+/// Whatever an adapter needs beyond what the kernel reads: `cmd`, `url`,
+/// `key`, `pattern`, and so on. The kernel never looks inside.
+pub type Settings = serde_json::Map<String, serde_json::Value>;
+
+/// A string setting, trimmed; missing or empty is `None`.
+pub fn setting(settings: &Settings, key: &str) -> Option<String> {
+    settings
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// A list-of-strings setting; missing is empty.
+pub fn setting_list(settings: &Settings, key: &str) -> Vec<String> {
+    settings
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A classifier as declared. The kernel reads `id`, `kind`, `label`,
+/// `labels`, and `once`; the rest is the adapter's.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ClassifierSpec {
     pub id: String,
     pub kind: String,
-    #[serde(default)]
-    pub pattern: Option<String>,
+    /// The label a yes/no classifier stamps.
     #[serde(default)]
     pub label: Option<String>,
-    #[serde(default)]
-    pub script: Option<String>,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub provider: Option<String>,
-    #[serde(default)]
-    pub url: Option<String>,
-    #[serde(default)]
-    pub prompt: Option<String>,
     /// Allow-list: the classifier must pick one of these or nothing.
     #[serde(default)]
     pub labels: Vec<String>,
-    /// Program for kind = "exec", or the CLI an "llm" talks to.
-    #[serde(default)]
-    pub cmd: Option<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// Run once per item and remember the verdict. llm always does.
+    /// Run once per item and remember the verdict.
     #[serde(default)]
     pub once: bool,
-    /// Bearer token for kind = "http", or for an "llm" over an openai service.
-    #[serde(default)]
-    pub key: Option<String>,
+    #[serde(flatten)]
+    pub settings: Settings,
 }
 
-/// A model or embedder as declared. `kind` picks the transport.
+/// A model or embedder as declared. `kind` picks the adapter.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ModelSpec {
     #[serde(default)]
     pub kind: String,
-    #[serde(default)]
-    pub cmd: Option<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub url: Option<String>,
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Bearer token for a service that wants one.
-    #[serde(default)]
-    pub key: Option<String>,
+    #[serde(flatten)]
+    pub settings: Settings,
 }
 
-/// A source as declared. `kind` picks the adapter.
+/// A source as declared. The kernel reads `id`, `kind`, `name`, and
+/// `forget_after`; the rest is the adapter's.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SourceSpec {
     pub id: String,
     pub kind: String,
-    #[serde(default)]
-    pub path: Option<String>,
-    #[serde(default)]
-    pub url: Option<String>,
-    #[serde(default)]
-    pub cmd: Option<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub dir: Option<String>,
-    /// Per-source stale window for untimed items. Wins over the host default.
-    #[serde(default)]
-    pub forget_after: Option<String>,
     /// Display name. Empty means `id`.
     #[serde(default)]
     pub name: Option<String>,
+    /// Per-source stale window for untimed items. Wins over the host default.
+    #[serde(default)]
+    pub forget_after: Option<String>,
+    #[serde(flatten)]
+    pub settings: Settings,
 }
 
 /// One inbox in the flattened tree, with its path from the root.
@@ -163,6 +159,19 @@ impl Config {
     pub fn nodes(&self) -> Vec<Node> {
         let mut out = Vec::new();
         walk(&self.inbox, &[], 0, &mut out);
+        out
+    }
+
+    /// Every classifier spec: the root's, then each inbox's, depth first.
+    pub fn classifiers(&self) -> Vec<&ClassifierSpec> {
+        fn walk<'a>(inboxes: &'a [Inbox], out: &mut Vec<&'a ClassifierSpec>) {
+            for ib in inboxes {
+                out.extend(ib.classifier.iter());
+                walk(&ib.inbox, out);
+            }
+        }
+        let mut out: Vec<&ClassifierSpec> = self.classifier.iter().collect();
+        walk(&self.inbox, &mut out);
         out
     }
 
@@ -275,6 +284,7 @@ impl Question {
         q
     }
 
+    /// As of the wall clock. For the edges; the kernel passes its own `now`.
     pub fn of(chain: &[&Inbox]) -> Self {
         Self::of_at(chain, chrono::Utc::now())
     }

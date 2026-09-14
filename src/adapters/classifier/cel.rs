@@ -9,7 +9,7 @@
 //! "todo" in item.labels && item.start != ""
 //! ```
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use cel_interpreter::{Program, Value};
 
 use crate::kernel::{sanitize_label, Classifier, ClassifierSpec, Item};
@@ -21,11 +21,7 @@ pub struct CelClassifier {
 }
 
 impl CelClassifier {
-    pub fn new(spec: &ClassifierSpec) -> Result<Self> {
-        let source = spec
-            .script
-            .as_deref()
-            .context("script classifier needs script")?;
+    pub fn new(spec: &ClassifierSpec, source: &str) -> Result<Self> {
         let program = Program::compile(source)
             .map_err(|e| anyhow::anyhow!("classifier {}: bad script: {e}", spec.id))?;
         Ok(Self {
@@ -97,11 +93,13 @@ mod tests {
         let spec = ClassifierSpec {
             id: "s".into(),
             kind: "script".into(),
-            script: Some(script.into()),
             label: label.map(str::to_string),
             ..Default::default()
         };
-        CelClassifier::new(&spec).unwrap().classify(it).unwrap()
+        CelClassifier::new(&spec, script)
+            .unwrap()
+            .classify(it)
+            .unwrap()
     }
 
     #[test]
@@ -171,9 +169,8 @@ mod tests {
         let spec = ClassifierSpec {
             id: "s".into(),
             kind: "script".into(),
-            script: Some("item.title ?".into()),
             ..Default::default()
         };
-        assert!(CelClassifier::new(&spec).is_err());
+        assert!(CelClassifier::new(&spec, "item.title ?").is_err());
     }
 }

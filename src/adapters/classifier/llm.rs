@@ -15,7 +15,7 @@
 use anyhow::{Context, Result};
 
 use super::super::model;
-use crate::kernel::{sanitize_label, Classifier, ClassifierSpec, Item, Model, ModelSpec};
+use crate::kernel::{sanitize_label, setting, Classifier, ClassifierSpec, Item, Model, ModelSpec};
 
 pub const SYSTEM: &str =
     "you label one inbox item. Reply with a single token: a label or NONE. No prose.";
@@ -32,18 +32,14 @@ pub struct LlmClassifier {
 impl LlmClassifier {
     pub fn new(spec: &ClassifierSpec) -> Result<Self> {
         let model = model::build(&ModelSpec {
-            kind: spec.provider.clone().unwrap_or_default(),
-            cmd: spec.cmd.clone(),
-            args: spec.args.clone(),
-            url: spec.url.clone(),
-            model: spec.model.clone(),
-            key: spec.key.clone(),
+            kind: setting(&spec.settings, "provider").unwrap_or_default(),
+            settings: spec.settings.clone(),
         })
         .with_context(|| format!("classifier {}", spec.id))?;
         Ok(Self {
             id: spec.id.clone(),
             model,
-            prompt: spec.prompt.clone(),
+            prompt: setting(&spec.settings, "prompt"),
             label: spec.label.clone(),
             labels: spec.labels.clone(),
         })
@@ -66,10 +62,7 @@ impl Classifier for LlmClassifier {
             self.label.as_deref(),
             &self.labels,
         );
-        let raw = self
-            .model
-            .complete(SYSTEM, &user)
-            .with_context(|| format!("classifier {}", self.id))?;
+        let raw = self.model.complete(SYSTEM, &user)?;
         Ok(interpret(&raw, self.label.as_deref(), &self.labels))
     }
 }
@@ -152,11 +145,15 @@ mod tests {
         let spec = ClassifierSpec {
             id: "l".into(),
             kind: "llm".into(),
-            cmd: Some("sh".into()),
-            args: vec![
-                "-c".into(),
-                "grep -q 'title: pay' && echo money || echo NONE".into(),
-            ],
+            settings: [
+                ("cmd".to_string(), serde_json::json!("sh")),
+                (
+                    "args".to_string(),
+                    serde_json::json!(["-c", "grep -q 'title: pay' && echo money || echo NONE"]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
             labels: vec!["money".into()],
             ..Default::default()
         };
