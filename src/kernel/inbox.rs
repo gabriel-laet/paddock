@@ -297,7 +297,7 @@ impl Question {
             None => true,
             Some(s) => s.iter().any(|s| s == &item.source_id),
         };
-        let labels_ok = self.labels.iter().all(|l| item.labels.contains(l));
+        let labels_ok = self.labels.iter().all(|l| item.has(l));
         let timed_ok = !self.timed || item.when() != item.created_at;
         let read_ok = !self.unread || !item.read;
         let when = parse_when(item.when());

@@ -5,8 +5,8 @@
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 
-use super::inbox::{parse_duration, parse_when, ClassifierSpec, Config, Inbox, Question};
-use super::item::{Draft, Item, NewItem};
+use super::inbox::{parse_duration, parse_when, rfc3339, ClassifierSpec, Config, Inbox, Question};
+use super::item::{By, Draft, Item, Label, NewItem};
 use super::ports::{Brief, Classifier, Embedder, Fact, Model, Source, StaleHint, Store};
 
 const ANSWER_ITEMS: usize = 12;
@@ -39,12 +39,12 @@ pub struct Report {
     pub warnings: Vec<String>,
 }
 
-/// Why an item is in an inbox: the chain's labels it carries, and the
-/// classifiers on the way down that could have stamped them.
+/// Why an item is in an inbox: the chain's labels it carries, each with who
+/// put it there, and the labels a hand has denied.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Why {
-    pub matched: Vec<String>,
-    pub fired: Vec<String>,
+    pub matched: Vec<Label>,
+    pub denied: Vec<Label>,
 }
 
 /// What `answer` returns: the model's text, the items it cited, and every
@@ -119,23 +119,36 @@ impl Kernel<'_> {
                     None
                 }
             };
-            if let Some(label) = label {
-                if !item.labels.contains(&label) {
-                    self.store.note(item.id, Fact::Label(label.clone()))?;
-                    item.labels.push(label);
+            if let Some(name) = label {
+                // A hand's removal stands; a classifier does not argue with it.
+                if item.has(&name) || item.denies(&name) {
+                    continue;
                 }
+                let label = Label {
+                    name,
+                    by: By::Classifier(spec.id.clone()),
+                    at: rfc3339(self.now),
+                };
+                self.store.note(item.id, Fact::Label(label.clone()))?;
+                item.labels.push(label);
             }
         }
         Ok(())
     }
 
-    /// Add and remove labels, then classify so a newly matching child can fire.
+    /// A hand adds and removes labels, then classify runs so a newly matching
+    /// child can fire. A removal is remembered: classifiers will not undo it.
     pub fn label(&self, id: i64, add: &[String], remove: &[String]) -> Result<Vec<String>> {
+        let by_hand = |name: &String| Label {
+            name: name.clone(),
+            by: By::Hand,
+            at: rfc3339(self.now),
+        };
         for l in add {
-            self.store.note(id, Fact::Label(l.clone()))?;
+            self.store.note(id, Fact::Label(by_hand(l)))?;
         }
         for l in remove {
-            self.store.note(id, Fact::Unlabel(l.clone()))?;
+            self.store.note(id, Fact::Unlabel(by_hand(l)))?;
         }
         self.classify(id)
     }
@@ -320,27 +333,22 @@ impl Kernel<'_> {
         })
     }
 
-    /// Which of the chain's labels the item carries, and which classifiers on
-    /// the way down could have stamped them. A label can also come from a hand.
+    /// The chain's labels the item carries, with who put each one there, and
+    /// what a hand has denied.
     pub fn why(&self, item: &Item, path: &[String]) -> Why {
         let refs: Vec<&str> = path.iter().map(String::as_str).collect();
         let chain = self.config.chain(&refs).unwrap_or_default();
-        let has = |l: &str| item.labels.iter().any(|x| x == l);
-        let matched = chain
+        let wanted: Vec<&String> = chain.iter().flat_map(|ib| ib.labels.iter()).collect();
+        let matched = item
+            .labels
             .iter()
-            .flat_map(|ib| ib.labels.iter())
-            .filter(|l| has(l))
+            .filter(|l| wanted.contains(&&l.name))
             .cloned()
             .collect();
-        let fired = self
-            .config
-            .classifier
-            .iter()
-            .chain(chain.iter().flat_map(|ib| ib.classifier.iter()))
-            .filter(|c| c.label.as_deref().is_some_and(has) || c.labels.iter().any(|l| has(l)))
-            .map(|c| c.id.clone())
-            .collect();
-        Why { matched, fired }
+        Why {
+            matched,
+            denied: item.denied.clone(),
+        }
     }
 }
 

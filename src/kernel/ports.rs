@@ -5,7 +5,7 @@
 use anyhow::Result;
 
 use super::inbox::Question;
-use super::item::{Draft, Item, NewItem};
+use super::item::{Draft, Item, Label, NewItem};
 
 /// Thin row for stale cleanup: no body, parts, or actors.
 #[derive(Debug, Clone)]
@@ -22,8 +22,10 @@ pub struct StaleHint {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Fact {
     Read(bool),
-    Label(String),
-    Unlabel(String),
+    /// Put on, by someone, at some time. Clears any denial of the same name.
+    Label(Label),
+    /// Taken off. By a hand, this leaves a denial behind.
+    Unlabel(Label),
     Thread(Option<String>),
     /// A run-once classifier has seen this item.
     Classified(String),

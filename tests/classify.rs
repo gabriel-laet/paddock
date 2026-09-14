@@ -98,7 +98,7 @@ fn classify_todo_regex_enters_todo_inbox() {
     let k = kernel(&cfg, &store).unwrap();
     k.classify(id).unwrap();
     let item = store.get(id).unwrap();
-    assert!(item.labels.contains(&"todo".into()), "root flag-todo regex");
+    assert!(item.has("todo"), "root flag-todo regex");
     let chain = cfg.chain(&["all", "todo"]).unwrap();
     let listed = k.ask(&chain).unwrap();
     assert_eq!(listed.len(), 1);
@@ -152,16 +152,13 @@ path = "/tmp"
         .0;
     k.classify(id).unwrap();
     let item = store.get(id).unwrap();
-    assert!(!item.labels.contains(&"todo".into()));
-    assert!(!item.labels.contains(&"urgent".into()));
+    assert!(!item.has("todo"));
+    assert!(!item.has("urgent"));
 
     k.label(id, &["todo".into()], &[]).unwrap();
     let item = store.get(id).unwrap();
-    assert!(item.labels.contains(&"todo".into()));
-    assert!(
-        item.labels.contains(&"urgent".into()),
-        "child classifier after enter"
-    );
+    assert!(item.has("todo"));
+    assert!(item.has("urgent"), "child classifier after enter");
     let chain = cfg.chain(&["all", "todo"]).unwrap();
     assert!(k.ask(&chain).unwrap().iter().any(|i| i.id == id));
 }
@@ -176,11 +173,11 @@ fn admit_file_reclassifies_on_update() {
     let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let id = k.admit(item_from_file("incoming", &p).unwrap()).unwrap().id;
-    assert!(!store.get(id).unwrap().labels.contains(&"todo".into()));
+    assert!(!store.get(id).unwrap().has("todo"));
     fs::write(&p, "hello todo").unwrap();
     let id2 = k.admit(item_from_file("incoming", &p).unwrap()).unwrap().id;
     assert_eq!(id, id2);
-    assert!(store.get(id).unwrap().labels.contains(&"todo".into()));
+    assert!(store.get(id).unwrap().has("todo"));
 }
 
 #[test]
@@ -194,5 +191,86 @@ fn admit_file_classifies() {
     let k = kernel(&cfg, &store).unwrap();
     let id = k.admit(item_from_file("incoming", &p).unwrap()).unwrap().id;
     let item = store.get(id).unwrap();
-    assert!(item.labels.contains(&"rfc".into()));
+    assert!(item.has("rfc"));
+}
+
+#[test]
+fn a_hand_removal_is_denied_to_classifiers_until_a_hand_relents() {
+    let (_tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    let (cfg, store) = load(&paths).unwrap();
+    let k = kernel(&cfg, &store).unwrap();
+    let id = k
+        .admit(NewItem {
+            source_id: "incoming".into(),
+            foreign_id: "a".into(),
+            title: "TODO: call the bank".into(),
+            body: "x".into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    let stamped = store.get(id).unwrap();
+    assert!(stamped.has("todo"), "the regex stamped it on admit");
+    assert_eq!(
+        stamped.labels[0].by,
+        By::Classifier("flag-todo".into()),
+        "and the label says so"
+    );
+
+    k.label(id, &[], &["todo".into()]).unwrap();
+    let after = store.get(id).unwrap();
+    assert!(!after.has("todo"), "a hand took it off");
+    assert!(after.denies("todo"), "and the removal is remembered");
+    k.classify(id).unwrap();
+    assert!(
+        !store.get(id).unwrap().has("todo"),
+        "reclassify does not put it back"
+    );
+    let todo = cfg.chain(&["all", "todo"]).unwrap();
+    assert!(
+        k.ask(&todo).unwrap().is_empty(),
+        "so it left the todo inbox"
+    );
+
+    k.label(id, &["todo".into()], &[]).unwrap();
+    let relented = store.get(id).unwrap();
+    assert!(relented.has("todo"));
+    assert!(
+        !relented.denies("todo"),
+        "a hand putting it back lifts the denial"
+    );
+    assert_eq!(relented.labels[0].by, By::Hand);
+    assert!(
+        !relented.labels[0].at.is_empty(),
+        "stamped with the kernel's clock"
+    );
+}
+
+#[test]
+fn why_says_who_stamped_each_label_and_what_is_denied() {
+    let (_tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    let (cfg, store) = load(&paths).unwrap();
+    let k = kernel(&cfg, &store).unwrap();
+    let id = k
+        .admit(NewItem {
+            source_id: "incoming".into(),
+            foreign_id: "a".into(),
+            title: "an RFC, todo".into(),
+            body: "x".into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    k.label(id, &["later".into()], &["rfc".into()]).unwrap();
+    let item = store.get(id).unwrap();
+    let why = k.why(&item, &["all".into(), "later".into()]);
+    assert_eq!(why.matched.len(), 1);
+    assert_eq!(why.matched[0].name, "later");
+    assert_eq!(why.matched[0].by, By::Hand);
+    assert_eq!(why.denied.len(), 1);
+    assert_eq!(why.denied[0].name, "rfc");
+    let why = k.why(&item, &["all".into(), "todo".into()]);
+    assert_eq!(why.matched[0].by, By::Classifier("flag-todo".into()));
 }

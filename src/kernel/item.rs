@@ -70,6 +70,51 @@ pub struct Actor {
     pub kind: ActorKind,
 }
 
+/// Who put a label on an item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum By {
+    Hand,
+    Classifier(String),
+}
+
+impl By {
+    /// `hand`, or `classifier:<id>`.
+    pub fn as_str(&self) -> String {
+        match self {
+            By::Hand => "hand".into(),
+            By::Classifier(id) => format!("classifier:{id}"),
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s.strip_prefix("classifier:") {
+            Some(id) => By::Classifier(id.to_string()),
+            None => By::Hand,
+        }
+    }
+}
+
+/// A label on an item, and how it got there. A hand outranks a classifier:
+/// a label a hand removed stays denied, and no classifier puts it back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Label {
+    pub name: String,
+    pub by: By,
+    /// RFC3339, or empty when unknown.
+    pub at: String,
+}
+
+impl Label {
+    pub fn hand(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            by: By::Hand,
+            at: String::new(),
+        }
+    }
+}
+
 /// One piece of an item's content. Text is inline; anything else is bytes
 /// the store keeps, `size` long, read back with `Store::blob`.
 #[derive(Debug, Clone, Serialize)]
@@ -108,7 +153,9 @@ pub struct Item {
     /// When paddock first admitted it, RFC3339.
     pub created_at: String,
     pub read: bool,
-    pub labels: Vec<String>,
+    pub labels: Vec<Label>,
+    /// Labels a hand removed. A classifier may not stamp these again.
+    pub denied: Vec<Label>,
     pub parts: Vec<Part>,
     pub from: Option<Actor>,
     pub to: Vec<Actor>,
@@ -119,6 +166,19 @@ pub struct Item {
 }
 
 impl Item {
+    pub fn has(&self, label: &str) -> bool {
+        self.labels.iter().any(|l| l.name == label)
+    }
+
+    pub fn denies(&self, label: &str) -> bool {
+        self.denied.iter().any(|l| l.name == label)
+    }
+
+    /// Label names, in store order.
+    pub fn label_names(&self) -> Vec<String> {
+        self.labels.iter().map(|l| l.name.clone()).collect()
+    }
+
     /// Everything searchable: title, then every text part (or the body).
     pub fn text(&self) -> String {
         let parts: Vec<&str> = self

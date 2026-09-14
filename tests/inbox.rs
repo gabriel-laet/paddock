@@ -104,7 +104,7 @@ fn child_requires_all_listed_labels() {
     };
     assert!(Question::of(&[&parent]).matches(&item));
     assert!(!Question::of(&[&child]).matches(&item));
-    item.labels.push("later".into());
+    item.labels.push(Label::hand("later"));
     assert!(Question::of(&[&child]).matches(&item));
     assert!(items_match_chain(&[&parent, &child], &item));
 }
@@ -129,14 +129,14 @@ fn source_filter_and_label_and() {
         thread: None,
         created_at: "2026-01-01T00:00:00Z".into(),
         read: false,
-        labels: vec!["x".into(), "y".into()],
+        labels: vec![Label::hand("x"), Label::hand("y")],
         parts: vec![],
         ..Default::default()
     };
     assert!(!Question::of(&[&ib]).matches(&item));
     item.source_id = "a".into();
     assert!(Question::of(&[&ib]).matches(&item));
-    item.labels = vec!["x".into()];
+    item.labels = vec![Label::hand("x")];
     assert!(!Question::of(&[&ib]).matches(&item));
 }
 

@@ -22,6 +22,9 @@ struct Cli {
     /// Machine output
     #[arg(long, global = true)]
     json: bool,
+    /// The host directory (config, store, incoming); else PADDOCK_DIR, a `.paddock/` above, or XDG
+    #[arg(long, global = true, value_name = "DIR")]
+    dir: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -102,7 +105,10 @@ enum Cmd {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let paths = Paths::from_env();
+    let paths = match &cli.dir {
+        Some(dir) => Paths::from_root(paddock::expand_path(dir)),
+        None => Paths::from_env(),
+    };
     if !cli.local && !matches!(cli.cmd, Cmd::Init { .. }) {
         let from_config = load_config(&paths.config_file).ok().and_then(|c| c.remote);
         let host = [cli.remote.as_deref(), from_config.as_deref()]
@@ -253,18 +259,18 @@ fn main() -> Result<()> {
             if cli.json {
                 println!("{}", serde_json::to_string(&why)?);
             } else {
-                let dash = |v: &[String]| {
+                let show = |v: &[paddock::Label]| {
                     if v.is_empty() {
                         "-".to_string()
                     } else {
-                        v.join(" ")
+                        v.iter().map(label_with_by).collect::<Vec<_>>().join(" ")
                     }
                 };
                 println!(
-                    "{}  labels: {}  classifiers: {}",
+                    "{}  labels: {}  denied: {}",
                     path.join("/"),
-                    dash(&why.matched),
-                    dash(&why.fired)
+                    show(&why.matched),
+                    show(&why.denied)
                 );
             }
         }
@@ -396,7 +402,7 @@ fn line(it: &Item) -> String {
     let labels = if it.labels.is_empty() {
         String::new()
     } else {
-        format!("  [{}]", it.labels.join(" "))
+        format!("  [{}]", it.label_names().join(" "))
     };
     let title = it.title.lines().next().unwrap_or("");
     format!(
@@ -451,7 +457,12 @@ fn show(it: &Item) -> Result<()> {
         writeln!(w, "cites    {who}{ex}")?;
     }
     writeln!(w, "read     {}", it.read)?;
-    writeln!(w, "labels   {}", it.labels.join(" "))?;
+    let labels: Vec<String> = it.labels.iter().map(label_with_by).collect();
+    writeln!(w, "labels   {}", labels.join("  "))?;
+    if !it.denied.is_empty() {
+        let denied: Vec<String> = it.denied.iter().map(|l| l.name.clone()).collect();
+        writeln!(w, "denied   {}", denied.join("  "))?;
+    }
     writeln!(w)?;
     for p in &it.parts {
         match (&p.text, p.size) {
@@ -467,6 +478,14 @@ fn show(it: &Item) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `todo(flag-todo)` for a classifier's label, `todo(hand)` for yours.
+fn label_with_by(l: &paddock::Label) -> String {
+    match &l.by {
+        paddock::By::Hand => format!("{}(hand)", l.name),
+        paddock::By::Classifier(id) => format!("{}({id})", l.name),
+    }
 }
 
 fn actor(a: &Actor) -> String {
@@ -496,7 +515,8 @@ fn context(paths: &Paths, k: &Kernel) -> Result<()> {
     writeln!(w, "Inboxes nest. A child is a tighter question over the parent. Match: sources AND labels (all) AND timed (start set) AND age.")?;
     writeln!(w, "Classifiers are per-inbox, ordered, kinds regex | script (CEL) | llm. They stamp labels. They are not sources.")?;
     writeln!(w, "Actor kind is person | group | list.")?;
-    writeln!(w, "Admit upserts on (source_id, foreign_id). Re-admit refreshes the item and keeps read + labels.\n")?;
+    writeln!(w, "Admit upserts on (source_id, foreign_id). Re-admit refreshes the item and keeps read + labels.")?;
+    writeln!(w, "A label remembers who put it there (hand or classifier). A label a hand removed is denied: no classifier puts it back.\n")?;
     writeln!(w, "## this host")?;
     writeln!(w, "config   {}", paths.config_file.display())?;
     writeln!(w, "db       {}", paths.db_path.display())?;

@@ -319,7 +319,7 @@ fn readmit_updates_item_keeps_labels_and_read() {
         })
         .unwrap()
         .id;
-    store.note(id, Fact::Label("keep".into())).unwrap();
+    store.note(id, Fact::Label(Label::hand("keep"))).unwrap();
     store.note(id, Fact::Read(true)).unwrap();
     let id2 = k
         .admit(NewItem {
@@ -355,8 +355,8 @@ fn readmit_updates_item_keeps_labels_and_read() {
     assert_eq!(item.to.len(), 1);
     assert_eq!(item.to[0].id, "eng");
     assert!(item.read);
-    assert!(item.labels.contains(&"keep".into()));
-    assert!(item.labels.contains(&"todo".into()));
+    assert!(item.has("keep"));
+    assert!(item.has("todo"));
 }
 
 #[test]

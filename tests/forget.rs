@@ -72,7 +72,7 @@ fn forget_stale_keeps_past_timed_todo() {
         })
         .unwrap()
         .id;
-    store.note(id, Fact::Label("todo".into())).unwrap();
+    store.note(id, Fact::Label(Label::hand("todo"))).unwrap();
     let n = k.forget_stale().unwrap();
     assert_eq!(n, 0);
     assert_eq!(store.ask(&Question::default()).unwrap().len(), 1);

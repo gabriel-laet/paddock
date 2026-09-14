@@ -8,7 +8,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::kernel::{
-    Actor, ActorKind, Fact, Item, NewItem, NewPart, Part, PartKind, Question, StaleHint, Store,
+    Actor, ActorKind, By, Fact, Item, Label, NewItem, NewPart, Part, PartKind, Question, StaleHint,
+    Store,
 };
 
 const ITEM_COLS: &str =
@@ -105,6 +106,9 @@ impl Sqlite {
         ensure_column(&conn, "items", "in_reply_to_foreign", "TEXT")?;
         ensure_column(&conn, "items", "forward_of_foreign", "TEXT")?;
         ensure_column(&conn, "parts", "blob", "BLOB")?;
+        ensure_column(&conn, "labels", "by", "TEXT NOT NULL DEFAULT 'hand'")?;
+        ensure_column(&conn, "labels", "at", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "labels", "removed", "INTEGER NOT NULL DEFAULT 0")?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_items_thread ON items(thread);
              CREATE INDEX IF NOT EXISTS idx_items_reply_foreign ON items(source_id, in_reply_to_foreign);
@@ -282,7 +286,7 @@ impl Store for Sqlite {
             params![id],
             row_item,
         )?;
-        item.labels = labels_for(&conn, id)?;
+        (item.labels, item.denied) = labels_for(&conn, id)?;
         item.parts = parts_for(&conn, id)?;
         item.to = to_for(&conn, id)?;
         ensure_text_part(&conn, &mut item)?;
@@ -305,7 +309,7 @@ impl Store for Sqlite {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
-        let mut lab_stmt = conn.prepare("SELECT item_id, label FROM labels")?;
+        let mut lab_stmt = conn.prepare("SELECT item_id, label FROM labels WHERE removed = 0")?;
         let labs = lab_stmt.query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -380,19 +384,21 @@ impl Store for Sqlite {
                 )?;
             }
             Fact::Label(label) => {
-                let label = label.trim();
-                if label.is_empty() {
+                let name = label.name.trim();
+                if name.is_empty() {
                     return Ok(());
                 }
                 conn.execute(
-                    "INSERT OR IGNORE INTO labels (item_id, label) VALUES (?1, ?2)",
-                    params![id, label],
+                    "INSERT INTO labels (item_id, label, by, at, removed) VALUES (?1, ?2, ?3, ?4, 0)
+                     ON CONFLICT(item_id, label) DO UPDATE SET by = excluded.by, at = excluded.at, removed = 0",
+                    params![id, name, label.by.as_str(), label.at],
                 )?;
             }
             Fact::Unlabel(label) => {
                 conn.execute(
-                    "DELETE FROM labels WHERE item_id = ?1 AND label = ?2",
-                    params![id, label.as_str()],
+                    "INSERT INTO labels (item_id, label, by, at, removed) VALUES (?1, ?2, ?3, ?4, 1)
+                     ON CONFLICT(item_id, label) DO UPDATE SET by = excluded.by, at = excluded.at, removed = 1",
+                    params![id, label.name.trim(), label.by.as_str(), label.at],
                 )?;
             }
             Fact::Thread(thread) => {
@@ -614,19 +620,40 @@ fn row_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
         cite_excerpt: row.get(16)?,
         cite_actor: actor_from_cols(row.get(17)?, row.get(18)?, row.get(19)?),
         labels: Vec::new(),
+        denied: Vec::new(),
         parts: Vec::new(),
         to: Vec::new(),
     })
 }
 
-fn labels_for(conn: &Connection, id: i64) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT label FROM labels WHERE item_id = ?1 ORDER BY label")?;
-    let rows = stmt.query_map(params![id], |row| row.get(0))?;
-    let mut out = Vec::new();
+/// (live, denied) labels of one item.
+fn labels_for(conn: &Connection, id: i64) -> Result<(Vec<Label>, Vec<Label>)> {
+    let mut stmt = conn
+        .prepare("SELECT label, by, at, removed FROM labels WHERE item_id = ?1 ORDER BY label")?;
+    let rows = stmt.query_map(params![id], row_label)?;
+    let mut live = Vec::new();
+    let mut denied = Vec::new();
     for r in rows {
-        out.push(r?);
+        let (label, removed) = r?;
+        if removed {
+            denied.push(label);
+        } else {
+            live.push(label);
+        }
     }
-    Ok(out)
+    Ok((live, denied))
+}
+
+fn row_label(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Label, bool)> {
+    let by: String = row.get(1)?;
+    Ok((
+        Label {
+            name: row.get(0)?,
+            by: By::parse(&by),
+            at: row.get(2)?,
+        },
+        row.get::<_, i64>(3)? != 0,
+    ))
 }
 
 fn parts_for(conn: &Connection, id: i64) -> Result<Vec<Part>> {
@@ -671,7 +698,7 @@ fn filter_where(filter: &Question) -> (String, Vec<Value>) {
     }
     for label in &filter.labels {
         clauses.push(
-            "EXISTS (SELECT 1 FROM labels WHERE labels.item_id = items.id AND labels.label = ?)"
+            "EXISTS (SELECT 1 FROM labels WHERE labels.item_id = items.id AND labels.label = ? AND labels.removed = 0)"
                 .into(),
         );
         params.push(Value::Text(label.clone()));
@@ -793,15 +820,31 @@ fn hydrate(conn: &Connection, items: &mut [Item]) -> Result<()> {
     let in_list = marks.join(", ");
 
     let mut lab_stmt = conn.prepare(&format!(
-        "SELECT item_id, label FROM labels WHERE item_id IN ({in_list})"
+        "SELECT item_id, label, by, at, removed FROM labels WHERE item_id IN ({in_list}) ORDER BY label"
     ))?;
     let labs = lab_stmt.query_map(params_from_iter(ids.iter().cloned()), |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        let item_id: i64 = row.get(0)?;
+        let by: String = row.get(2)?;
+        Ok((
+            item_id,
+            Label {
+                name: row.get(1)?,
+                by: By::parse(&by),
+                at: row.get(3)?,
+            },
+            row.get::<_, i64>(4)? != 0,
+        ))
     })?;
-    let mut lab_map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    let mut lab_map: std::collections::HashMap<i64, (Vec<Label>, Vec<Label>)> =
+        std::collections::HashMap::new();
     for row in labs {
-        let (id, label) = row?;
-        lab_map.entry(id).or_default().push(label);
+        let (id, label, removed) = row?;
+        let entry = lab_map.entry(id).or_default();
+        if removed {
+            entry.1.push(label);
+        } else {
+            entry.0.push(label);
+        }
     }
     drop(lab_stmt);
 
@@ -851,7 +894,7 @@ fn hydrate(conn: &Connection, items: &mut [Item]) -> Result<()> {
     drop(to_stmt);
 
     for item in items {
-        item.labels = lab_map.remove(&item.id).unwrap_or_default();
+        (item.labels, item.denied) = lab_map.remove(&item.id).unwrap_or_default();
         item.parts = part_map.remove(&item.id).unwrap_or_default();
         item.to = to_map.remove(&item.id).unwrap_or_default();
     }

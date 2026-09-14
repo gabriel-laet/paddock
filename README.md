@@ -19,12 +19,14 @@ src/main.rs               the CLI
 
 - **item** — one thing that arrived, stripped of its source's shape
 - **source** — a program that admits items (and may send)
-- **label** — a mark a classifier or a hand put on an item
+- **label** — a mark a classifier or a hand put on an item; it remembers which, and a hand outranks a classifier
 - **inbox** — a named question over the pile (sources + labels + time + words), not an account and not a folder
 
 Items may have parts (text, file, image, audio, video) and an optional thread. `body` is the preview; the full text is the first text part. Part bytes live in the store, not on disk beside it.
 
 Actors and cites are kernel: an item can have `from` / `to` (a person, a group, or a list) and may cite another item. A reply cites an item (`in_reply_to` + thread).
+
+A label a hand removed stays denied: no classifier puts it back until a hand does. `why` shows who stamped each label and what is denied.
 
 Inboxes nest. A child is a tighter question over its parent's matched items. Classifiers are owned by an inbox; they run when an item enters that inbox, then children re-evaluate. A label change re-runs classify (classify-on-enter) so a newly matching child can fire. `all/todo` is the todo list: same machinery, no extra feature.
 
@@ -48,14 +50,14 @@ paddock label ID [+l|-l]...        # add / remove labels, then reclassify
 paddock read ID | unread ID
 paddock forget ID                  # delete
 paddock classify ID                # re-run classifiers
-paddock why ID [INBOX]             # labels matched, classifiers that could have fired
+paddock why ID [INBOX]             # the chain's labels it carries, who stamped each, what a hand denied
 paddock send [--title T] [--reply ID] [--to A]... [--source S] [BODY]   # body from arg or stdin
 paddock answer QUESTION [--in INBOX]   # the model answers from the items and cites them
 paddock embed                      # embed items that have no vector yet
 paddock context                    # dump this host for an agent
 ```
 
-`--json` on any command prints machine output. `--remote[=HOST]` re-runs the same command over ssh (host from the flag, else `remote` in config); `--local` forces this machine.
+`--json` on any command prints machine output. `--dir DIR` names the host directory. `--remote[=HOST]` re-runs the same command over ssh (host from the flag, else `remote` in config); `--local` forces this machine.
 
 Drop a file in the incoming directory, then `paddock pull`.
 
@@ -67,11 +69,11 @@ Drop a file in the incoming directory, then `paddock pull`.
 | store | `~/.local/share/paddock/paddock.db` | `$root/paddock.db` |
 | incoming | `~/.local/share/paddock/incoming` | `$root/incoming` |
 
-Resolution: `PADDOCK_DIR`, else walk up from cwd for a `.paddock/` directory, else XDG. `init --here` creates `./.paddock`. Several `[[source]]` blocks share one store. Existing configs are not rewritten by `init`. That is the only environment variable paddock reads; keys and endpoints live in the config next to what uses them, or come from a command (below).
+Resolution: `--dir`, else `PADDOCK_DIR`, else walk up from cwd for a `.paddock/` directory, else XDG (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`). `init --here` creates `./.paddock`. Existing configs are not rewritten by `init`. Those are the only environment variables paddock reads, and they only say where the host is; keys and endpoints live in the config next to what uses them, or come from a command (below).
 
 ## config
 
-The host part, then one block per inbox, source, classifier, and (optionally) the embedder and the model.
+The host part, then one block per inbox, source, classifier, and (optionally) the embedder, the model, and the store. Several `[[source]]` blocks share one store.
 
 ```toml
 keep = ["todo", "later"]        # labels that never auto-forget

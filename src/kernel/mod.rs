@@ -14,6 +14,6 @@ pub use inbox::{
     parse_duration, parse_when, rfc3339, setting, setting_list, AdapterSpec, ClassifierSpec,
     Config, Inbox, Node, Question, Settings, SourceSpec,
 };
-pub use item::{Actor, ActorKind, Draft, Item, NewItem, NewPart, Part, PartKind};
+pub use item::{Actor, ActorKind, By, Draft, Item, Label, NewItem, NewPart, Part, PartKind};
 pub use ports::{Brief, Classifier, Embedder, Fact, Model, Source, StaleHint, Store};
 pub use verbs::{reply_title, Admitted, Answer, Kernel, Report, Why};

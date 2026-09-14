@@ -104,7 +104,7 @@ fn prompt(prompt: Option<&str>, item: &Item, label: Option<&str>, allow: &[Strin
     }
     s.push_str(&format!("title: {}\n", item.title));
     s.push_str(&format!("body: {}\n", truncate(&item.body, BODY_LIMIT)));
-    s.push_str(&format!("labels: {}", item.labels.join(", ")));
+    s.push_str(&format!("labels: {}", item.label_names().join(", ")));
     for (k, v) in [("start", &item.start), ("end", &item.end)] {
         if let Some(v) = v.as_deref().filter(|v| !v.is_empty()) {
             s.push_str(&format!("\n{k}: {v}"));

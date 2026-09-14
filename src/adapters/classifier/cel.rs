@@ -67,7 +67,7 @@ fn item_value(item: &Item) -> serde_json::Value {
         "end": s(&item.end),
         "thread": s(&item.thread),
         "read": item.read,
-        "labels": item.labels,
+        "labels": item.label_names(),
         "parts": item.parts.iter().map(|p| p.kind.as_str()).collect::<Vec<_>>(),
         "from": item.from.as_ref().map(actor).unwrap_or(serde_json::Value::Null),
         "to": item.to.iter().map(actor).collect::<Vec<_>>(),
@@ -126,7 +126,7 @@ mod tests {
     fn sees_start_labels_thread_and_parts() {
         let mut it = item("x", "");
         it.start = Some("2026-08-18T12:00:00Z".into());
-        it.labels = vec!["todo".into()];
+        it.labels = vec![crate::kernel::Label::hand("todo")];
         it.thread = Some("t1".into());
         it.parts = vec![
             Part {
