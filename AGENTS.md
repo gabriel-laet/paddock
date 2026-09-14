@@ -103,8 +103,8 @@ Next, in the order agreed with the owner:
    slack rides slackcli's browser session (unsanctioned by Slack; the tool throttles to
    dodge `unexpected_api_call_volume`, see its issue #147); `conversations unread` costs
    one call per unread channel, `unread = false` skips it. The sanctioned fallback is the
-   same mapping over the Web API with a user token from your own app (manifest in the
-   session notes: user scopes for history, Socket Mode for live).
+   same mapping over the Web API with a user token from your own app; the app manifest
+   for that (user scopes for history, Socket Mode for live) is `plugins/slack/manifest.json`.
 3. **Send-only plugins** (a transactional mail API, a webhook): `pull` prints `[]`,
    `send` posts the draft. The shape is documented in README "plugins"; none exist yet.
 4. **`send` from the app for a persona**: `Session::source_in(inbox)` gives the source;

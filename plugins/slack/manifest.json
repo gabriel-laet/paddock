@@ -1,0 +1,19 @@
+{
+  "_comment": "The Slack app for the sanctioned route, should paddock-slack ever run over the Web API instead of slackcli's browser session: user scopes for history and sending, Socket Mode for live delivery. Create an app 'from manifest' at api.slack.com/apps, paste this, install, and keep the xoxp- and xapp- tokens behind NAME_cmd.",
+  "display_information": { "name": "paddock" },
+  "oauth_config": {
+    "scopes": {
+      "user": [
+        "channels:history", "channels:read", "groups:history", "groups:read",
+        "im:history", "im:read", "mpim:history", "mpim:read",
+        "users:read", "files:read", "chat:write"
+      ]
+    }
+  },
+  "settings": {
+    "socket_mode_enabled": true,
+    "event_subscriptions": {
+      "user_events": ["message.channels", "message.groups", "message.im", "message.mpim"]
+    }
+  }
+}
