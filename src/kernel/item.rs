@@ -42,6 +42,8 @@ pub enum ActorKind {
     Person,
     Group,
     List,
+    /// A program acting on someone's behalf: an assistant, a sub-agent.
+    Agent,
 }
 
 impl ActorKind {
@@ -50,6 +52,7 @@ impl ActorKind {
             Self::Person => "person",
             Self::Group => "group",
             Self::List => "list",
+            Self::Agent => "agent",
         }
     }
 
@@ -57,6 +60,7 @@ impl ActorKind {
         match s {
             "group" => Self::Group,
             "list" => Self::List,
+            "agent" => Self::Agent,
             _ => Self::Person,
         }
     }
@@ -76,21 +80,33 @@ pub struct Actor {
 pub enum By {
     Hand,
     Classifier(String),
+    /// The source reported it (a chat's read state, say).
+    Source,
+    /// An inbox's `then` effect, by inbox path.
+    Inbox(String),
 }
 
 impl By {
-    /// `hand`, or `classifier:<id>`.
+    /// `hand`, `source`, `classifier:<id>`, or `inbox:<path>`.
     pub fn as_str(&self) -> String {
         match self {
             By::Hand => "hand".into(),
+            By::Source => "source".into(),
             By::Classifier(id) => format!("classifier:{id}"),
+            By::Inbox(path) => format!("inbox:{path}"),
         }
     }
 
     pub fn parse(s: &str) -> Self {
-        match s.strip_prefix("classifier:") {
-            Some(id) => By::Classifier(id.to_string()),
-            None => By::Hand,
+        if let Some(id) = s.strip_prefix("classifier:") {
+            return By::Classifier(id.to_string());
+        }
+        if let Some(path) = s.strip_prefix("inbox:") {
+            return By::Inbox(path.to_string());
+        }
+        match s {
+            "source" => By::Source,
+            _ => By::Hand,
         }
     }
 }
@@ -224,7 +240,7 @@ pub struct Item {
     pub thread: Option<String>,
     /// When paddock first admitted it, RFC3339.
     pub created_at: String,
-    pub read: bool,
+    /// Read is a label like any other, so `without = ["read"]` is "unread".
     pub labels: Vec<Label>,
     /// Labels a hand removed. A classifier may not stamp these again.
     pub denied: Vec<Label>,
@@ -234,7 +250,16 @@ pub struct Item {
     pub cites: Vec<Cite>,
 }
 
+/// The label that means "read". A hand's unread beats a source's read.
+pub const READ: &str = "read";
+/// Stamped by a `send:` effect once the item has gone out.
+pub const SENT: &str = "sent";
+
 impl Item {
+    pub fn read(&self) -> bool {
+        self.has(READ)
+    }
+
     /// The item this one replies to, when that item is in the pile.
     pub fn reply_to(&self) -> Option<i64> {
         self.cites
@@ -254,6 +279,20 @@ impl Item {
     /// Label names, in store order.
     pub fn label_names(&self) -> Vec<String> {
         self.labels.iter().map(|l| l.name.clone()).collect()
+    }
+
+    /// The full text: every text part, else the body.
+    pub fn text_body(&self) -> String {
+        let parts: Vec<&str> = self
+            .parts
+            .iter()
+            .filter_map(|p| p.text.as_deref())
+            .collect();
+        if parts.is_empty() {
+            self.body.clone()
+        } else {
+            parts.join("\n")
+        }
     }
 
     /// Everything searchable: title, then every text part (or the body).

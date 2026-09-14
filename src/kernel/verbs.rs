@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 
 use super::inbox::{parse_duration, parse_when, rfc3339, ClassifierSpec, Config, Inbox, Question};
-use super::item::{By, Cite, CiteKind, Draft, Item, Label, NewItem};
+use super::item::{By, Cite, CiteKind, Draft, Item, Label, NewItem, READ, SENT};
 use super::ports::{Brief, Classifier, Embedder, Fact, Model, Source, StaleHint, Store};
 
 const ANSWER_ITEMS: usize = 12;
@@ -58,9 +58,17 @@ pub struct Answer {
 }
 
 impl Kernel<'_> {
-    /// Upsert, classify from the root down, then embed if the host has an embedder.
+    /// Upsert, take the source's word on read, classify from the root down,
+    /// then embed if the host has an embedder.
     pub fn admit(&self, item: NewItem) -> Result<Admitted> {
         let (id, _) = self.store.upsert(&item)?;
+        if item.read == Some(true) {
+            let current = self.store.get(id)?;
+            if !current.has(READ) && !current.denies(READ) {
+                self.store
+                    .note(id, Fact::Label(self.stamp(READ, By::Source)))?;
+            }
+        }
         let mut warnings = self.classify(id)?;
         if let Err(e) = self.embed(id) {
             warnings.push(format!("embed #{id}: {e:#}"));
@@ -82,14 +90,108 @@ impl Kernel<'_> {
     }
 
     fn enter(&self, inbox: &Inbox, item: &mut Item, warnings: &mut Vec<String>) -> Result<()> {
+        self.enter_at(inbox, &inbox.name, item, warnings)
+    }
+
+    fn enter_at(
+        &self,
+        inbox: &Inbox,
+        path: &str,
+        item: &mut Item,
+        warnings: &mut Vec<String>,
+    ) -> Result<()> {
         if !Question::of_at(&[inbox], self.now).matches(item) {
             return Ok(());
         }
         self.apply(&inbox.classifier, item, warnings)?;
+        for effect in &inbox.then {
+            self.effect(effect, path, item, warnings)?;
+        }
         for child in &inbox.inbox {
-            self.enter(child, item, warnings)?;
+            self.enter_at(child, &format!("{path}/{}", child.name), item, warnings)?;
         }
         Ok(())
+    }
+
+    /// What an inbox does to an item that enters it. Idempotent: a label
+    /// already there stays, and an item already `sent` is not sent again.
+    fn effect(
+        &self,
+        effect: &str,
+        path: &str,
+        item: &mut Item,
+        warnings: &mut Vec<String>,
+    ) -> Result<()> {
+        let by = By::Inbox(path.to_string());
+        let put = |name: &str, item: &mut Item| -> Result<()> {
+            if item.has(name) || item.denies(name) {
+                return Ok(());
+            }
+            let label = self.stamp(name, by.clone());
+            self.store.note(item.id, Fact::Label(label.clone()))?;
+            item.labels.push(label);
+            Ok(())
+        };
+        match effect.split_once(':').unwrap_or((effect, "")) {
+            ("read", "") => put(READ, item),
+            ("label", name) if !name.is_empty() => put(name, item),
+            ("send", source) if !source.is_empty() => {
+                if item.has(SENT) {
+                    return Ok(());
+                }
+                let draft = Draft {
+                    source_id: source.to_string(),
+                    title: item.title.clone(),
+                    body: item.text_body(),
+                    thread: item.thread.clone(),
+                    reply_to: item.reply_to(),
+                    to: item.to.clone(),
+                    ..Default::default()
+                };
+                match self.send(draft) {
+                    Ok(sent) => {
+                        warnings.extend(sent.warnings);
+                        put(SENT, item)
+                    }
+                    Err(e) => {
+                        warnings.push(format!("{path}: send:{source} #{}: {e:#}", item.id));
+                        Ok(())
+                    }
+                }
+            }
+            _ => {
+                warnings.push(format!("{path}: unknown effect `{effect}`"));
+                Ok(())
+            }
+        }
+    }
+
+    fn stamp(&self, name: &str, by: By) -> Label {
+        Label {
+            name: name.to_string(),
+            by,
+            at: rfc3339(self.now),
+        }
+    }
+
+    /// A hand marks an item read or unread. Unread is remembered: a source
+    /// saying "read" later does not override it.
+    pub fn read(&self, id: i64, read: bool) -> Result<Vec<String>> {
+        let name = READ.to_string();
+        if read {
+            self.label(id, &[name], &[])
+        } else {
+            self.label(id, &[], &[name])
+        }
+    }
+
+    /// The source a draft goes to from inside an inbox chain: the first source
+    /// of the deepest inbox that names any. None means the host's first source.
+    pub fn source_for(&self, chain: &[&Inbox]) -> Option<String> {
+        chain
+            .iter()
+            .rev()
+            .find_map(|ib| ib.sources.first().cloned())
     }
 
     fn apply(

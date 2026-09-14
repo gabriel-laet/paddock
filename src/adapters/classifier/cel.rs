@@ -66,7 +66,7 @@ fn item_value(item: &Item) -> serde_json::Value {
         "start": s(&item.start),
         "end": s(&item.end),
         "thread": s(&item.thread),
-        "read": item.read,
+        "read": item.read(),
         "labels": item.label_names(),
         "parts": item.parts.iter().map(|p| p.kind.as_str()).collect::<Vec<_>>(),
         "from": item.from.as_ref().map(actor).unwrap_or(serde_json::Value::Null),

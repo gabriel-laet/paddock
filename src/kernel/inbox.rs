@@ -46,6 +46,12 @@ pub struct Inbox {
     /// Item must come from ONE of these. Empty means any.
     #[serde(default)]
     pub sources: Vec<String>,
+    /// Item must carry NONE of these. `["read"]` is the unread view.
+    #[serde(default)]
+    pub without: Vec<String>,
+    /// Effects when an item enters: `label:NAME`, `read`, `send:SOURCE`.
+    #[serde(default)]
+    pub then: Vec<String>,
     /// Only items with `start`; listed in `start` order.
     #[serde(default)]
     pub timed: bool,
@@ -233,9 +239,10 @@ pub struct Question {
     pub sources: Option<Vec<String>>,
     /// Item must carry ALL of these.
     pub labels: Vec<String>,
+    /// Item must carry NONE of these.
+    pub without: Vec<String>,
     /// `start` must be set.
     pub timed: bool,
-    pub unread: bool,
     /// RFC3339 cutoff: the item's moment must be >= this.
     pub newer_than: Option<String>,
     /// RFC3339 cutoff: the item's moment must be < this.
@@ -264,6 +271,7 @@ impl Question {
                 });
             }
             q.labels.extend(ib.labels.iter().cloned());
+            q.without.extend(ib.without.iter().cloned());
             q.timed |= ib.timed;
             // Most restrictive wins: latest lower bound, earliest upper bound.
             if let Some(c) = ib
@@ -298,8 +306,8 @@ impl Question {
             Some(s) => s.iter().any(|s| s == &item.source_id),
         };
         let labels_ok = self.labels.iter().all(|l| item.has(l));
+        let without_ok = self.without.iter().all(|l| !item.has(l));
         let timed_ok = !self.timed || item.when() != item.created_at;
-        let read_ok = !self.unread || !item.read;
         let when = parse_when(item.when());
         // No parsable moment: never hide an item behind a window it cannot be placed in.
         let newer_ok = match (&self.newer_than, when) {
@@ -323,7 +331,7 @@ impl Question {
                     .all(|w| hay.contains(&w.to_lowercase()))
             }
         };
-        source_ok && labels_ok && timed_ok && read_ok && newer_ok && older_ok && text_ok
+        source_ok && labels_ok && without_ok && timed_ok && newer_ok && older_ok && text_ok
     }
 }
 

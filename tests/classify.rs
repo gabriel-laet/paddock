@@ -61,7 +61,6 @@ fn regex_classifier_case_insensitive() {
         end: None,
         thread: None,
         created_at: "2026-01-01T00:00:00Z".into(),
-        read: false,
         labels: vec![],
         parts: vec![],
         ..Default::default()
@@ -273,4 +272,240 @@ fn why_says_who_stamped_each_label_and_what_is_denied() {
     assert_eq!(why.denied[0].name, "rfc");
     let why = k.why(&item, &["all".into(), "todo".into()]);
     assert_eq!(why.matched[0].by, By::Classifier("flag-todo".into()));
+}
+
+#[test]
+fn read_is_a_label_and_a_hands_unread_beats_the_source() {
+    let (_tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    let (cfg, store) = load(&paths).unwrap();
+    let k = kernel(&cfg, &store).unwrap();
+    let seen = NewItem {
+        source_id: "incoming".into(),
+        foreign_id: "a".into(),
+        title: "a".into(),
+        body: "x".into(),
+        read: Some(true),
+        ..Default::default()
+    };
+    let id = k.admit(seen.clone()).unwrap().id;
+    let item = store.get(id).unwrap();
+    assert!(item.read(), "the source said read");
+    assert_eq!(item.labels[0].name, READ);
+    assert_eq!(item.labels[0].by, By::Source);
+
+    k.read(id, false).unwrap();
+    assert!(!store.get(id).unwrap().read(), "a hand said unread");
+    k.admit(seen).unwrap();
+    assert!(
+        !store.get(id).unwrap().read(),
+        "the source cannot override a hand"
+    );
+    k.read(id, true).unwrap();
+    assert!(store.get(id).unwrap().read());
+}
+
+#[test]
+fn without_is_the_negative_term_and_unread_is_just_without_read() {
+    let (_tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    fs::write(
+        &paths.config_file,
+        format!(
+            r#"
+[[inbox]]
+name = "all"
+
+[[inbox.inbox]]
+name = "fresh"
+without = ["read", "later"]
+
+[[source]]
+id = "incoming"
+kind = "fs"
+path = "{}"
+"#,
+            paths.incoming_dir.display()
+        ),
+    )
+    .unwrap();
+    let (cfg, store) = load(&paths).unwrap();
+    let k = kernel(&cfg, &store).unwrap();
+    let mut ids = Vec::new();
+    for f in ["a", "b", "c"] {
+        ids.push(
+            k.admit(NewItem {
+                source_id: "incoming".into(),
+                foreign_id: f.into(),
+                title: f.into(),
+                body: "x".into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .id,
+        );
+    }
+    k.read(ids[0], true).unwrap();
+    k.label(ids[1], &["later".into()], &[]).unwrap();
+    let fresh = cfg.chain(&["all", "fresh"]).unwrap();
+    let got: Vec<i64> = k.ask(&fresh).unwrap().iter().map(|i| i.id).collect();
+    assert_eq!(got, vec![ids[2]]);
+    // the in-memory rule agrees with the store
+    let q = k.question(&fresh);
+    for it in store.ask(&Question::default()).unwrap() {
+        assert_eq!(q.matches(&it), it.id == ids[2], "#{}", it.id);
+    }
+    let mut unread = k.question(&cfg.chain(&["all"]).unwrap());
+    unread.without.push(READ.into());
+    assert_eq!(store.count(&unread).unwrap(), 2);
+}
+
+#[test]
+fn an_inbox_effect_sends_once_and_labels_on_enter() {
+    let (tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    let helper = write_exec_helper(tmp.path());
+    fs::write(
+        &paths.config_file,
+        format!(
+            r#"
+[[inbox]]
+name = "all"
+
+[[inbox.inbox]]
+name = "drafts"
+sources = ["incoming"]
+
+[[inbox.inbox.inbox]]
+name = "approved"
+labels = ["approved"]
+then = ["send:plug", "label:done", "read"]
+
+[[source]]
+id = "incoming"
+kind = "fs"
+path = "{}"
+
+[[source]]
+id = "plug"
+kind = "exec"
+cmd = "sh"
+args = ["{}"]
+"#,
+            paths.incoming_dir.display(),
+            helper.display()
+        ),
+    )
+    .unwrap();
+    let (cfg, store) = load(&paths).unwrap();
+    let k = kernel(&cfg, &store).unwrap();
+    let draft = k
+        .admit(NewItem {
+            source_id: "incoming".into(),
+            foreign_id: "d.md".into(),
+            title: "hello".into(),
+            body: "please ship".into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    assert_eq!(
+        store.count(&Question::default()).unwrap(),
+        1,
+        "nothing sent yet"
+    );
+
+    let warnings = k.label(draft, &["approved".into()], &[]).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let it = store.get(draft).unwrap();
+    assert!(it.has(SENT) && it.has("done") && it.read());
+    assert_eq!(
+        it.labels.iter().find(|l| l.name == SENT).unwrap().by,
+        By::Inbox("all/drafts/approved".into())
+    );
+    let sent: Vec<Item> = store
+        .ask(&Question::default())
+        .unwrap()
+        .into_iter()
+        .filter(|i| i.source_id == "plug")
+        .collect();
+    assert_eq!(sent.len(), 1, "the exec source delivered it once");
+    assert_eq!(sent[0].foreign_id, "sent-1");
+    assert_eq!(sent[0].body, "please ship");
+
+    k.classify(draft).unwrap();
+    k.classify(draft).unwrap();
+    let again = store.ask(&Question::default()).unwrap();
+    assert_eq!(
+        again.iter().filter(|i| i.source_id == "plug").count(),
+        1,
+        "sent stays sent"
+    );
+}
+
+#[test]
+fn a_persona_is_an_inbox_with_sources_and_send_in_picks_its_source() {
+    let (_tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    fs::write(
+        &paths.config_file,
+        format!(
+            r#"
+[[inbox]]
+name = "work"
+sources = ["work-mail"]
+
+[[inbox.inbox]]
+name = "todo"
+labels = ["todo"]
+
+[[inbox]]
+name = "personal"
+sources = ["home"]
+
+[[source]]
+id = "home"
+kind = "fs"
+path = "{0}/home"
+
+[[source]]
+id = "work-mail"
+kind = "fs"
+path = "{0}/work"
+"#,
+            paths.incoming_dir.display()
+        ),
+    )
+    .unwrap();
+    let (cfg, store) = load(&paths).unwrap();
+    let k = kernel(&cfg, &store).unwrap();
+    let work_todo = cfg.chain(&["work", "todo"]).unwrap();
+    assert_eq!(k.source_for(&work_todo).as_deref(), Some("work-mail"));
+    assert_eq!(
+        k.source_for(&cfg.chain(&["personal"]).unwrap()).as_deref(),
+        Some("home")
+    );
+    let id = k
+        .send(Draft {
+            source_id: k.source_for(&work_todo).unwrap(),
+            title: "standup".into(),
+            body: "notes".into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    let it = store.get(id).unwrap();
+    assert_eq!(it.source_id, "work-mail");
+    assert!(k
+        .ask(&cfg.chain(&["work"]).unwrap())
+        .unwrap()
+        .iter()
+        .any(|i| i.id == id));
+    assert!(
+        k.ask(&cfg.chain(&["personal"]).unwrap())
+            .unwrap()
+            .is_empty(),
+        "personas do not leak"
+    );
+    assert_eq!(ActorKind::parse("agent"), ActorKind::Agent);
 }

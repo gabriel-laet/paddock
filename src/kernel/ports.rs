@@ -21,7 +21,6 @@ pub struct StaleHint {
 /// Something the kernel learned about an item and wants kept.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Fact {
-    Read(bool),
     /// Put on, by someone, at some time. Clears any denial of the same name.
     Label(Label),
     /// Taken off. By a hand, this leaves a denial behind.

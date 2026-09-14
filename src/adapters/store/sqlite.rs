@@ -13,7 +13,7 @@ use crate::kernel::{
 };
 
 const ITEM_COLS: &str =
-    "id, source_id, foreign_id, title, body, href, start, end, created_at, read, thread, \
+    "id, source_id, foreign_id, title, body, href, start, end, created_at, thread, \
      from_id, from_name, from_kind";
 
 #[derive(Clone)]
@@ -55,7 +55,6 @@ impl Sqlite {
                 end TEXT,
                 thread TEXT,
                 created_at TEXT NOT NULL,
-                read INTEGER NOT NULL DEFAULT 0,
                 from_id TEXT,
                 from_name TEXT,
                 from_kind TEXT,
@@ -146,9 +145,6 @@ impl Store for Sqlite {
                 "UPDATE items SET title = ?1, body = ?2, href = ?3 WHERE id = ?4",
                 params![item.title, body, item.href, id],
             )?;
-            if item.read == Some(true) {
-                tx.execute("UPDATE items SET read = 1 WHERE id = ?1", params![id])?;
-            }
             for (col, val) in [
                 ("thread", &thread),
                 ("start", &item.start),
@@ -185,9 +181,9 @@ impl Store for Sqlite {
         } else {
             tx.execute(
                 "INSERT INTO items
-                    (source_id, foreign_id, title, body, href, start, end, thread, created_at, read,
+                    (source_id, foreign_id, title, body, href, start, end, thread, created_at,
                      from_id, from_name, from_kind)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     item.source_id,
                     item.foreign_id,
@@ -198,7 +194,6 @@ impl Store for Sqlite {
                     item.end,
                     thread,
                     created_at,
-                    item.read.unwrap_or(false),
                     from_id,
                     from_name,
                     from_kind,
@@ -320,12 +315,6 @@ impl Store for Sqlite {
     fn note(&self, id: i64, fact: Fact) -> Result<()> {
         let conn = self.lock()?;
         match fact {
-            Fact::Read(read) => {
-                conn.execute(
-                    "UPDATE items SET read = ?1 WHERE id = ?2",
-                    params![if read { 1 } else { 0 }, id],
-                )?;
-            }
             Fact::Label(label) => {
                 let name = label.name.trim();
                 if name.is_empty() {
@@ -569,9 +558,8 @@ fn row_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
         start: row.get(6)?,
         end: row.get(7)?,
         created_at: row.get(8)?,
-        read: row.get::<_, i64>(9)? != 0,
-        thread: row.get(10)?,
-        from: actor_from_cols(row.get(11)?, row.get(12)?, row.get(13)?),
+        thread: row.get(9)?,
+        from: actor_from_cols(row.get(10)?, row.get(11)?, row.get(12)?),
         ..Default::default()
     })
 }
@@ -714,8 +702,12 @@ fn filter_where(filter: &Question) -> (String, Vec<Value>) {
     if filter.timed {
         clauses.push("start IS NOT NULL AND start != ''".into());
     }
-    if filter.unread {
-        clauses.push("read = 0".into());
+    for label in &filter.without {
+        clauses.push(
+            "NOT EXISTS (SELECT 1 FROM labels WHERE labels.item_id = items.id AND labels.label = ? AND labels.removed = 0)"
+                .into(),
+        );
+        params.push(Value::Text(label.clone()));
     }
     if let Some(cutoff) = &filter.newer_than {
         clauses.push("COALESCE(NULLIF(start, ''), created_at) >= ?".into());

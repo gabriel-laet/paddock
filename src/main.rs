@@ -4,8 +4,7 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use paddock::{
-    init, kernel, load, load_config, Actor, Config, Draft, Fact, Item, Kernel, Paths, Question,
-    Store,
+    init, kernel, load, load_config, Actor, Config, Draft, Item, Kernel, Paths, Question, Store,
 };
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -90,6 +89,9 @@ enum Cmd {
         reply: Option<i64>,
         #[arg(long)]
         to: Vec<String>,
+        /// Send from inside an inbox: its first source (a persona's, say)
+        #[arg(long = "in")]
+        inbox: Option<String>,
         body: Option<String>,
     },
     /// Embed every item that has no vector yet
@@ -196,7 +198,9 @@ fn main() -> Result<()> {
         } => {
             let path = split_path(inbox.as_deref());
             let mut q = k.question(&chain(&config, &path)?);
-            q.unread = unread;
+            if unread {
+                q.without.push(paddock::READ.into());
+            }
             q.text = text;
             q.limit = limit;
             if let Some(like) = like {
@@ -229,11 +233,11 @@ fn main() -> Result<()> {
             emit(id)?;
         }
         Cmd::Read { id } => {
-            store.note(id, Fact::Read(true))?;
+            warn(&k.read(id, true)?);
             emit(id)?;
         }
         Cmd::Unread { id } => {
-            store.note(id, Fact::Read(false))?;
+            warn(&k.read(id, false)?);
             emit(id)?;
         }
         Cmd::Forget { id } => {
@@ -275,8 +279,17 @@ fn main() -> Result<()> {
             source,
             reply,
             to,
+            inbox,
             body,
         } => {
+            let source = match (source, inbox) {
+                (Some(s), _) => Some(s),
+                (None, Some(path)) => {
+                    let path = split_path(Some(&path));
+                    k.source_for(&chain(&config, &path)?)
+                }
+                (None, None) => None,
+            };
             let body = match body {
                 Some(b) => b,
                 None => {
@@ -371,7 +384,7 @@ fn counts(config: &Config, store: &dyn Store, path: &[String]) -> (usize, usize)
     };
     let mut q = Question::of(&chain);
     let total = store.count(&q).unwrap_or(0);
-    q.unread = true;
+    q.without.push(paddock::READ.into());
     let unread = store.count(&q).unwrap_or(0);
     (unread, total)
 }
@@ -389,7 +402,7 @@ fn list(items: &[Item], json: bool) -> Result<()> {
 
 /// One line per item: id, unread mark, date, source, from, title, labels.
 fn line(it: &Item) -> String {
-    let mark = if it.read { " " } else { "*" };
+    let mark = if it.read() { " " } else { "*" };
     let from = it
         .from
         .as_ref()
@@ -460,7 +473,6 @@ fn show(it: &Item) -> Result<()> {
             .unwrap_or_default();
         writeln!(w, "{:<8} {target}{who}{excerpt}", c.kind.as_str())?;
     }
-    writeln!(w, "read     {}", it.read)?;
     let labels: Vec<String> = it.labels.iter().map(label_with_by).collect();
     writeln!(w, "labels   {}", labels.join("  "))?;
     if !it.denied.is_empty() {
@@ -488,7 +500,9 @@ fn show(it: &Item) -> Result<()> {
 fn label_with_by(l: &paddock::Label) -> String {
     match &l.by {
         paddock::By::Hand => format!("{}(hand)", l.name),
+        paddock::By::Source => format!("{}(source)", l.name),
         paddock::By::Classifier(id) => format!("{}({id})", l.name),
+        paddock::By::Inbox(path) => format!("{}({path})", l.name),
     }
 }
 
@@ -517,7 +531,8 @@ fn context(paths: &Paths, k: &Kernel) -> Result<()> {
     writeln!(w, "Classifiers are per-inbox, ordered, kinds regex | script (CEL) | llm. They stamp labels. They are not sources.")?;
     writeln!(w, "Actor kind is person | group | list.")?;
     writeln!(w, "Admit upserts on (source_id, foreign_id). Re-admit refreshes the item and keeps read + labels.")?;
-    writeln!(w, "A label remembers who put it there (hand or classifier). A label a hand removed is denied: no classifier puts it back.\n")?;
+    writeln!(w, "A label remembers who put it there (hand, source, classifier, or an inbox effect). A label a hand removed is denied: nothing but a hand puts it back. Read is the label `read`.")?;
+    writeln!(w, "An inbox may say `without = [...]` (item carries none) and `then = [...]` (effects on enter: label:NAME, read, send:SOURCE).\n")?;
     writeln!(w, "## this host")?;
     writeln!(w, "config   {}", paths.config_file.display())?;
     writeln!(w, "db       {}", paths.db_path.display())?;
@@ -565,7 +580,7 @@ fn context(paths: &Paths, k: &Kernel) -> Result<()> {
         writeln!(w)?;
     }
     writeln!(w, "\n## use")?;
-    writeln!(w, "paddock pull | inboxes | ls [INBOX] [--unread] [--text WORDS] [--like TEXT] | answer QUESTION [--in INBOX] | embed | show ID | thread ID | cited ID | part ID | label ID [+l|-l]... | read ID | unread ID | forget ID | classify ID | why ID [INBOX] | send [--title T] [--reply ID] [--to A]... [BODY]")?;
+    writeln!(w, "paddock pull | inboxes | ls [INBOX] [--unread] [--text WORDS] [--like TEXT] | answer QUESTION [--in INBOX] | embed | show ID | thread ID | cited ID | part ID | label ID [+l|-l]... | read ID | unread ID | forget ID | classify ID | why ID [INBOX] | send [--title T] [--reply ID] [--to A]... [--in INBOX] [BODY]")?;
     writeln!(w, "Add --json to any command for machine output. Edit config.toml, then `paddock pull`. Do not invent nouns.")?;
     Ok(())
 }

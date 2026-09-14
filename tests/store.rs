@@ -263,7 +263,7 @@ fn readmit_updates_item_keeps_labels_and_read() {
         .unwrap()
         .id;
     store.note(id, Fact::Label(Label::hand("keep"))).unwrap();
-    store.note(id, Fact::Read(true)).unwrap();
+    k.read(id, true).unwrap();
     let id2 = k
         .admit(NewItem {
             source_id: "incoming".into(),
@@ -297,7 +297,7 @@ fn readmit_updates_item_keeps_labels_and_read() {
     assert_eq!(item.from.as_ref().map(|a| a.id.as_str()), Some("ann@x"));
     assert_eq!(item.to.len(), 1);
     assert_eq!(item.to[0].id, "eng");
-    assert!(item.read);
+    assert!(item.read());
     assert!(item.has("keep"));
     assert!(item.has("todo"));
 }

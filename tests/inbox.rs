@@ -23,7 +23,6 @@ fn inbox_match_empty_is_everything() {
         end: None,
         thread: None,
         created_at: "2026-01-01T00:00:00Z".into(),
-        read: false,
         labels: vec![],
         parts: vec![],
         ..Default::default()
@@ -45,7 +44,6 @@ fn newer_than_and_older_than_partition_by_effective_date() {
         end: None,
         thread: None,
         created_at: now.to_rfc3339(),
-        read: false,
         labels: vec![],
         parts: vec![],
         ..Default::default()
@@ -97,7 +95,6 @@ fn child_requires_all_listed_labels() {
         end: None,
         thread: None,
         created_at: "2026-01-01T00:00:00Z".into(),
-        read: false,
         labels: vec![],
         parts: vec![],
         ..Default::default()
@@ -128,7 +125,6 @@ fn source_filter_and_label_and() {
         end: None,
         thread: None,
         created_at: "2026-01-01T00:00:00Z".into(),
-        read: false,
         labels: vec![Label::hand("x"), Label::hand("y")],
         parts: vec![],
         ..Default::default()
@@ -158,7 +154,6 @@ fn timed_inbox_requires_start() {
         end: None,
         thread: None,
         created_at: "2026-01-01T00:00:00Z".into(),
-        read: false,
         labels: vec![],
         parts: vec![],
         ..Default::default()

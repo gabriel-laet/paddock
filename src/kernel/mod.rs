@@ -16,6 +16,7 @@ pub use inbox::{
 };
 pub use item::{
     Actor, ActorKind, By, Cite, CiteKind, Draft, Item, Label, NewItem, NewPart, Part, PartKind,
+    READ, SENT,
 };
 pub use ports::{Brief, Classifier, Embedder, Fact, Model, Source, StaleHint, Store};
 pub use verbs::{reply_title, Admitted, Answer, Kernel, Report, Why};

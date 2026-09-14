@@ -20,15 +20,17 @@ src/main.rs               the CLI
 - **item** — one thing that arrived, stripped of its source's shape
 - **source** — a program that admits items (and may send)
 - **label** — a mark a classifier or a hand put on an item; it remembers which, and a hand outranks a classifier
-- **inbox** — a named question over the pile (sources + labels + time + words), not an account and not a folder
+- **inbox** — a named question over the pile (sources, labels, `without`, time, words), not an account and not a folder; it may do something to what enters it
 
 Items may have parts (text, file, image, audio, video) and an optional thread. `body` is the preview; the full text is the first text part. Part bytes live in the store, not on disk beside it.
 
 Actors and cites are kernel: an item can have `from` / `to` (a person, a group, or a list) and `cites`. A cite is one shape for a reply, a forward, a quote, a mention, or an attachment: it names an item by its source's id (resolved to ours when that item is here, early or late) or something outside the pile by `href`, with an optional excerpt and actor. A thread is the source's key when it has one, else whatever replies and forwards join.
 
-A label a hand removed stays denied: no classifier puts it back until a hand does. `why` shows who stamped each label and what is denied.
+A label a hand removed stays denied: no classifier, source, or effect puts it back until a hand does. `why` shows who stamped each label and what is denied. Read is the label `read`, so "unread" is `without = ["read"]`, and a hand's unread beats a source's read.
 
-Inboxes nest. A child is a tighter question over its parent's matched items. Classifiers are owned by an inbox; they run when an item enters that inbox, then children re-evaluate. A label change re-runs classify (classify-on-enter) so a newly matching child can fire. `all/todo` is the todo list: same machinery, no extra feature.
+Inboxes nest. A child is a tighter question over its parent's matched items. Classifiers are owned by an inbox; they run when an item enters that inbox, then the inbox's `then` effects run, then children re-evaluate. A label change re-runs classify (classify-on-enter) so a newly matching child can fire. `all/todo` is the todo list: same machinery, no extra feature.
+
+Personas are top-level inboxes with `sources`: `work/` and `personal/` see only their own sources, nest their own questions, and `send --in work` sends from the first of work's sources. An actor may be a `person`, `group`, `list`, or `agent`.
 
 ## install
 
@@ -52,7 +54,7 @@ paddock read ID | unread ID
 paddock forget ID                  # delete
 paddock classify ID                # re-run classifiers
 paddock why ID [INBOX]             # the chain's labels it carries, who stamped each, what a hand denied
-paddock send [--title T] [--reply ID] [--to A]... [--source S] [BODY]   # body from arg or stdin
+paddock send [--title T] [--reply ID] [--to A]... [--source S | --in INBOX] [BODY]   # body from arg or stdin
 paddock answer QUESTION [--in INBOX]   # the model answers from the items and cites them
 paddock embed                      # embed items that have no vector yet
 paddock context                    # dump this host for an agent
@@ -102,13 +104,32 @@ timed = true                    # only items with start; listed in start order
 name = "recent"
 newer_than = "7d"               # by start, else created_at
 
+[[inbox.inbox]]
+name = "unread"
+without = ["read", "later"]     # carries none of these
+
 [[source]]
 id = "incoming"
 kind = "fs"
 path = "~/.local/share/paddock/incoming"
 ```
 
-An item matches an inbox when `(sources empty OR item.source in sources)` and `(labels empty OR item has ALL listed labels)` and (`timed` unset OR the item has `start`) and the age bounds hold, and it matches every ancestor. `keep` labels survive stale cleanup. Lists are queried in SQL, not loaded whole.
+### effects
+
+`then` names what an inbox does to an item that enters it: `label:NAME`, `read`, or `send:SOURCE`. Effects are idempotent, and `send:` stamps `sent` so nothing goes out twice. That is the whole approval flow: an agent drafts into a source, a hand adds `approved`, the inbox sends.
+
+```toml
+[[inbox]]
+name = "drafts"
+sources = ["drafts"]            # where an agent writes on your behalf
+
+[[inbox.inbox]]
+name = "approved"
+labels = ["approved"]           # a hand adds this
+then = ["send:mail", "label:done", "read"]
+```
+
+An item matches an inbox when `(sources empty OR item.source in sources)` and `(labels empty OR item has ALL listed labels)` and `(item has NONE of without)` and (`timed` unset OR the item has `start`) and the age bounds hold, and it matches every ancestor. `keep` labels survive stale cleanup. Lists are queried in SQL, not loaded whole.
 
 ### sources
 
