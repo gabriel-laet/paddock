@@ -253,3 +253,88 @@ fn items_in_chain_cal_still_only_timed() {
     );
     assert_eq!(store.count(&Question::default()).unwrap(), 2);
 }
+
+#[test]
+fn from_and_to_ask_by_actor_and_a_child_can_only_narrow() {
+    let (_tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    fs::write(
+        &paths.config_file,
+        format!(
+            r#"
+[[inbox]]
+name = "all"
+
+[[inbox.inbox]]
+name = "family"
+to = ["fam@g.us"]
+
+[[inbox.inbox.inbox]]
+name = "ana"
+from = ["ana", "bo"]
+
+[[inbox.inbox.inbox.inbox]]
+name = "only-ana"
+from = ["ana", "cy"]
+
+[[source]]
+id = "chat"
+kind = "fs"
+path = "{}"
+"#,
+            paths.incoming_dir.display()
+        ),
+    )
+    .unwrap();
+    let (cfg, store) = load(&paths).unwrap();
+    let k = kernel(&cfg, &store).unwrap();
+    let say = |id: &str, from: &str, to: &str| {
+        k.admit(NewItem {
+            source_id: "chat".into(),
+            foreign_id: id.into(),
+            title: id.into(),
+            body: "x".into(),
+            from: Some(Actor {
+                id: from.into(),
+                ..Default::default()
+            }),
+            to: vec![Actor {
+                id: to.into(),
+                kind: ActorKind::Group,
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .unwrap()
+        .id
+    };
+    let ana_fam = say("1", "ana", "fam@g.us");
+    let bo_fam = say("2", "bo", "fam@g.us");
+    let ana_work = say("3", "ana", "work@g.us");
+    let ids = |path: &[&str]| -> Vec<i64> {
+        let chain = cfg.chain(path).unwrap();
+        let got: Vec<i64> = k.ask(&chain).unwrap().iter().map(|i| i.id).collect();
+        // the in-memory rule agrees with the store on every item
+        let q = k.question(&chain);
+        for it in store.ask(&Question::default()).unwrap() {
+            assert_eq!(
+                q.matches(&it),
+                got.contains(&it.id),
+                "{path:?} on #{}",
+                it.id
+            );
+        }
+        got
+    };
+    assert_eq!(ids(&["all", "family"]), vec![bo_fam, ana_fam]);
+    assert_eq!(ids(&["all", "family", "ana"]), vec![bo_fam, ana_fam]);
+    assert_eq!(
+        ids(&["all", "family", "ana", "only-ana"]),
+        vec![ana_fam],
+        "intersection: ana, not cy"
+    );
+    let mut from_ana = k.question(&cfg.chain(&["all"]).unwrap());
+    from_ana.from = Some(vec!["ana".into()]);
+    let got: Vec<i64> = store.ask(&from_ana).unwrap().iter().map(|i| i.id).collect();
+    assert_eq!(got, vec![ana_work, ana_fam]);
+}

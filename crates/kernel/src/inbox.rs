@@ -46,6 +46,13 @@ pub struct Inbox {
     /// Item must come from ONE of these. Empty means any.
     #[serde(default)]
     pub sources: Vec<String>,
+    /// Item's `from` actor must be ONE of these ids. Empty means any.
+    #[serde(default)]
+    pub from: Vec<String>,
+    /// Item must be addressed to ONE of these actor ids (a person, a group,
+    /// a list). Empty means any.
+    #[serde(default)]
+    pub to: Vec<String>,
     /// Item must carry NONE of these. `["read"]` is the unread view.
     #[serde(default)]
     pub without: Vec<String>,
@@ -237,6 +244,10 @@ fn chain<'a>(inboxes: &'a [Inbox], path: &[&str]) -> Option<Vec<&'a Inbox>> {
 pub struct Question {
     /// None = any source; Some(empty) = no source, so nothing.
     pub sources: Option<Vec<String>>,
+    /// None = anyone; Some(ids) = the `from` actor is one of them.
+    pub from: Option<Vec<String>>,
+    /// None = anyone; Some(ids) = a `to` actor is one of them.
+    pub to: Option<Vec<String>>,
     /// Item must carry ALL of these.
     pub labels: Vec<String>,
     /// Item must carry NONE of these.
@@ -264,12 +275,9 @@ impl Question {
     pub fn of_at(chain: &[&Inbox], now: chrono::DateTime<chrono::Utc>) -> Self {
         let mut q = Question::default();
         for ib in chain {
-            if !ib.sources.is_empty() {
-                q.sources = Some(match q.sources.take() {
-                    None => ib.sources.clone(),
-                    Some(had) => had.into_iter().filter(|s| ib.sources.contains(s)).collect(),
-                });
-            }
+            q.sources = narrow(q.sources.take(), &ib.sources);
+            q.from = narrow(q.from.take(), &ib.from);
+            q.to = narrow(q.to.take(), &ib.to);
             q.labels.extend(ib.labels.iter().cloned());
             q.without.extend(ib.without.iter().cloned());
             q.timed |= ib.timed;
@@ -301,9 +309,21 @@ impl Question {
     }
 
     pub fn matches(&self, item: &Item) -> bool {
-        let source_ok = match &self.sources {
+        let one_of = |list: &Option<Vec<String>>, id: &str| match list {
             None => true,
-            Some(s) => s.iter().any(|s| s == &item.source_id),
+            Some(ids) => ids.iter().any(|x| x == id),
+        };
+        let source_ok = one_of(&self.sources, &item.source_id);
+        let from_ok = match &self.from {
+            None => true,
+            Some(_) => item
+                .from
+                .as_ref()
+                .is_some_and(|a| one_of(&self.from, &a.id)),
+        };
+        let to_ok = match &self.to {
+            None => true,
+            Some(_) => item.to.iter().any(|a| one_of(&self.to, &a.id)),
         };
         let labels_ok = self.labels.iter().all(|l| item.has(l));
         let without_ok = self.without.iter().all(|l| !item.has(l));
@@ -331,8 +351,27 @@ impl Question {
                     .all(|w| hay.contains(&w.to_lowercase()))
             }
         };
-        source_ok && labels_ok && without_ok && timed_ok && newer_ok && older_ok && text_ok
+        source_ok
+            && from_ok
+            && to_ok
+            && labels_ok
+            && without_ok
+            && timed_ok
+            && newer_ok
+            && older_ok
+            && text_ok
     }
+}
+
+/// A child can only narrow: the intersection when both name ids.
+fn narrow(had: Option<Vec<String>>, ids: &[String]) -> Option<Vec<String>> {
+    if ids.is_empty() {
+        return had;
+    }
+    Some(match had {
+        None => ids.to_vec(),
+        Some(had) => had.into_iter().filter(|s| ids.contains(s)).collect(),
+    })
 }
 
 fn later(had: Option<String>, c: chrono::DateTime<chrono::Utc>) -> String {

@@ -55,6 +55,12 @@ enum Cmd {
         /// At most this many
         #[arg(long)]
         limit: Option<usize>,
+        /// Only items from this actor id
+        #[arg(long)]
+        from: Vec<String>,
+        /// Only items addressed to this actor id (a person, a group, a list)
+        #[arg(long)]
+        to: Vec<String>,
     },
     /// One item in full
     Show { id: i64 },
@@ -215,6 +221,8 @@ fn main() -> Result<()> {
             text,
             like,
             limit,
+            from,
+            to,
         } => {
             let path = split_path(inbox.as_deref());
             let mut q = k.question(&chain(&config, &path)?);
@@ -223,6 +231,12 @@ fn main() -> Result<()> {
             }
             q.text = text;
             q.limit = limit;
+            if !from.is_empty() {
+                q.from = Some(from);
+            }
+            if !to.is_empty() {
+                q.to = Some(to);
+            }
             if let Some(like) = like {
                 q.near = Some(k.near(&like)?);
             }
@@ -547,7 +561,7 @@ fn context(paths: &Paths, k: &Kernel) -> Result<()> {
     writeln!(w, "An item is source-shaped data stripped: foreign_id, title, body, href, start, end, thread, parts, from, to[], cites.")?;
     writeln!(w, "A cite is {{kind: reply|forward|quote|mention|attach, foreign_id or href, excerpt?, actor?}}; it resolves to an id when the cited item is here, early or late.")?;
     writeln!(w, "A source admits items and may send. kinds: fs, rss, exec. rss cannot send. exec runs `{{cmd}} {{args}} pull|send`.")?;
-    writeln!(w, "Inboxes nest. A child is a tighter question over the parent. Match: sources AND labels (all) AND timed (start set) AND age.")?;
+    writeln!(w, "Inboxes nest. A child is a tighter question over the parent. Match: sources AND from AND to AND labels (all) AND without (none) AND timed (start set) AND age.")?;
     writeln!(w, "Classifiers are per-inbox, ordered, kinds regex | script (CEL) | llm. They stamp labels. They are not sources.")?;
     writeln!(w, "Actor kind is person | group | list.")?;
     writeln!(w, "Admit upserts on (source_id, foreign_id). Re-admit refreshes the item and keeps read + labels.")?;
@@ -600,7 +614,7 @@ fn context(paths: &Paths, k: &Kernel) -> Result<()> {
         writeln!(w)?;
     }
     writeln!(w, "\n## use")?;
-    writeln!(w, "paddock pull | inboxes | ls [INBOX] [--unread] [--text WORDS] [--like TEXT] | answer QUESTION [--in INBOX] | embed | show ID | thread ID | cited ID | part ID | label ID [+l|-l]... | read ID | unread ID | forget ID | classify ID | why ID [INBOX] | send [--title T] [--reply ID] [--to A]... [--in INBOX] [BODY]")?;
+    writeln!(w, "paddock pull | inboxes | ls [INBOX] [--unread] [--from ID] [--to ID] [--text WORDS] [--like TEXT] | answer QUESTION [--in INBOX] | embed | show ID | thread ID | cited ID | part ID | label ID [+l|-l]... | read ID | unread ID | forget ID | classify ID | why ID [INBOX] | send [--title T] [--reply ID] [--to A]... [--in INBOX] [BODY]")?;
     writeln!(w, "Add --json to any command for machine output. Edit config.toml, then `paddock pull`. Do not invent nouns.")?;
     Ok(())
 }

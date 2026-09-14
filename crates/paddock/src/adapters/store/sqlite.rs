@@ -668,19 +668,33 @@ fn row_part(row: &rusqlite::Row<'_>) -> rusqlite::Result<Part> {
 fn filter_where(filter: &Question) -> (String, Vec<Value>) {
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<Value> = Vec::new();
-    match &filter.sources {
-        None => {}
-        Some(srcs) if srcs.is_empty() => {
-            clauses.push("1 = 0".into());
-        }
-        Some(srcs) => {
-            let marks: Vec<&str> = srcs.iter().map(|_| "?").collect();
-            clauses.push(format!("source_id IN ({})", marks.join(", ")));
-            for s in srcs {
-                params.push(Value::Text(s.clone()));
+    let one_of = |clauses: &mut Vec<String>,
+                  params: &mut Vec<Value>,
+                  col_sql: &str,
+                  ids: &Option<Vec<String>>| {
+        match ids {
+            None => {}
+            Some(ids) if ids.is_empty() => clauses.push("1 = 0".into()),
+            Some(ids) => {
+                let marks: Vec<&str> = ids.iter().map(|_| "?").collect();
+                clauses.push(col_sql.replace("{IN}", &marks.join(", ")));
+                params.extend(ids.iter().map(|s| Value::Text(s.clone())));
             }
         }
-    }
+    };
+    one_of(
+        &mut clauses,
+        &mut params,
+        "source_id IN ({IN})",
+        &filter.sources,
+    );
+    one_of(&mut clauses, &mut params, "from_id IN ({IN})", &filter.from);
+    one_of(
+        &mut clauses,
+        &mut params,
+        "EXISTS (SELECT 1 FROM item_to WHERE item_to.item_id = items.id AND item_to.actor_id IN ({IN}))",
+        &filter.to,
+    );
     for label in &filter.labels {
         clauses.push(
             "EXISTS (SELECT 1 FROM labels WHERE labels.item_id = items.id AND labels.label = ? AND labels.removed = 0)"
