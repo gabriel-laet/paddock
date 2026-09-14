@@ -5,10 +5,9 @@ use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::llm::LlmClassifier;
-use super::script::CelClassifier;
-use super::sources::{Exec, Fs, Rss};
-use super::sqlite::Sqlite;
+use super::classifier::{CelClassifier, ExecClassifier, HttpClassifier, LlmClassifier};
+use super::source::{Exec, Fs, Rss};
+use super::store::Sqlite;
 use crate::kernel::{
     Adapters, Classifier, ClassifierSpec, Config, Kernel, Source, SourceSpec, Store,
 };
@@ -143,7 +142,7 @@ pub fn kernel<'a>(config: &'a Config, store: &'a dyn Store) -> Kernel<'a> {
     Kernel::new(config, store, &STD)
 }
 
-/// fs, rss, and exec sources; the script (CEL) and llm classifiers.
+/// fs, rss, and exec sources; script, exec, http, and llm classifiers.
 pub struct Std;
 
 pub static STD: Std = Std;
@@ -183,11 +182,23 @@ impl Adapters for Std {
     }
 
     fn classifier(&self, spec: &ClassifierSpec) -> Result<Box<dyn Classifier>> {
-        match spec.kind.as_str() {
-            "script" => Ok(Box::new(CelClassifier::new(spec)?)),
-            "llm" => Ok(Box::new(LlmClassifier::new(spec))),
-            other => bail!("unknown classifier kind `{other}` (regex, script, llm)"),
-        }
+        let need = |field: Option<&str>, what: &str| {
+            field
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("classifier {} {} needs {what}", spec.id, spec.kind))
+        };
+        Ok(match spec.kind.as_str() {
+            "script" => Box::new(CelClassifier::new(spec)?),
+            "exec" => {
+                let cmd = expand_path(&need(spec.cmd.as_deref(), "cmd")?);
+                Box::new(ExecClassifier::new(spec, cmd.display().to_string()))
+            }
+            "http" => Box::new(HttpClassifier::new(spec, need(spec.url.as_deref(), "url")?)),
+            "llm" => Box::new(LlmClassifier::new(spec)),
+            other => bail!("unknown classifier kind `{other}` (regex, script, exec, http, llm)"),
+        })
     }
 }
 

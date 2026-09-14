@@ -5,9 +5,12 @@ An inbox kernel with a CLI. No UI. Meant to be driven by hand, by scripts, and b
 The kernel is pure: four nouns, the questions inboxes ask, and the verbs. Everything that touches the world (SQLite, files, feeds, programs, chat models, the TOML config) is an adapter behind a port.
 
 ```
-src/kernel/     item, inbox + question, classify (regex), verbs, ports
-src/adapters/   sqlite, sources (fs, rss, exec), script (CEL), llm, host (paths, toml)
-src/main.rs     the CLI
+src/kernel/               item, inbox + question, classify (regex), verbs, ports
+src/adapters/store/       where items live: sqlite
+src/adapters/source/      where items come from: fs, rss, exec
+src/adapters/classifier/  what stamps labels: script (CEL), exec, http, llm
+src/adapters/host.rs      the machine: paths, the TOML config, the wiring
+src/main.rs               the CLI
 ```
 
 ## nouns
@@ -112,18 +115,31 @@ path = "~/.local/share/paddock/incoming"
 # script = 'item.title.contains("invoice") ? "money" : ""'
 
 # [[inbox.classifier]]
+# id = "by-program"
+# kind = "exec"                 # item as JSON on stdin; label on stdout (or {"label": ...})
+# cmd = "~/bin/label-it"
+# once = true                   # remember the verdict per item
+
+# [[inbox.classifier]]
+# id = "by-service"
+# kind = "http"                 # POST item as JSON; body is the label
+# url = "http://127.0.0.1:8080/label"
+
+# [[inbox.classifier]]
 # id = "by-llm"
-# kind = "llm"                  # Ollama /api/chat or OpenAI-compatible /chat/completions
-# model = "llama3.2"
+# kind = "llm"                  # prompt from the item, one token back; always once
+# cmd = "claude"                # over a CLI: prompt on stdin, reply on stdout
+# args = ["-p"]
 # labels = ["later", "todo"]    # allow-list; the model picks one or NONE
 # # prompt = "prefer later unless it is actionable"
+# # or over http: provider = "ollama" | "openai", url, model
 ```
 
 An item matches an inbox when `(sources empty OR item.source in sources)` and `(labels empty OR item has ALL listed labels)` and (`timed` unset OR the item has `start`) and the age bounds hold, and it matches every ancestor. `keep` labels survive stale cleanup. Lists are queried in SQL, not loaded whole.
 
 A script sees `item.title`, `body`, `source`, `href`, `start`, `end`, `thread`, `read`, `labels`, `parts` (kinds), `from`, `to`. Absent strings are `""`. CEL cannot loop or do IO.
 
-LLM classifiers run on `pull`, once per item (the result is cached). Env: `PADDOCK_LLM_URL`, `PADDOCK_LLM_MODEL`, `PADDOCK_LLM_KEY` or `OPENAI_API_KEY`. Do not put keys in the config.
+Classifier kinds: `regex` (kernel), `script` (CEL), `exec` (any program), `http` (any URL), `llm` (a prompt over exec or http). A label reply is its first token; `NONE` or nothing means no label; a JSON reply may say `{"label": "..."}`. `once = true` remembers the verdict per item so a slow classifier runs on `pull` only once; `llm` is always once. Env: `PADDOCK_LLM_URL`, `PADDOCK_LLM_MODEL`, `PADDOCK_LLM_KEY` or `OPENAI_API_KEY`, `PADDOCK_HTTP_KEY`. Do not put keys in the config.
 
 ## exec sources
 

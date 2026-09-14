@@ -74,6 +74,14 @@ pub struct ClassifierSpec {
     /// Allow-list: the classifier must pick one of these or nothing.
     #[serde(default)]
     pub labels: Vec<String>,
+    /// Program for kind = "exec", or the CLI an "llm" talks to.
+    #[serde(default)]
+    pub cmd: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Run once per item and remember the verdict. llm always does.
+    #[serde(default)]
+    pub once: bool,
 }
 
 /// A source as declared. `kind` picks the adapter.
