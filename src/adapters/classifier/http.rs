@@ -6,7 +6,7 @@
 //! id = "by-service"
 //! kind = "http"
 //! url = "http://127.0.0.1:8080/label"
-//! key = "..."            # bearer token, optional
+//! key = "..."            # bearer token, optional; or key_cmd = "pass show svc"
 //! once = true
 //! ```
 
@@ -14,7 +14,7 @@ use anyhow::Result;
 
 use super::label_of;
 use crate::adapters::transport::post;
-use crate::kernel::{setting, Classifier, ClassifierSpec, Item};
+use crate::kernel::{Classifier, ClassifierSpec, Item};
 
 pub struct HttpClassifier {
     id: String,
@@ -24,11 +24,11 @@ pub struct HttpClassifier {
 }
 
 impl HttpClassifier {
-    pub fn new(spec: &ClassifierSpec, url: String) -> Self {
+    pub fn new(spec: &ClassifierSpec, url: String, key: Option<String>) -> Self {
         Self {
             id: spec.id.clone(),
             url,
-            key: setting(&spec.settings, "key"),
+            key,
             once: spec.once,
         }
     }

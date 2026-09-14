@@ -22,7 +22,7 @@ src/main.rs               the CLI
 - **label** — a mark a classifier or a hand put on an item
 - **inbox** — a named question over the pile (sources + labels + time + words), not an account and not a folder
 
-Items may have parts (text, file, image, audio, video) and an optional thread. `body` is the preview; the full text is the first text part.
+Items may have parts (text, file, image, audio, video) and an optional thread. `body` is the preview; the full text is the first text part. Part bytes live in the store, not on disk beside it.
 
 Actors and cites are kernel: an item can have `from` / `to` (a person, a group, or a list) and may cite another item. A reply cites an item (`in_reply_to` + thread).
 
@@ -43,6 +43,7 @@ paddock inboxes                    # tree with unread/total
 paddock ls [INBOX] [--unread] [--text WORDS] [--like TEXT] [--limit N]
 paddock show ID                    # one item in full
 paddock thread ID                  # every item in the same thread
+paddock part ID > file             # the bytes of a non-text part
 paddock label ID [+l|-l]...        # add / remove labels, then reclassify
 paddock read ID | unread ID
 paddock forget ID                  # delete
@@ -66,7 +67,7 @@ Drop a file in the incoming directory, then `paddock pull`.
 | store | `~/.local/share/paddock/paddock.db` | `$root/paddock.db` |
 | incoming | `~/.local/share/paddock/incoming` | `$root/incoming` |
 
-Resolution: `PADDOCK_DIR`, else walk up from cwd for a `.paddock/` directory, else XDG. `init --here` creates `./.paddock`. Several `[[source]]` blocks share one store. Existing configs are not rewritten by `init`. That is the only environment variable paddock reads; keys and endpoints live in the config next to what uses them.
+Resolution: `PADDOCK_DIR`, else walk up from cwd for a `.paddock/` directory, else XDG. `init --here` creates `./.paddock`. Several `[[source]]` blocks share one store. Existing configs are not rewritten by `init`. That is the only environment variable paddock reads; keys and endpoints live in the config next to what uses them, or come from a command (below).
 
 ## config
 
@@ -179,6 +180,31 @@ label = "urgent"                # with a single label the model answers yes or n
 A script sees `item.title`, `body`, `source`, `href`, `start`, `end`, `thread`, `read`, `labels`, `parts` (kinds), `from`, `to`. Absent strings are `""`. CEL cannot loop or do IO.
 
 A label reply is its first token; `NONE` or nothing means no label; a JSON reply may say `{"label": "..."}`. A classifier that fails (a program that exits non-zero, a service that is down) is a warning, not a verdict, and is tried again next time.
+
+### secrets
+
+Any `key` can instead be `key_cmd`: a shell command whose stdout is the secret, so the config file never holds it.
+
+```toml
+[store]
+key_cmd = "pass show paddock"   # or: key = "..."
+
+[[inbox.classifier]]
+id = "by-service"
+kind = "http"
+url = "https://example.com/label"
+key_cmd = "security find-generic-password -s example -w"
+```
+
+### store
+
+Where items live. Missing means sqlite, unencrypted. With a `key` (or `key_cmd`) the file is encrypted with SQLCipher, part bytes included, since parts live inside the store. A plaintext store opened with a key fails with "wrong key, or not an encrypted store"; an encrypted one opened without fails with "not a store, or it is encrypted". Set the key on a fresh store. There is no in-place migration yet.
+
+```toml
+[store]
+kind = "sqlite"
+key_cmd = "pass show paddock"
+```
 
 ### embedder and model
 

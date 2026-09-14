@@ -70,7 +70,8 @@ pub struct Actor {
     pub kind: ActorKind,
 }
 
-/// One piece of an item's content. Text is inline; anything else is a path the store owns.
+/// One piece of an item's content. Text is inline; anything else is bytes
+/// the store keeps, `size` long, read back with `Store::blob`.
 #[derive(Debug, Clone, Serialize)]
 pub struct Part {
     pub id: i64,
@@ -78,7 +79,7 @@ pub struct Part {
     pub kind: PartKind,
     pub mime: String,
     pub text: Option<String>,
-    pub path: Option<String>,
+    pub size: Option<i64>,
 }
 
 /// A part on its way in: inline text, inline bytes, or a file to copy from.

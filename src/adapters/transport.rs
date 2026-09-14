@@ -18,7 +18,11 @@ pub(crate) fn run(cmd: &str, args: &[String], stdin: &[u8]) -> Result<String> {
         .spawn()
         .with_context(|| format!("cannot run `{cmd}`"))?;
     if let Some(mut pipe) = child.stdin.take() {
-        pipe.write_all(stdin)?;
+        // A program may exit without reading its input; that is its business.
+        match pipe.write_all(stdin) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            other => other?,
+        }
     }
     let out = child.wait_with_output()?;
     if !out.status.success() {
@@ -59,6 +63,24 @@ pub(crate) fn post_json(
     serde_json::from_str(&text).with_context(|| format!("{url}: reply is not JSON"))
 }
 
+/// A secret from the settings: `NAME` inline, or `NAME_cmd`, a command whose
+/// stdout is the secret, so the config file never holds it.
+pub(crate) fn secret(settings: &crate::kernel::Settings, name: &str) -> Result<Option<String>> {
+    if let Some(v) = crate::kernel::setting(settings, name) {
+        return Ok(Some(v));
+    }
+    let Some(cmd) = crate::kernel::setting(settings, &format!("{name}_cmd")) else {
+        return Ok(None);
+    };
+    let out = run("sh", &["-c".to_string(), cmd.clone()], b"")
+        .with_context(|| format!("{name}_cmd `{cmd}`"))?;
+    let out = out.trim();
+    if out.is_empty() {
+        bail!("{name}_cmd `{cmd}` printed nothing");
+    }
+    Ok(Some(out.to_string()))
+}
+
 pub(crate) fn join(base: &str, path: &str) -> String {
     format!(
         "{}/{}",
@@ -70,6 +92,24 @@ pub(crate) fn join(base: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_is_inline_or_from_a_command() {
+        let inline: crate::kernel::Settings = [("key".to_string(), serde_json::json!("k1"))]
+            .into_iter()
+            .collect();
+        assert_eq!(secret(&inline, "key").unwrap(), Some("k1".into()));
+        let cmd: crate::kernel::Settings =
+            [("key_cmd".to_string(), serde_json::json!("printf '  k2\n'"))]
+                .into_iter()
+                .collect();
+        assert_eq!(secret(&cmd, "key").unwrap(), Some("k2".into()));
+        let empty: crate::kernel::Settings = [("key_cmd".to_string(), serde_json::json!("true"))]
+            .into_iter()
+            .collect();
+        assert!(secret(&empty, "key").is_err());
+        assert_eq!(secret(&Default::default(), "key").unwrap(), None);
+    }
 
     #[test]
     fn run_pipes_stdin_and_fails_loudly() {

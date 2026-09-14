@@ -135,7 +135,7 @@ mod tests {
                 kind: PartKind::Text,
                 mime: "text/plain".into(),
                 text: Some("a".into()),
-                path: None,
+                size: None,
             },
             Part {
                 id: 2,
@@ -143,7 +143,7 @@ mod tests {
                 kind: PartKind::Image,
                 mime: "image/png".into(),
                 text: None,
-                path: Some("parts/1-1.png".into()),
+                size: Some(3),
             },
         ];
         assert_eq!(

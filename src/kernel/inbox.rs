@@ -28,10 +28,13 @@ pub struct Config {
     pub forget_after: Option<String>,
     /// Text to vector, for `near` questions. Items are embedded on admit.
     #[serde(default)]
-    pub embedder: Option<ModelSpec>,
+    pub embedder: Option<AdapterSpec>,
     /// The chat model `answer` talks to.
     #[serde(default)]
-    pub model: Option<ModelSpec>,
+    pub model: Option<AdapterSpec>,
+    /// Where items live. Missing means sqlite, unencrypted.
+    #[serde(default)]
+    pub store: Option<AdapterSpec>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -105,9 +108,9 @@ pub struct ClassifierSpec {
     pub settings: Settings,
 }
 
-/// A model or embedder as declared. `kind` picks the adapter.
+/// A store, model, or embedder as declared. `kind` picks the adapter.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct ModelSpec {
+pub struct AdapterSpec {
     #[serde(default)]
     pub kind: String,
     #[serde(flatten)]

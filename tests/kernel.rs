@@ -152,7 +152,7 @@ fn items_match_chain(chain: &[&Inbox], item: &Item) -> bool {
 fn unique_on_source_and_foreign_id() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let n = NewItem {
         source_id: "incoming".into(),
         foreign_id: "note.md".into(),
@@ -177,7 +177,7 @@ fn unique_on_source_and_foreign_id() {
 fn llm_classified_marks_and_persists() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let id = store
         .upsert(&NewItem {
             source_id: "incoming".into(),
@@ -245,7 +245,7 @@ fn regex_classifier_case_insensitive() {
 fn classify_todo_regex_enters_todo_inbox() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let id = store
         .upsert(&NewItem {
             source_id: "incoming".into(),
@@ -300,7 +300,7 @@ path = "/tmp"
     )
     .unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let id = store
         .upsert(&NewItem {
@@ -340,7 +340,7 @@ fn admit_file_reclassifies_on_update() {
     let p = paths.incoming_dir.join("note.md");
     fs::write(&p, "hello").unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let id = k.admit(item_from_file("incoming", &p).unwrap()).unwrap().id;
     assert!(!store.get(id).unwrap().labels.contains(&"todo".into()));
@@ -360,7 +360,7 @@ fn fs_pull_and_chain_query() {
     fs::write(paths.incoming_dir.join("subdir").join("nested.md"), "no").unwrap();
 
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let n = k.pull().unwrap().count;
     assert_eq!(n, 1);
@@ -383,7 +383,7 @@ fn admit_file_classifies() {
     let p = paths.incoming_dir.join("rfc-note.md");
     fs::write(&p, "see the rfc please").unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let id = k.admit(item_from_file("incoming", &p).unwrap()).unwrap().id;
     let item = store.get(id).unwrap();
@@ -453,7 +453,7 @@ fn opens_legacy_db_without_thread_column() {
         )
         .unwrap();
     }
-    let store = Sqlite::open(&db).unwrap();
+    let store = Sqlite::open(&db, None).unwrap();
     let items = store.ask(&Question::default()).unwrap();
     assert_eq!(items.len(), 1);
     assert!(items[0].thread.is_none());
@@ -464,7 +464,7 @@ fn opens_legacy_db_without_thread_column() {
 fn store_roundtrip_start_end() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let id = store
         .upsert(&NewItem {
             source_id: "incoming".into(),
@@ -570,7 +570,7 @@ fn init_here_creates_dot_paddock() {
 fn insert_body_only_synthesizes_text_part() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let id = store
         .upsert(&NewItem {
             source_id: "incoming".into(),
@@ -592,7 +592,7 @@ fn insert_body_only_synthesizes_text_part() {
     assert_eq!(item.parts[0].kind, PartKind::Text);
     assert_eq!(item.parts[0].mime, "text/plain");
     assert_eq!(item.parts[0].text.as_deref(), Some("hello body"));
-    assert!(item.parts[0].path.is_none());
+    assert!(item.parts[0].size.is_none());
     assert!(item.thread.is_none());
 }
 
@@ -600,7 +600,7 @@ fn insert_body_only_synthesizes_text_part() {
 fn insert_image_and_text_parts() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let id = store
         .upsert(&NewItem {
             source_id: "incoming".into(),
@@ -636,11 +636,8 @@ fn insert_image_and_text_parts() {
     assert_eq!(item.parts.len(), 2);
     assert_eq!(item.parts[0].kind, PartKind::Image);
     assert_eq!(item.parts[0].mime, "image/png");
-    assert!(item.parts[0]
-        .path
-        .as_deref()
-        .unwrap_or("")
-        .starts_with("parts/"));
+    assert_eq!(item.parts[0].size, Some(4), "png bytes are kept");
+    assert_eq!(store.blob(item.parts[0].id).unwrap(), b"\x89PNG");
     assert_eq!(item.parts[1].kind, PartKind::Text);
     assert_eq!(item.parts[1].text.as_deref(), Some("caption"));
     let listed = store.ask(&Question::default()).unwrap();
@@ -652,7 +649,7 @@ fn insert_image_and_text_parts() {
 fn set_thread_and_items_in_thread() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let a = store
         .upsert(&NewItem {
             source_id: "incoming".into(),
@@ -715,7 +712,7 @@ fn set_thread_and_items_in_thread() {
 fn backfill_parts_from_body() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let _ = Sqlite::open(&paths.db_path).unwrap();
+    let _ = Sqlite::open(&paths.db_path, None).unwrap();
     {
         let conn = rusqlite::Connection::open(&paths.db_path).unwrap();
         conn.execute(
@@ -725,7 +722,7 @@ fn backfill_parts_from_body() {
         )
         .unwrap();
     }
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let items = store.ask(&Question::default()).unwrap();
     let item = items.iter().find(|i| i.foreign_id == "old.md").unwrap();
     assert_eq!(item.body, "legacy body");
@@ -741,7 +738,7 @@ fn send_draft_fs_writes_file_and_text_part() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let id = k
         .send(Draft {
@@ -769,7 +766,7 @@ fn reply_shares_thread_and_sets_in_reply_to() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let parent = store
         .upsert(&NewItem {
@@ -823,7 +820,7 @@ url = "https://example.com/feed.xml"
     )
     .unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let err = k
         .send(Draft {
@@ -840,7 +837,7 @@ url = "https://example.com/feed.xml"
 fn insert_from_to_actors() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let id = store
         .upsert(&NewItem {
             source_id: "incoming".into(),
@@ -890,7 +887,7 @@ fn fs_video_part() {
     let p = paths.incoming_dir.join("clip.mp4");
     std::fs::write(&p, b"ftyp").unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let id = k.admit(item_from_file("incoming", &p).unwrap()).unwrap().id;
     let item = store.get(id).unwrap();
@@ -898,15 +895,10 @@ fn fs_video_part() {
     assert_eq!(item.parts.len(), 1);
     assert_eq!(item.parts[0].kind, PartKind::Video);
     assert_eq!(item.parts[0].mime, "video/mp4");
-    assert!(item.parts[0]
-        .path
-        .as_deref()
-        .unwrap_or("")
-        .starts_with("parts/"));
     let part = item.parts[0].clone();
     assert_eq!(part.kind, PartKind::Video);
-    let abs = store.part_path(&part).unwrap();
-    assert!(abs.exists());
+    assert_eq!(part.size, Some(4));
+    assert_eq!(store.blob(part.id).unwrap(), b"ftyp");
 }
 
 #[test]
@@ -914,7 +906,7 @@ fn admit_reply_resolves_parent() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let parent = k
         .admit(NewItem {
@@ -945,7 +937,7 @@ fn admit_reply_before_parent_stitches() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let child = k
         .admit(NewItem {
@@ -982,7 +974,7 @@ fn admit_forward_resolves() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let src = k
         .admit(NewItem {
@@ -1013,7 +1005,7 @@ fn readmit_updates_item_keeps_labels_and_read() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let id = k
         .admit(NewItem {
@@ -1070,7 +1062,7 @@ fn send_draft_keeps_source_foreign_id() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let id = k
         .send(Draft {
@@ -1149,7 +1141,7 @@ fn exec_pull_admits_items_including_timed() {
     let helper = write_exec_helper(tmp.path());
     fs::write(&paths.config_file, exec_source_toml(&helper)).unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let n = k.pull().unwrap().count;
     assert_eq!(n, 2);
@@ -1180,7 +1172,7 @@ fn exec_send_uses_returned_foreign_id() {
     let helper = write_exec_helper(tmp.path());
     fs::write(&paths.config_file, exec_source_toml(&helper)).unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let id = k
         .send(Draft {
@@ -1218,7 +1210,7 @@ cmd = "paddock-no-such-exec-cmd"
     )
     .unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let err = k.pull().unwrap_err();
     let msg = err.to_string();
@@ -1296,7 +1288,7 @@ path = "/tmp"
     )
     .unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     k.admit(NewItem {
         source_id: "incoming".into(),
@@ -1344,7 +1336,7 @@ fn default_init_has_no_brand_exec_sources() {
 fn forget_deletes_the_row() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let id = store
         .upsert(&NewItem {
             source_id: "incoming".into(),
@@ -1371,7 +1363,7 @@ fn forget_stale_drops_past_timed() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let y = yesterday();
     k.admit(NewItem {
@@ -1396,7 +1388,7 @@ fn forget_stale_keeps_start_only_past_item() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     k.admit(NewItem {
         source_id: "incoming".into(),
@@ -1417,7 +1409,7 @@ fn forget_stale_keeps_past_timed_todo() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let y = yesterday();
     let id = k
@@ -1443,7 +1435,7 @@ fn forget_stale_keeps_untimed_when_forget_after_unset() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     k.admit(NewItem {
         source_id: "incoming".into(),
@@ -1479,7 +1471,7 @@ path = "/tmp"
     )
     .unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let id = store
         .upsert(&NewItem {
@@ -1528,7 +1520,7 @@ forget_after = "30d"
     )
     .unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     let id = store
         .upsert(&NewItem {
@@ -1560,7 +1552,7 @@ fn items_in_chain_cal_still_only_timed() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
     let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let k = kernel(&cfg, &store).unwrap();
     k.admit(NewItem {
         source_id: "incoming".into(),
@@ -1703,7 +1695,7 @@ fn text_index_is_rebuilt_for_an_old_store() {
     let conn = rusqlite::Connection::open(&paths.db_path).unwrap();
     conn.execute_batch("DROP TABLE items_fts;").unwrap();
     drop(conn);
-    let store = Sqlite::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path, None).unwrap();
     let q = Question {
         text: Some("invoice".into()),
         ..Default::default()
@@ -1892,4 +1884,95 @@ path = "/tmp"
         "and the item is stale"
     );
     assert!(store.get(id).is_err());
+}
+
+fn store_toml(incoming: &std::path::Path, store: &str) -> String {
+    format!(
+        r#"
+[[inbox]]
+name = "all"
+
+[[source]]
+id = "incoming"
+kind = "fs"
+path = "{}"
+
+[store]
+{store}
+"#,
+        incoming.display()
+    )
+}
+
+#[test]
+fn an_encrypted_store_is_unreadable_without_its_key() {
+    let (_tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    fs::write(
+        &paths.config_file,
+        store_toml(&paths.incoming_dir, r#"key = "hunter2""#),
+    )
+    .unwrap();
+    fs::remove_file(&paths.db_path).unwrap();
+    let (cfg, store) = load(&paths).unwrap();
+    let k = kernel(&cfg, &store).unwrap();
+    k.admit(NewItem {
+        source_id: "incoming".into(),
+        foreign_id: "a".into(),
+        title: "secret plans".into(),
+        body: "x".into(),
+        parts: vec![NewPart {
+            kind: PartKind::File,
+            mime: "application/octet-stream".into(),
+            bytes: Some(b"\x00\x01\x02".to_vec()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+    drop(store);
+
+    let raw = fs::read(&paths.db_path).unwrap();
+    assert!(!raw.starts_with(b"SQLite format 3"), "no plaintext header");
+    assert!(
+        !raw.windows(12).any(|w| w == b"secret plans"),
+        "the title is not on disk in the clear"
+    );
+    assert!(
+        Sqlite::open(&paths.db_path, None).is_err(),
+        "no key, no store"
+    );
+    assert!(Sqlite::open(&paths.db_path, Some("wrong")).is_err());
+
+    let again = Sqlite::open(&paths.db_path, Some("hunter2")).unwrap();
+    let items = again.ask(&Question::default()).unwrap();
+    assert_eq!(items[0].title, "secret plans");
+    assert_eq!(again.blob(items[0].parts[0].id).unwrap(), b"\x00\x01\x02");
+}
+
+#[test]
+fn the_store_key_can_come_from_a_command() {
+    let (_tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    fs::write(
+        &paths.config_file,
+        store_toml(&paths.incoming_dir, r#"key_cmd = "echo from-a-command""#),
+    )
+    .unwrap();
+    fs::remove_file(&paths.db_path).unwrap();
+    let (_cfg, store) = load(&paths).unwrap();
+    drop(store);
+    assert!(Sqlite::open(&paths.db_path, None).is_err());
+    assert!(Sqlite::open(&paths.db_path, Some("from-a-command")).is_ok());
+}
+
+#[test]
+fn a_plaintext_store_opened_with_a_key_says_so() {
+    let (_tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    let err = match Sqlite::open(&paths.db_path, Some("k")) {
+        Ok(_) => panic!("a plaintext store must not open with a key"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("wrong key"), "{err}");
 }

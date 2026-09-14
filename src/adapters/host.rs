@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use super::source::{Exec, Fs, Rss};
 use super::store::Sqlite;
+use super::transport::secret;
 use super::{classifier, embedder, model};
 use crate::kernel::{setting, setting_list, Config, Kernel, Source, SourceSpec, Store};
 
@@ -112,8 +113,20 @@ pub fn init(paths: &Paths) -> Result<()> {
         fs::write(&paths.config_file, text)
             .with_context(|| format!("create {}", paths.config_file.display()))?;
     }
-    Sqlite::open(&paths.db_path)?;
+    open_store(paths, &load_config(&paths.config_file)?)?;
     Ok(())
+}
+
+/// The store the config names: sqlite, encrypted when `[store]` has a
+/// `key` or a `key_cmd`.
+pub fn open_store(paths: &Paths, config: &Config) -> Result<Sqlite> {
+    let spec = config.store.clone().unwrap_or_default();
+    match spec.kind.trim() {
+        "" | "sqlite" => {}
+        other => bail!("unknown store kind `{other}` (sqlite)"),
+    }
+    let key = secret(&spec.settings, "key")?;
+    Sqlite::open(&paths.db_path, key.as_deref())
 }
 
 /// Read the config and open the store, initializing the host first if needed.
@@ -123,10 +136,9 @@ pub fn load(paths: &Paths) -> Result<(Config, Sqlite)> {
     }
     fs::create_dir_all(&paths.data_dir)?;
     fs::create_dir_all(&paths.incoming_dir)?;
-    Ok((
-        load_config(&paths.config_file)?,
-        Sqlite::open(&paths.db_path)?,
-    ))
+    let config = load_config(&paths.config_file)?;
+    let store = open_store(paths, &config)?;
+    Ok((config, store))
 }
 
 pub fn load_config(path: &Path) -> Result<Config> {

@@ -13,8 +13,8 @@
 
 use anyhow::{bail, Context, Result};
 
-use super::transport::{join, post_json, run};
-use crate::kernel::{setting, setting_list, Embedder, ModelSpec};
+use super::transport::{join, post_json, run, secret};
+use crate::kernel::{setting, setting_list, AdapterSpec, Embedder};
 
 pub struct Exec {
     pub cmd: String,
@@ -83,10 +83,10 @@ fn vector(v: &serde_json::Value) -> Option<Vec<f32>> {
     (!out.is_empty() && out.len() == arr.len()).then_some(out)
 }
 
-pub fn build(spec: &ModelSpec) -> Result<Box<dyn Embedder>> {
+pub fn build(spec: &AdapterSpec) -> Result<Box<dyn Embedder>> {
     let s = &spec.settings;
     let cmd = setting(s, "cmd");
-    let key = setting(s, "key");
+    let key = secret(s, "key")?;
     let kind = match spec.kind.trim().to_ascii_lowercase().as_str() {
         "" if cmd.is_some() => "exec".to_string(),
         "" if key.is_some() => "openai".to_string(),

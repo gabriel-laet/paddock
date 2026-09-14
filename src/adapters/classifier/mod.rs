@@ -16,6 +16,7 @@ pub mod llm;
 
 use anyhow::{bail, Result};
 
+use super::transport::secret;
 use crate::kernel::{sanitize_label, setting, Classifier, ClassifierSpec, RegexClassifier};
 
 /// Every classifier kind, the kernel's regex included.
@@ -28,7 +29,11 @@ pub fn build(spec: &ClassifierSpec) -> Result<Box<dyn Classifier>> {
         "regex" => Box::new(RegexClassifier::new(spec)?),
         "script" => Box::new(cel::CelClassifier::new(spec, &need("script")?)?),
         "exec" => Box::new(exec::ExecClassifier::new(spec, need("cmd")?)),
-        "http" => Box::new(http::HttpClassifier::new(spec, need("url")?)),
+        "http" => Box::new(http::HttpClassifier::new(
+            spec,
+            need("url")?,
+            secret(&spec.settings, "key")?,
+        )),
         "llm" => Box::new(llm::LlmClassifier::new(spec)?),
         other => bail!(
             "unknown classifier kind `{other}` on {} (regex, script, exec, http, llm)",

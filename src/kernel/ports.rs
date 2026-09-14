@@ -40,6 +40,8 @@ pub trait Store {
     fn ask(&self, q: &Question) -> Result<Vec<Item>>;
     fn count(&self, q: &Question) -> Result<usize>;
     fn thread(&self, thread: &str) -> Result<Vec<Item>>;
+    /// The bytes of a non-text part.
+    fn blob(&self, part_id: i64) -> Result<Vec<u8>>;
     fn note(&self, id: i64, fact: Fact) -> Result<()>;
     fn delete(&self, id: i64) -> Result<bool>;
     fn stale(&self) -> Result<Vec<StaleHint>>;

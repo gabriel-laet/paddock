@@ -9,13 +9,13 @@
 //! args = ["-p"]
 //! # url = "http://127.0.0.1:11434"
 //! # model = "llama3.2"
-//! # key = "..."            # bearer token for openai-compatible services
+//! # key = "..."            # bearer token, or key_cmd = "pass show openai"
 //! ```
 
 use anyhow::{bail, Result};
 
-use super::transport::{join, post_json, run};
-use crate::kernel::{setting, setting_list, Brief, Model, ModelSpec};
+use super::transport::{join, post_json, run, secret};
+use crate::kernel::{setting, setting_list, AdapterSpec, Brief, Model};
 
 const ANSWER_SYSTEM: &str =
     "You answer a question from someone's inbox using only the items given. \
@@ -122,10 +122,10 @@ fn content(v: &serde_json::Value) -> Option<String> {
 
 /// `kind` picks the transport. Missing kind means exec when `cmd` is set,
 /// else openai when `key` is set, else ollama.
-pub fn build(spec: &ModelSpec) -> Result<Box<dyn Model>> {
+pub fn build(spec: &AdapterSpec) -> Result<Box<dyn Model>> {
     let s = &spec.settings;
     let cmd = setting(s, "cmd");
-    let key = setting(s, "key");
+    let key = secret(s, "key")?;
     let kind = match spec.kind.trim().to_ascii_lowercase().as_str() {
         "" if cmd.is_some() => "exec".to_string(),
         "" if key.is_some() => "openai".to_string(),
@@ -200,14 +200,14 @@ mod tests {
 
     #[test]
     fn kind_defaults_to_exec_when_cmd_is_set() {
-        let spec = ModelSpec {
+        let spec = AdapterSpec {
             settings: [("cmd".to_string(), serde_json::json!("true"))]
                 .into_iter()
                 .collect(),
             ..Default::default()
         };
         assert!(build(&spec).is_ok());
-        assert!(build(&ModelSpec {
+        assert!(build(&AdapterSpec {
             kind: "weird".into(),
             ..Default::default()
         })

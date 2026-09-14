@@ -57,6 +57,8 @@ enum Cmd {
     Show { id: i64 },
     /// Every item in the same thread as ID
     Thread { id: i64 },
+    /// The bytes of a part, to stdout
+    Part { id: i64 },
     /// Add (+l or l) and remove (-l) labels, then reclassify
     Label {
         id: i64,
@@ -209,6 +211,9 @@ fn main() -> Result<()> {
                 None => vec![it],
             };
             list(&items, cli.json)?;
+        }
+        Cmd::Part { id } => {
+            out.write_all(&store.blob(id)?)?;
         }
         Cmd::Label { id, labels } => {
             let (add, remove): (Vec<String>, Vec<String>) =
@@ -449,9 +454,15 @@ fn show(it: &Item) -> Result<()> {
     writeln!(w, "labels   {}", it.labels.join(" "))?;
     writeln!(w)?;
     for p in &it.parts {
-        match (&p.text, &p.path) {
+        match (&p.text, p.size) {
             (Some(t), _) => writeln!(w, "{t}")?,
-            (None, Some(path)) => writeln!(w, "[{} {} {path}]", p.kind.as_str(), p.mime)?,
+            (None, Some(size)) => writeln!(
+                w,
+                "[{} {} part {} {size} bytes]",
+                p.kind.as_str(),
+                p.mime,
+                p.id
+            )?,
             _ => {}
         }
     }
@@ -533,7 +544,7 @@ fn context(paths: &Paths, k: &Kernel) -> Result<()> {
         writeln!(w)?;
     }
     writeln!(w, "\n## use")?;
-    writeln!(w, "paddock pull | inboxes | ls [INBOX] [--unread] [--text WORDS] [--like TEXT] | answer QUESTION [--in INBOX] | embed | show ID | thread ID | label ID [+l|-l]... | read ID | unread ID | forget ID | classify ID | why ID [INBOX] | send [--title T] [--reply ID] [--to A]... [BODY]")?;
+    writeln!(w, "paddock pull | inboxes | ls [INBOX] [--unread] [--text WORDS] [--like TEXT] | answer QUESTION [--in INBOX] | embed | show ID | thread ID | part ID | label ID [+l|-l]... | read ID | unread ID | forget ID | classify ID | why ID [INBOX] | send [--title T] [--reply ID] [--to A]... [BODY]")?;
     writeln!(w, "Add --json to any command for machine output. Edit config.toml, then `paddock pull`. Do not invent nouns.")?;
     Ok(())
 }

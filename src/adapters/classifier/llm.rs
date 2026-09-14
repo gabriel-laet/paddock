@@ -15,7 +15,9 @@
 use anyhow::{Context, Result};
 
 use super::super::model;
-use crate::kernel::{sanitize_label, setting, Classifier, ClassifierSpec, Item, Model, ModelSpec};
+use crate::kernel::{
+    sanitize_label, setting, AdapterSpec, Classifier, ClassifierSpec, Item, Model,
+};
 
 pub const SYSTEM: &str =
     "you label one inbox item. Reply with a single token: a label or NONE. No prose.";
@@ -31,7 +33,7 @@ pub struct LlmClassifier {
 
 impl LlmClassifier {
     pub fn new(spec: &ClassifierSpec) -> Result<Self> {
-        let model = model::build(&ModelSpec {
+        let model = model::build(&AdapterSpec {
             kind: setting(&spec.settings, "provider").unwrap_or_default(),
             settings: spec.settings.clone(),
         })

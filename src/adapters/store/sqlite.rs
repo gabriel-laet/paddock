@@ -1,9 +1,10 @@
-//! SQLite behind the `Store` port. Part bytes live under `data_dir/parts`.
+//! SQLite behind the `Store` port. Everything lives in the one file, part
+//! bytes included, so a key encrypts the lot (SQLCipher).
 
 use anyhow::{Context, Result};
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::kernel::{
@@ -16,19 +17,27 @@ const ITEM_COLS: &str =
 #[derive(Clone)]
 pub struct Sqlite {
     conn: Arc<Mutex<Connection>>,
-    data_dir: PathBuf,
 }
 
 impl Sqlite {
-    pub fn open(path: &Path) -> Result<Self> {
+    /// Open (or create) the store. With a key the file is encrypted; an
+    /// existing plaintext store opened with a key fails as "not a database".
+    pub fn open(path: &Path, key: Option<&str>) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let data_dir = path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        if let Some(key) = key {
+            conn.pragma_update(None, "key", key)?;
+        }
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+            .with_context(|| match key {
+                Some(_) => format!(
+                    "open {}: wrong key, or not an encrypted store",
+                    path.display()
+                ),
+                None => format!("open {}: not a store, or it is encrypted", path.display()),
+            })?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(
@@ -60,7 +69,7 @@ impl Sqlite {
                 kind TEXT NOT NULL,
                 mime TEXT NOT NULL,
                 text TEXT,
-                path TEXT,
+                blob BLOB,
                 FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS item_to (
@@ -95,6 +104,7 @@ impl Sqlite {
         ensure_column(&conn, "items", "cite_actor_kind", "TEXT")?;
         ensure_column(&conn, "items", "in_reply_to_foreign", "TEXT")?;
         ensure_column(&conn, "items", "forward_of_foreign", "TEXT")?;
+        ensure_column(&conn, "parts", "blob", "BLOB")?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_items_thread ON items(thread);
              CREATE INDEX IF NOT EXISTS idx_items_reply_foreign ON items(source_id, in_reply_to_foreign);
@@ -121,7 +131,6 @@ impl Sqlite {
         }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-            data_dir,
         })
     }
 
@@ -129,16 +138,6 @@ impl Sqlite {
         self.conn
             .lock()
             .map_err(|e| anyhow::anyhow!("store lock: {e}"))
-    }
-
-    pub fn part_path(&self, part: &Part) -> Option<PathBuf> {
-        let p = part.path.as_ref()?;
-        let path = Path::new(p);
-        if path.is_absolute() {
-            Some(path.to_path_buf())
-        } else {
-            Some(self.data_dir.join(path))
-        }
     }
 }
 
@@ -223,7 +222,7 @@ impl Store for Sqlite {
             if !to_write.is_empty() {
                 tx.execute("DELETE FROM parts WHERE item_id = ?1", params![id])?;
                 for (seq, part) in to_write.iter().enumerate() {
-                    insert_part_row(&tx, &self.data_dir, id, seq as i64, part)?;
+                    insert_part_row(&tx, id, seq as i64, part)?;
                 }
             }
             if !item.to.is_empty() {
@@ -265,7 +264,7 @@ impl Store for Sqlite {
             )?;
             let id = tx.last_insert_rowid();
             for (seq, part) in to_write.iter().enumerate() {
-                insert_part_row(&tx, &self.data_dir, id, seq as i64, part)?;
+                insert_part_row(&tx, id, seq as i64, part)?;
             }
             insert_to_rows(&tx, id, &item.to)?;
             (id, true)
@@ -419,6 +418,19 @@ impl Store for Sqlite {
         Ok(())
     }
 
+    fn blob(&self, part_id: i64) -> Result<Vec<u8>> {
+        let conn = self.lock()?;
+        let bytes: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT blob FROM parts WHERE id = ?1",
+                params![part_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        bytes.with_context(|| format!("part {part_id} has no bytes"))
+    }
+
     fn delete(&self, id: i64) -> Result<bool> {
         let conn = self.lock()?;
         let exists: Option<i64> = conn
@@ -428,14 +440,6 @@ impl Store for Sqlite {
             .optional()?;
         if exists.is_none() {
             return Ok(false);
-        }
-        let parts = parts_for(&conn, id)?;
-        for part in &parts {
-            if let Some(abs) = self.part_path(part) {
-                if path_under_dir(&abs, &self.data_dir) {
-                    let _ = std::fs::remove_file(&abs);
-                }
-            }
         }
         conn.execute("DELETE FROM items_fts WHERE item_id = ?1", params![id])?;
         conn.execute("DELETE FROM items WHERE id = ?1", params![id])?;
@@ -570,94 +574,25 @@ fn to_for(conn: &Connection, id: i64) -> Result<Vec<Actor>> {
     Ok(out)
 }
 
-fn insert_part_row(
-    conn: &Connection,
-    data_dir: &Path,
-    item_id: i64,
-    seq: i64,
-    part: &NewPart,
-) -> Result<i64> {
-    let path = materialize_part_path(data_dir, item_id, seq, part)?;
+fn insert_part_row(conn: &Connection, item_id: i64, seq: i64, part: &NewPart) -> Result<i64> {
+    let bytes = match (&part.bytes, &part.src) {
+        (Some(b), _) => Some(b.clone()),
+        (None, Some(src)) => Some(std::fs::read(src).with_context(|| format!("read part {src}"))?),
+        (None, None) => None,
+    };
     conn.execute(
-        "INSERT INTO parts (item_id, seq, kind, mime, text, path)
+        "INSERT INTO parts (item_id, seq, kind, mime, text, blob)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![item_id, seq, part.kind.as_str(), part.mime, part.text, path],
+        params![
+            item_id,
+            seq,
+            part.kind.as_str(),
+            part.mime,
+            part.text,
+            bytes
+        ],
     )?;
     Ok(conn.last_insert_rowid())
-}
-
-fn materialize_part_path(
-    data_dir: &Path,
-    item_id: i64,
-    seq: i64,
-    part: &NewPart,
-) -> Result<Option<String>> {
-    let bytes = if let Some(b) = &part.bytes {
-        Some(b.clone())
-    } else if let Some(src) = &part.src {
-        Some(std::fs::read(src).with_context(|| format!("read part {src}"))?)
-    } else {
-        None
-    };
-    let Some(bytes) = bytes else {
-        return Ok(None);
-    };
-    let ext = extension_for(part);
-    let dir = data_dir.join("parts");
-    std::fs::create_dir_all(&dir)?;
-    let name = format!("{item_id}-{seq}{ext}");
-    std::fs::write(dir.join(&name), bytes)?;
-    Ok(Some(format!("parts/{name}")))
-}
-
-fn extension_for(part: &NewPart) -> String {
-    if let Some(src) = &part.src {
-        if let Some(e) = Path::new(src).extension().and_then(|s| s.to_str()) {
-            if !e.is_empty() {
-                return format!(".{e}");
-            }
-        }
-    }
-    match part.kind {
-        PartKind::Image => {
-            if part.mime.contains("png") {
-                ".png".into()
-            } else if part.mime.contains("jpeg") || part.mime.contains("jpg") {
-                ".jpg".into()
-            } else if part.mime.contains("gif") {
-                ".gif".into()
-            } else if part.mime.contains("webp") {
-                ".webp".into()
-            } else {
-                ".bin".into()
-            }
-        }
-        PartKind::Audio => {
-            if part.mime.contains("mpeg") || part.mime.contains("mp3") {
-                ".mp3".into()
-            } else if part.mime.contains("wav") {
-                ".wav".into()
-            } else if part.mime.contains("ogg") {
-                ".ogg".into()
-            } else if part.mime.contains("mp4") || part.mime.contains("m4a") {
-                ".m4a".into()
-            } else {
-                ".bin".into()
-            }
-        }
-        PartKind::Video => {
-            if part.mime.contains("webm") {
-                ".webm".into()
-            } else if part.mime.contains("quicktime") {
-                ".mov".into()
-            } else if part.mime.contains("matroska") {
-                ".mkv".into()
-            } else {
-                ".mp4".into()
-            }
-        }
-        _ => String::new(),
-    }
 }
 
 fn row_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
@@ -696,7 +631,7 @@ fn labels_for(conn: &Connection, id: i64) -> Result<Vec<String>> {
 
 fn parts_for(conn: &Connection, id: i64) -> Result<Vec<Part>> {
     let mut stmt = conn.prepare(
-        "SELECT id, seq, kind, mime, text, path FROM parts WHERE item_id = ?1 ORDER BY seq, id",
+        "SELECT id, seq, kind, mime, text, length(blob) FROM parts WHERE item_id = ?1 ORDER BY seq, id",
     )?;
     let rows = stmt.query_map(params![id], row_part)?;
     let mut out = Vec::new();
@@ -714,7 +649,7 @@ fn row_part(row: &rusqlite::Row<'_>) -> rusqlite::Result<Part> {
         kind: PartKind::parse(&kind),
         mime: row.get(3)?,
         text: row.get(4)?,
-        path: row.get(5)?,
+        size: row.get(5)?,
     })
 }
 
@@ -849,12 +784,6 @@ fn filter_order(filter: &Question) -> &'static str {
     }
 }
 
-fn path_under_dir(path: &Path, dir: &Path) -> bool {
-    let dir_c = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let path_c = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    path_c.starts_with(&dir_c)
-}
-
 fn hydrate(conn: &Connection, items: &mut [Item]) -> Result<()> {
     if items.is_empty() {
         return Ok(());
@@ -877,7 +806,7 @@ fn hydrate(conn: &Connection, items: &mut [Item]) -> Result<()> {
     drop(lab_stmt);
 
     let mut part_stmt = conn.prepare(&format!(
-        "SELECT id, item_id, seq, kind, mime, text, path FROM parts WHERE item_id IN ({in_list}) ORDER BY item_id, seq, id"
+        "SELECT id, item_id, seq, kind, mime, text, length(blob) FROM parts WHERE item_id IN ({in_list}) ORDER BY item_id, seq, id"
     ))?;
     let part_rows = part_stmt.query_map(params_from_iter(ids.iter().cloned()), |row| {
         let item_id: i64 = row.get(1)?;
@@ -890,7 +819,7 @@ fn hydrate(conn: &Connection, items: &mut [Item]) -> Result<()> {
                 kind: PartKind::parse(&kind),
                 mime: row.get(4)?,
                 text: row.get(5)?,
-                path: row.get(6)?,
+                size: row.get(6)?,
             },
         ))
     })?;
@@ -932,7 +861,7 @@ fn hydrate(conn: &Connection, items: &mut [Item]) -> Result<()> {
 fn ensure_text_part(conn: &Connection, item: &mut Item) -> Result<()> {
     if item.parts.is_empty() && !item.body.is_empty() {
         conn.execute(
-            "INSERT INTO parts (item_id, seq, kind, mime, text, path)
+            "INSERT INTO parts (item_id, seq, kind, mime, text, blob)
              VALUES (?1, 0, 'text', 'text/plain', ?2, NULL)",
             params![item.id, item.body],
         )?;
@@ -943,7 +872,7 @@ fn ensure_text_part(conn: &Connection, item: &mut Item) -> Result<()> {
 
 fn backfill_parts(conn: &Connection) -> Result<()> {
     conn.execute(
-        "INSERT INTO parts (item_id, seq, kind, mime, text, path)
+        "INSERT INTO parts (item_id, seq, kind, mime, text, blob)
          SELECT id, 0, 'text', 'text/plain', body, NULL
          FROM items
          WHERE body != ''
