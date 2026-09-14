@@ -79,7 +79,7 @@ Resolution: `--dir`, else `PADDOCK_DIR`, else walk up from cwd for a `.paddock/`
 The host part, then one block per inbox, source, classifier, and (optionally) the embedder, the model, and the store. Several `[[source]]` blocks share one store.
 
 ```toml
-keep = ["todo", "later"]        # labels that never auto-forget
+keep = ["todo", "later"]        # stale cleanup asks "without these"
 # forget_after = "30d"          # host default for untimed items
 # remote = "box"                # ssh host for --remote
 
@@ -116,7 +116,7 @@ path = "~/.local/share/paddock/incoming"
 
 ### effects
 
-`then` names what an inbox does to an item that enters it: `label:NAME`, `read`, or `send:SOURCE`. Effects are idempotent, and `send:` stamps `sent` so nothing goes out twice. That is the whole approval flow: an agent drafts into a source, a hand adds `approved`, the inbox sends.
+`then` names what an inbox does to an item that enters it: `label:NAME`, `read`, or `send:SOURCE`. What an effect produces (the item a `send:` delivers) is classified like anything else but fires no effects of its own, so an effect cannot chase its own output. An effect runs once per item per inbox, the same way a run-once classifier does; one that fails (a source that is down) is not remembered, so it retries on the next classify or pull and warns each time until it goes through. `send:` stamps `sent`. That is the whole approval flow: an agent drafts into a source, a hand adds `approved`, the inbox sends.
 
 ```toml
 [[inbox]]
@@ -129,7 +129,7 @@ labels = ["approved"]           # a hand adds this
 then = ["send:mail", "label:done", "read"]
 ```
 
-An item matches an inbox when `(sources empty OR item.source in sources)` and `(labels empty OR item has ALL listed labels)` and `(item has NONE of without)` and (`timed` unset OR the item has `start`) and the age bounds hold, and it matches every ancestor. `keep` labels survive stale cleanup. Lists are queried in SQL, not loaded whole.
+An item matches an inbox when `(sources empty OR item.source in sources)` and `(labels empty OR item has ALL listed labels)` and `(item has NONE of without)` and (`timed` unset OR the item has `start`) and the age bounds hold, and it matches every ancestor. Stale cleanup is the question `without = keep` and then a passed `end` or an old `created_at`, so `keep` is just a `without`. Lists are queried in SQL, not loaded whole.
 
 ### sources
 

@@ -7,7 +7,7 @@ use paddock::*;
 use std::fs;
 
 #[test]
-fn llm_classified_marks_and_persists() {
+fn a_run_once_classifier_is_seen_once_per_item() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
     let store = Sqlite::open(&paths.db_path, None).unwrap();
@@ -26,17 +26,13 @@ fn llm_classified_marks_and_persists() {
         })
         .unwrap()
         .0;
-    assert!(!store.classified(id, "important").unwrap());
-    store
-        .note(id, Fact::Classified("important".into()))
-        .unwrap();
-    assert!(store.classified(id, "important").unwrap());
+    assert!(!store.seen(id, "important").unwrap());
+    store.note(id, Fact::Seen("important".into())).unwrap();
+    assert!(store.seen(id, "important").unwrap());
     // Distinct classifier id on the same item is tracked separately.
-    assert!(!store.classified(id, "other").unwrap());
+    assert!(!store.seen(id, "other").unwrap());
     // Marking twice does not error (INSERT OR IGNORE).
-    store
-        .note(id, Fact::Classified("important".into()))
-        .unwrap();
+    store.note(id, Fact::Seen("important".into())).unwrap();
 }
 
 #[test]
@@ -508,4 +504,75 @@ path = "{0}/work"
         "personas do not leak"
     );
     assert_eq!(ActorKind::parse("agent"), ActorKind::Agent);
+}
+
+#[test]
+fn an_effect_runs_once_per_entry_and_a_failed_one_retries() {
+    let (tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    let flag = tmp.path().join("up");
+    fs::write(
+        &paths.config_file,
+        format!(
+            r#"
+[[inbox]]
+name = "all"
+then = ["send:flaky"]
+
+[[source]]
+id = "incoming"
+kind = "fs"
+path = "{}"
+
+[[source]]
+id = "flaky"
+kind = "exec"
+cmd = "sh"
+args = ["-c", "test -e {} || exit 1; cat >/dev/null; echo '{{\"foreign_id\":\"ok-1\"}}'"]
+"#,
+            paths.incoming_dir.display(),
+            flag.display()
+        ),
+    )
+    .unwrap();
+    let (cfg, store) = load(&paths).unwrap();
+    let k = kernel(&cfg, &store).unwrap();
+    let admitted = k
+        .admit(NewItem {
+            source_id: "incoming".into(),
+            foreign_id: "a".into(),
+            title: "a".into(),
+            body: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        admitted.warnings.len(),
+        1,
+        "the send failed and said so: {:?}",
+        admitted.warnings
+    );
+    let key = "then:all:send:flaky";
+    assert!(!store.get(admitted.id).unwrap().has(SENT));
+    assert!(
+        !store.seen(admitted.id, key).unwrap(),
+        "a failure is not remembered"
+    );
+
+    fs::write(&flag, "").unwrap();
+    let warnings = k.classify(admitted.id).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!(
+        store.get(admitted.id).unwrap().has(SENT),
+        "retried once the source was up"
+    );
+    assert!(store.seen(admitted.id, key).unwrap(), "and now it is done");
+    k.classify(admitted.id).unwrap();
+    let delivered = store
+        .ask(&Question::default())
+        .unwrap()
+        .iter()
+        .filter(|i| i.source_id == "flaky")
+        .count();
+    assert_eq!(delivered, 1, "once per entry, not once per classify");
 }

@@ -105,10 +105,10 @@ impl Sqlite {
             CREATE INDEX IF NOT EXISTS idx_cites_item ON cites(item_id);
             CREATE INDEX IF NOT EXISTS idx_cites_target ON cites(target_id);
             CREATE INDEX IF NOT EXISTS idx_cites_foreign ON cites(source_id, foreign_id);
-            CREATE TABLE IF NOT EXISTS classified (
+            CREATE TABLE IF NOT EXISTS seen (
                 item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-                classifier_id TEXT NOT NULL,
-                PRIMARY KEY (item_id, classifier_id)
+                key TEXT NOT NULL,
+                PRIMARY KEY (item_id, key)
             );
             CREATE TABLE IF NOT EXISTS vectors (
                 item_id INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
@@ -231,34 +231,23 @@ impl Store for Sqlite {
         Ok(item)
     }
 
-    fn stale(&self) -> Result<Vec<StaleHint>> {
+    fn stale(&self, q: &Question) -> Result<Vec<StaleHint>> {
+        let (where_sql, params) = filter_where(q);
         let conn = self.lock()?;
-        let mut stmt = conn.prepare("SELECT id, source_id, created_at, start, end FROM items")?;
-        let mut hints: Vec<StaleHint> = stmt
-            .query_map([], |row| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, source_id, created_at, start, end FROM items {where_sql}"
+        ))?;
+        let hints = stmt
+            .query_map(params_from_iter(params), |row| {
                 Ok(StaleHint {
                     id: row.get(0)?,
                     source_id: row.get(1)?,
                     created_at: row.get(2)?,
                     start: row.get(3)?,
                     end: row.get(4)?,
-                    labels: Vec::new(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-        let mut lab_stmt = conn.prepare("SELECT item_id, label FROM labels WHERE removed = 0")?;
-        let labs = lab_stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
-        for row in labs {
-            let (id, label) = row?;
-            map.entry(id).or_default().push(label);
-        }
-        for h in &mut hints {
-            h.labels = map.remove(&h.id).unwrap_or_default();
-        }
         Ok(hints)
     }
 
@@ -340,10 +329,10 @@ impl Store for Sqlite {
                     params![thread, id],
                 )?;
             }
-            Fact::Classified(classifier_id) => {
+            Fact::Seen(key) => {
                 conn.execute(
-                    "INSERT OR IGNORE INTO classified (item_id, classifier_id) VALUES (?1, ?2)",
-                    params![id, classifier_id],
+                    "INSERT OR IGNORE INTO seen (item_id, key) VALUES (?1, ?2)",
+                    params![id, key],
                 )?;
             }
             Fact::Vector(vector) => {
@@ -398,12 +387,12 @@ impl Store for Sqlite {
         Ok(conn.changes() > 0)
     }
 
-    fn classified(&self, id: i64, classifier_id: &str) -> Result<bool> {
+    fn seen(&self, id: i64, key: &str) -> Result<bool> {
         let conn = self.lock()?;
         let hit: Option<i64> = conn
             .query_row(
-                "SELECT 1 FROM classified WHERE item_id = ?1 AND classifier_id = ?2",
-                params![id, classifier_id],
+                "SELECT 1 FROM seen WHERE item_id = ?1 AND key = ?2",
+                params![id, key],
                 |r| r.get(0),
             )
             .optional()?;

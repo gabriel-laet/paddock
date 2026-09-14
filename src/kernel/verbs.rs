@@ -61,6 +61,12 @@ impl Kernel<'_> {
     /// Upsert, take the source's word on read, classify from the root down,
     /// then embed if the host has an embedder.
     pub fn admit(&self, item: NewItem) -> Result<Admitted> {
+        self.admit_with(item, true)
+    }
+
+    /// `effects: false` is for what an effect itself produced: it is
+    /// classified like anything else, but fires no effects of its own.
+    fn admit_with(&self, item: NewItem, effects: bool) -> Result<Admitted> {
         let (id, _) = self.store.upsert(&item)?;
         if item.read == Some(true) {
             let current = self.store.get(id)?;
@@ -69,7 +75,7 @@ impl Kernel<'_> {
                     .note(id, Fact::Label(self.stamp(READ, By::Source)))?;
             }
         }
-        let mut warnings = self.classify(id)?;
+        let mut warnings = self.classify_with(id, effects)?;
         if let Err(e) = self.embed(id) {
             warnings.push(format!("embed #{id}: {e:#}"));
         }
@@ -80,23 +86,24 @@ impl Kernel<'_> {
     /// matches, recursively. A label stamped on the way down can open a child.
     /// Returns warnings from classifiers that could not decide.
     pub fn classify(&self, id: i64) -> Result<Vec<String>> {
+        self.classify_with(id, true)
+    }
+
+    fn classify_with(&self, id: i64, effects: bool) -> Result<Vec<String>> {
         let mut item = self.store.get(id)?;
         let mut warnings = Vec::new();
         self.apply(&self.config.classifier, &mut item, &mut warnings)?;
         for inbox in &self.config.inbox {
-            self.enter(inbox, &mut item, &mut warnings)?;
+            self.enter(inbox, &inbox.name, effects, &mut item, &mut warnings)?;
         }
         Ok(warnings)
     }
 
-    fn enter(&self, inbox: &Inbox, item: &mut Item, warnings: &mut Vec<String>) -> Result<()> {
-        self.enter_at(inbox, &inbox.name, item, warnings)
-    }
-
-    fn enter_at(
+    fn enter(
         &self,
         inbox: &Inbox,
         path: &str,
+        effects: bool,
         item: &mut Item,
         warnings: &mut Vec<String>,
     ) -> Result<()> {
@@ -104,24 +111,32 @@ impl Kernel<'_> {
             return Ok(());
         }
         self.apply(&inbox.classifier, item, warnings)?;
-        for effect in &inbox.then {
-            self.effect(effect, path, item, warnings)?;
+        for effect in inbox.then.iter().filter(|_| effects) {
+            // Once per entry. A failed effect is not remembered, so it retries.
+            let key = format!("then:{path}:{effect}");
+            if self.store.seen(item.id, &key)? {
+                continue;
+            }
+            if self.effect(effect, path, item, warnings)? {
+                self.store.note(item.id, Fact::Seen(key))?;
+            }
         }
         for child in &inbox.inbox {
-            self.enter_at(child, &format!("{path}/{}", child.name), item, warnings)?;
+            let path = format!("{path}/{}", child.name);
+            self.enter(child, &path, effects, item, warnings)?;
         }
         Ok(())
     }
 
-    /// What an inbox does to an item that enters it. Idempotent: a label
-    /// already there stays, and an item already `sent` is not sent again.
+    /// What an inbox does to an item that enters it. Returns whether it is
+    /// done: a label already there counts, a send that failed does not.
     fn effect(
         &self,
         effect: &str,
         path: &str,
         item: &mut Item,
         warnings: &mut Vec<String>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let by = By::Inbox(path.to_string());
         let put = |name: &str, item: &mut Item| -> Result<()> {
             if item.has(name) || item.denies(name) {
@@ -133,11 +148,11 @@ impl Kernel<'_> {
             Ok(())
         };
         match effect.split_once(':').unwrap_or((effect, "")) {
-            ("read", "") => put(READ, item),
-            ("label", name) if !name.is_empty() => put(name, item),
+            ("read", "") => put(READ, item).map(|_| true),
+            ("label", name) if !name.is_empty() => put(name, item).map(|_| true),
             ("send", source) if !source.is_empty() => {
                 if item.has(SENT) {
-                    return Ok(());
+                    return Ok(true);
                 }
                 let draft = Draft {
                     source_id: source.to_string(),
@@ -148,20 +163,20 @@ impl Kernel<'_> {
                     to: item.to.clone(),
                     ..Default::default()
                 };
-                match self.send(draft) {
+                match self.send_with(draft, false) {
                     Ok(sent) => {
                         warnings.extend(sent.warnings);
-                        put(SENT, item)
+                        put(SENT, item).map(|_| true)
                     }
                     Err(e) => {
                         warnings.push(format!("{path}: send:{source} #{}: {e:#}", item.id));
-                        Ok(())
+                        Ok(false)
                     }
                 }
             }
             _ => {
                 warnings.push(format!("{path}: unknown effect `{effect}`"));
-                Ok(())
+                Ok(false)
             }
         }
     }
@@ -205,14 +220,13 @@ impl Kernel<'_> {
                 warnings.push(format!("classifier {}: not resolved", spec.id));
                 continue;
             };
-            if classifier.once() && self.store.classified(item.id, &spec.id)? {
+            if classifier.once() && self.store.seen(item.id, &spec.id)? {
                 continue;
             }
             let label = match classifier.classify(item) {
                 Ok(label) => {
                     if classifier.once() {
-                        self.store
-                            .note(item.id, Fact::Classified(spec.id.clone()))?;
+                        self.store.note(item.id, Fact::Seen(spec.id.clone()))?;
                     }
                     label
                 }
@@ -288,14 +302,15 @@ impl Kernel<'_> {
     }
 
     /// Drop stale items: a passed `end`, or an untimed item older than the
-    /// source's (else the host's) `forget_after`. Kept labels never go.
+    /// source's (else the host's) `forget_after`. The stale question is
+    /// "everything without a kept label"; `keep` is just its `without`.
     pub fn forget_stale(&self) -> Result<usize> {
-        let keep = self.config.keep();
+        let candidates = Question {
+            without: self.config.keep(),
+            ..Question::default()
+        };
         let mut n = 0;
-        for hint in self.store.stale()? {
-            if hint.labels.iter().any(|l| keep.contains(l)) {
-                continue;
-            }
+        for hint in self.store.stale(&candidates)? {
             if self.is_stale(&hint) && self.store.delete(hint.id)? {
                 n += 1;
             }
@@ -323,6 +338,10 @@ impl Kernel<'_> {
     /// Hand the draft to its source, then admit what came back. A reply
     /// joins the parent's thread, starting one if the parent had none.
     pub fn send(&self, draft: Draft) -> Result<Admitted> {
+        self.send_with(draft, true)
+    }
+
+    fn send_with(&self, draft: Draft, effects: bool) -> Result<Admitted> {
         let mut draft = draft;
         let mut reply_foreign = None;
         if let Some(pid) = draft.reply_to {
@@ -360,7 +379,7 @@ impl Kernel<'_> {
             item.cites.push(Cite::reply(f));
         }
         item.to = draft.to.clone();
-        self.admit(item)
+        self.admit_with(item, effects)
     }
 
     /// Store the item's vector. Nothing happens without an embedder.

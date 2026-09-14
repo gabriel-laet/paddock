@@ -15,7 +15,6 @@ pub struct StaleHint {
     pub created_at: String,
     pub start: Option<String>,
     pub end: Option<String>,
-    pub labels: Vec<String>,
 }
 
 /// Something the kernel learned about an item and wants kept.
@@ -26,8 +25,9 @@ pub enum Fact {
     /// Taken off. By a hand, this leaves a denial behind.
     Unlabel(Label),
     Thread(Option<String>),
-    /// A run-once classifier has seen this item.
-    Classified(String),
+    /// Something that runs once per item has run: a run-once classifier
+    /// (its id), or an inbox effect (`then:<path>:<effect>`).
+    Seen(String),
     Vector(Vec<f32>),
 }
 
@@ -47,8 +47,9 @@ pub trait Store {
     fn blob(&self, part_id: i64) -> Result<Vec<u8>>;
     fn note(&self, id: i64, fact: Fact) -> Result<()>;
     fn delete(&self, id: i64) -> Result<bool>;
-    fn stale(&self) -> Result<Vec<StaleHint>>;
-    fn classified(&self, id: i64, classifier_id: &str) -> Result<bool>;
+    /// Thin rows for the items a question matches, for stale cleanup.
+    fn stale(&self, q: &Question) -> Result<Vec<StaleHint>>;
+    fn seen(&self, id: i64, key: &str) -> Result<bool>;
     /// Items with no vector yet.
     fn unembedded(&self) -> Result<Vec<i64>>;
     fn counts_by_source(&self) -> Result<Vec<(String, i64)>>;
