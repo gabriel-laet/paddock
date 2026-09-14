@@ -35,7 +35,7 @@ impl Paths {
         Self::from_dirs(config_dir, data_dir)
     }
 
-    /// Host root is `.paddock/` or `$PADDOCK_DIR`: config, db, incoming, themes live together.
+    /// Host root is `.paddock/` or `$PADDOCK_DIR`: config, db, and incoming live together.
     pub fn from_root(root: PathBuf) -> Self {
         Self {
             config_file: root.join("config.toml"),
@@ -112,9 +112,6 @@ pub struct Config {
     /// Classifiers on the implicit root (the whole pile).
     #[serde(default)]
     pub classifier: Vec<ClassifierConfig>,
-    /// Theme name. File lives at `$config_dir/themes/<name>.toml`.
-    #[serde(default)]
-    pub theme: Option<String>,
     /// SSH host for `paddock --remote`. Not a source.
     #[serde(default)]
     pub remote: Option<String>,
@@ -133,13 +130,7 @@ pub struct InboxConfig {
     pub labels: Vec<String>,
     #[serde(default)]
     pub sources: Vec<String>,
-    /// "list" | "calendar" | "board". Missing/unknown → list.
-    #[serde(default)]
-    pub view: Option<String>,
-    /// Board columns (label names). Ignored unless view = "board".
-    #[serde(default)]
-    pub columns: Vec<String>,
-    /// If true, match only items that have `start` set.
+    /// If true, match only items that have `start` set; the list is then in `start` order.
     #[serde(default)]
     pub timed: bool,
     /// Match only items whose effective date (`start`, else `created_at`) is
@@ -153,28 +144,6 @@ pub struct InboxConfig {
     pub classifier: Vec<ClassifierConfig>,
     #[serde(default)]
     pub inbox: Vec<InboxConfig>,
-}
-
-impl InboxConfig {
-    /// Kernel view: list, calendar, or board.
-    pub fn view_kind(&self) -> &str {
-        match self.view.as_deref().map(str::trim) {
-            Some("calendar") => "calendar",
-            Some("board") => "board",
-            _ => "list",
-        }
-    }
-
-    /// First configured board column whose label the item has.
-    pub fn board_column<'a>(&'a self, item: &Item) -> Option<&'a str> {
-        if self.view_kind() != "board" {
-            return None;
-        }
-        self.columns
-            .iter()
-            .find(|c| item.labels.iter().any(|l| l == *c))
-            .map(|s| s.as_str())
-    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -240,10 +209,10 @@ pub fn source_label<'a>(cfg: &'a Config, id: &'a str) -> &'a str {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("read config {}", path.display()))?;
-        let cfg: Config = toml::from_str(&text)
-            .with_context(|| format!("parse config {}", path.display()))?;
+        let text =
+            fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
+        let cfg: Config =
+            toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
         if cfg.inbox.is_empty() {
             let mut cfg = cfg;
             cfg.inbox.push(InboxConfig {
@@ -305,12 +274,18 @@ fn find_chain<'a>(inboxes: &'a [InboxConfig], path: &[&str]) -> Option<Vec<&'a I
 /// AND (not timed OR item.start is a non-empty string)
 /// AND (newer_than/older_than, if set, bound the item's effective date).
 pub fn inbox_matches(inbox: &InboxConfig, item: &Item) -> bool {
-    let source_ok =
-        inbox.sources.is_empty() || inbox.sources.iter().any(|s| s == &item.source_id);
+    let source_ok = inbox.sources.is_empty() || inbox.sources.iter().any(|s| s == &item.source_id);
     let labels_ok = inbox.labels.is_empty()
-        || inbox.labels.iter().all(|l| item.labels.iter().any(|x| x == l));
+        || inbox
+            .labels
+            .iter()
+            .all(|l| item.labels.iter().any(|x| x == l));
     let timed_ok = !inbox.timed
-        || item.start.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
+        || item
+            .start
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
     source_ok && labels_ok && timed_ok && age_matches(inbox, item, chrono::Utc::now())
 }
 

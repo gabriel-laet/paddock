@@ -29,10 +29,7 @@ impl RegexClassifier {
             .pattern
             .as_deref()
             .context("regex classifier needs pattern")?;
-        let label = cfg
-            .label
-            .clone()
-            .context("regex classifier needs label")?;
+        let label = cfg.label.clone().context("regex classifier needs label")?;
         let re = regex::Regex::new(pattern)
             .with_context(|| format!("classifier {}: bad pattern", cfg.id))?;
         Ok(Self {
@@ -112,10 +109,7 @@ fn item_map(item: &Item) -> rhai::Map {
     map.insert("title".into(), item.title.clone().into());
     map.insert("body".into(), item.body.clone().into());
     map.insert("source".into(), item.source_id.clone().into());
-    map.insert(
-        "href".into(),
-        item.href.clone().unwrap_or_default().into(),
-    );
+    map.insert("href".into(), item.href.clone().unwrap_or_default().into());
     map.insert(
         "start".into(),
         item.start.clone().unwrap_or_default().into(),
@@ -210,7 +204,12 @@ impl LlmClassifier {
             .clone()
             .or_else(|| env_nonempty("PADDOCK_LLM_MODEL"))
             .unwrap_or_else(|| "llama3.2".into());
-        let user = build_user_message(self.prompt.as_deref(), item, self.label.as_deref(), &self.labels);
+        let user = build_user_message(
+            self.prompt.as_deref(),
+            item,
+            self.label.as_deref(),
+            &self.labels,
+        );
         let (url, key, body) = if provider == "openai" {
             let base = self
                 .url
@@ -293,11 +292,7 @@ pub fn parse_llm_token(raw: &str) -> Option<String> {
     sanitize_label(token)
 }
 
-pub fn interpret_llm_reply(
-    raw: &str,
-    cfg_label: Option<&str>,
-    allow: &[String],
-) -> Option<String> {
+pub fn interpret_llm_reply(raw: &str, cfg_label: Option<&str>, allow: &[String]) -> Option<String> {
     let line = raw.lines().next().unwrap_or("").trim();
     let token = line.split_whitespace().next().unwrap_or("");
     if token.is_empty() || token.eq_ignore_ascii_case("none") {
@@ -458,7 +453,9 @@ fn extract_content(v: &serde_json::Value) -> Option<String> {
     {
         return Some(s.to_string());
     }
-    v.get("response").and_then(|r| r.as_str()).map(|s| s.to_string())
+    v.get("response")
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string())
 }
 
 #[cfg(test)]
@@ -563,7 +560,10 @@ mod tests {
         assert_eq!(parse_llm_token("NONE"), None);
         assert_eq!(parse_llm_token("none"), None);
         assert_eq!(parse_llm_token("foo bar"), Some("foo".into()));
-        assert_eq!(parse_llm_token("Hello-World!! extra"), Some("hello-world".into()));
+        assert_eq!(
+            parse_llm_token("Hello-World!! extra"),
+            Some("hello-world".into())
+        );
     }
 
     #[test]

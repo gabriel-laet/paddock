@@ -1,39 +1,25 @@
 use anyhow::Result;
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use crate::classify::{run_classifier, LlmClassifier};
 use crate::config::{
-    expand_path, parse_duration, parse_when, source_label, Config, InboxConfig, Paths,
-    SourceConfig,
+    expand_path, parse_duration, parse_when, Config, InboxConfig, Paths, SourceConfig,
 };
 use crate::source::{item_from_file, pull_exec, pull_fs, pull_rss, send_exec, Draft, NewItem};
 use crate::store::{Item, ItemFilter, StaleHint, Store};
 
-/// Generation bump after store mutations from the watcher (TUI polls this).
-pub static GEN: AtomicU64 = AtomicU64::new(0);
-
-pub fn bump() {
-    GEN.fetch_add(1, Ordering::Relaxed);
-}
-
-pub fn gen() -> u64 {
-    GEN.load(Ordering::Relaxed)
-}
-
 pub fn admit(store: &Store, config: &Config, item: NewItem) -> Result<i64> {
     let (id, _) = store.upsert(&item)?;
     classify_item(store, config, id)?;
-    bump();
     Ok(id)
 }
 
-pub fn admit_file(store: &Store, config: &Config, source_id: &str, path: &Path) -> Result<Option<i64>> {
+pub fn admit_file(
+    store: &Store,
+    config: &Config,
+    source_id: &str,
+    path: &Path,
+) -> Result<Option<i64>> {
     if !path.is_file() {
         return Ok(None);
     }
@@ -49,20 +35,21 @@ pub fn admit_file(store: &Store, config: &Config, source_id: &str, path: &Path) 
     Ok(Some(admit(store, config, new)?))
 }
 
-/// Toggle (or add/remove) a label, then classify so child inboxes can fire.
-pub fn relabel(store: &Store, config: &Config, id: i64, label: &str) -> Result<bool> {
-    let on = store.toggle_label(id, label)?;
-    classify_item(store, config, id)?;
-    bump();
-    Ok(on)
-}
-
-/// Add a label if missing, then classify.
-pub fn stamp(store: &Store, config: &Config, id: i64, label: &str) -> Result<()> {
-    store.add_label(id, label)?;
-    classify_item(store, config, id)?;
-    bump();
-    Ok(())
+/// Add and remove labels, then classify so a newly matching child can fire.
+pub fn label(
+    store: &Store,
+    config: &Config,
+    id: i64,
+    add: &[String],
+    remove: &[String],
+) -> Result<()> {
+    for l in add {
+        store.add_label(id, l)?;
+    }
+    for l in remove {
+        store.remove_label(id, l)?;
+    }
+    classify_item(store, config, id)
 }
 
 /// admit → enter root → classify → match children → classify → recurse.
@@ -86,7 +73,11 @@ fn walk_inbox(store: &Store, inbox: &InboxConfig, item: &mut Item) -> Result<()>
     Ok(())
 }
 
-fn apply_classifiers(store: &Store, classifiers: &[crate::config::ClassifierConfig], item: &mut Item) -> Result<()> {
+fn apply_classifiers(
+    store: &Store,
+    classifiers: &[crate::config::ClassifierConfig],
+    item: &mut Item,
+) -> Result<()> {
     for cfg in classifiers {
         let label = if cfg.kind == "llm" {
             if store.llm_classified(item.id, &cfg.id)? {
@@ -184,10 +175,20 @@ pub fn filter_for_chain(chain: &[&InboxConfig]) -> ItemFilter {
         if ib.timed {
             timed = true;
         }
-        if let Some(cutoff) = ib.newer_than.as_deref().and_then(parse_duration).map(|d| now - d) {
+        if let Some(cutoff) = ib
+            .newer_than
+            .as_deref()
+            .and_then(parse_duration)
+            .map(|d| now - d)
+        {
             newer_than = Some(newer_than.map_or(cutoff, |c| c.max(cutoff)));
         }
-        if let Some(cutoff) = ib.older_than.as_deref().and_then(parse_duration).map(|d| now - d) {
+        if let Some(cutoff) = ib
+            .older_than
+            .as_deref()
+            .and_then(parse_duration)
+            .map(|d| now - d)
+        {
             older_than = Some(older_than.map_or(cutoff, |c| c.min(cutoff)));
         }
     }
@@ -198,16 +199,14 @@ pub fn filter_for_chain(chain: &[&InboxConfig]) -> ItemFilter {
         unread_only: false,
         newer_than: newer_than.map(|c| c.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
         older_than: older_than.map(|c| c.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
-        order_by_start: chain.last().is_some_and(|ib| ib.view_kind() == "calendar"),
+        order_by_start: timed,
     }
 }
 
 /// Always deletes the item (user asked to forget it).
 pub fn forget(store: &Store, id: i64) -> Result<bool> {
     let gone = store.delete(id)?;
-    if gone {
-        bump();
-    }
+    if gone {}
     Ok(gone)
 }
 
@@ -236,7 +235,11 @@ fn keep_labels(config: &Config) -> Vec<String> {
     }
 }
 
-fn should_forget_stale(item: &StaleHint, config: &Config, now: chrono::DateTime<chrono::Utc>) -> bool {
+fn should_forget_stale(
+    item: &StaleHint,
+    config: &Config,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
     // `end` (not `start` alone) means "this has a deadline that passed" — a
     // calendar event. A start-only item (e.g. a chat message's send time) is
     // not a deadline, so it stays on the forget_after path like before.
@@ -266,95 +269,6 @@ fn nonempty(s: Option<&str>) -> Option<&str> {
     s.map(str::trim).filter(|s| !s.is_empty())
 }
 
-pub struct WatchGuard {
-    _watcher: RecommendedWatcher,
-    _thread: thread::JoinHandle<()>,
-}
-
-/// Watch every fs source directory. Debounced admit on create/modify.
-pub fn spawn_fs_watch(store: Store, paths: Paths) -> Result<WatchGuard> {
-    let (tx, rx) = mpsc::channel();
-    let mut watcher = notify::recommended_watcher(tx)?;
-    let config = Config::load(&paths.config_file).unwrap_or_default();
-    let mut watched: HashSet<PathBuf> = HashSet::new();
-    for src in &config.source {
-        if src.kind != "fs" {
-            continue;
-        }
-        if let Some(p) = src.path.as_deref() {
-            let dir = expand_path(p);
-            if dir.is_dir() {
-                watcher.watch(&dir, RecursiveMode::NonRecursive)?;
-                watched.insert(dir);
-            }
-        }
-    }
-    if watched.is_empty() && paths.incoming_dir.is_dir() {
-        watcher.watch(&paths.incoming_dir, RecursiveMode::NonRecursive)?;
-    }
-
-    let thread = thread::spawn(move || {
-        let debounce = Duration::from_millis(180);
-        loop {
-            let ev = match rx.recv() {
-                Ok(v) => v,
-                Err(_) => break,
-            };
-            let mut pending: HashSet<PathBuf> = HashSet::new();
-            collect_paths(&ev, &mut pending);
-            thread::sleep(debounce);
-            while let Ok(more) = rx.try_recv() {
-                collect_paths(&more, &mut pending);
-            }
-            let cfg = match Config::load(&paths.config_file) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            for path in pending {
-                if let Some(sid) = source_for_path(&cfg, &path, &paths) {
-                    let _ = admit_file(&store, &cfg, &sid, &path);
-                }
-            }
-        }
-    });
-
-    Ok(WatchGuard {
-        _watcher: watcher,
-        _thread: thread,
-    })
-}
-
-fn collect_paths(ev: &notify::Result<notify::Event>, out: &mut HashSet<PathBuf>) {
-    let Ok(event) = ev else { return };
-    match event.kind {
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Any => {}
-        _ => return,
-    }
-    for p in &event.paths {
-        out.insert(p.clone());
-    }
-}
-
-fn source_for_path(cfg: &Config, path: &Path, paths: &Paths) -> Option<String> {
-    let parent = path.parent()?;
-    for src in &cfg.source {
-        if src.kind != "fs" {
-            continue;
-        }
-        if let Some(p) = src.path.as_deref() {
-            let dir = expand_path(p);
-            if parent == dir.as_path() || path.starts_with(&dir) && path.parent() == Some(dir.as_path()) {
-                return Some(src.id.clone());
-            }
-        }
-    }
-    if parent == paths.incoming_dir.as_path() {
-        return Some("incoming".into());
-    }
-    None
-}
-
-
 /// First `kind=fs` source, else "incoming".
 pub fn default_send_source(config: &Config) -> String {
     config
@@ -363,18 +277,6 @@ pub fn default_send_source(config: &Config) -> String {
         .find(|s| s.kind == "fs")
         .map(|s| s.id.clone())
         .unwrap_or_else(|| "incoming".into())
-}
-
-pub fn source_can_send(config: &Config, source_id: &str) -> bool {
-    match config
-        .source
-        .iter()
-        .find(|s| s.id == source_id)
-        .map(|s| s.kind.as_str())
-    {
-        Some("rss") => false,
-        _ => true,
-    }
 }
 
 pub fn reply_title(parent: &Item) -> String {
@@ -478,10 +380,18 @@ pub fn send_draft(store: &Store, config: &Config, paths: &Paths, draft: Draft) -
             let dest = unique_path(&paths.incoming_dir.join(format!("{stem}.md")));
             std::fs::write(&dest, draft.body.as_bytes())?;
             let mut new = item_from_file(&source_id, &dest)?;
+            if !draft.title.trim().is_empty() {
+                new.title = draft.title.clone();
+            }
             new.thread = thread;
             new.in_reply_to = reply_foreign;
             new.to = draft.to.clone();
-            if let Some(fid) = draft.foreign_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(fid) = draft
+                .foreign_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 new.foreign_id = fid.to_string();
             }
             Ok(admit(store, config, new)?)
@@ -561,398 +471,32 @@ pub fn send_draft(store: &Store, config: &Config, paths: &Paths, draft: Draft) -
     }
 }
 
-
-/// One list row after thread collapse. `item` is the latest in the thread.
-#[derive(Debug, Clone)]
-pub struct ListRow {
-    pub item: Item,
-    pub count: usize,
-}
-
-/// Collapse items that share a non-empty `thread` into one row.
-/// Empty/missing thread stays a singleton. Same thread keeps the newest
-/// `created_at` (then highest id). Surviving heads stay in input order
-/// (store lists are already newest-first, or start order for calendar).
-pub fn collapse_threads(items: Vec<Item>) -> Vec<ListRow> {
-    let mut rows: Vec<ListRow> = Vec::new();
-    let mut at: HashMap<String, usize> = HashMap::new();
-    for item in items {
-        let key = item
-            .thread
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
-        match key {
-            None => rows.push(ListRow { item, count: 1 }),
-            Some(th) => {
-                if let Some(&i) = at.get(&th) {
-                    rows[i].count += 1;
-                    if is_newer_item(&item, &rows[i].item) {
-                        rows[i].item = item;
-                    }
-                } else {
-                    at.insert(th, rows.len());
-                    rows.push(ListRow { item, count: 1 });
-                }
-            }
-        }
-    }
-    rows
-}
-
-fn is_newer_item(a: &Item, b: &Item) -> bool {
-    match a.created_at.cmp(&b.created_at) {
-        std::cmp::Ordering::Greater => true,
-        std::cmp::Ordering::Equal => a.id > b.id,
-        std::cmp::Ordering::Less => false,
-    }
-}
-
-/// How to cluster the item list for display. Same across TUI and web — only
-/// the rendering of the group header differs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum GroupBy {
-    #[default]
-    None,
-    Sender,
-    Date,
-    Account,
-}
-
-impl GroupBy {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            GroupBy::None => "none",
-            GroupBy::Sender => "sender",
-            GroupBy::Date => "date",
-            GroupBy::Account => "account",
-        }
-    }
-
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "sender" => GroupBy::Sender,
-            "date" => GroupBy::Date,
-            "account" => GroupBy::Account,
-            _ => GroupBy::None,
-        }
-    }
-
-    /// Cycle order for a single "group" keypress/command.
-    pub fn next(self) -> Self {
-        match self {
-            GroupBy::None => GroupBy::Sender,
-            GroupBy::Sender => GroupBy::Date,
-            GroupBy::Date => GroupBy::Account,
-            GroupBy::Account => GroupBy::None,
-        }
-    }
-}
-
-/// The label an item falls under for a given grouping.
-pub fn group_key(item: &Item, config: &Config, by: GroupBy) -> String {
-    match by {
-        GroupBy::None => String::new(),
-        GroupBy::Sender => item
-            .from
-            .as_ref()
-            .map(|a| a.name.clone().unwrap_or_else(|| a.id.clone()))
-            .unwrap_or_else(|| "(unknown)".into()),
-        GroupBy::Date => item.created_at.chars().take(10).collect(),
-        GroupBy::Account => source_label(config, &item.source_id).to_string(),
-    }
-}
-
-/// Reorder rows so same-group rows are contiguous. Stable, so newest-first
-/// order survives within a group. Date is already contiguous in a
-/// newest-first list, so it's left as-is; sender/account need an actual sort.
-pub fn group_rows(mut rows: Vec<ListRow>, config: &Config, by: GroupBy) -> Vec<ListRow> {
-    if matches!(by, GroupBy::Sender | GroupBy::Account) {
-        rows.sort_by(|a, b| group_key(&a.item, config, by).cmp(&group_key(&b.item, config, by)));
-    }
-    rows
-}
-
-/// The single most useful thing to copy out of an item: a verification code
-/// if one is found, else the first link in the body. Shared by TUI (yank) and
-/// web (copy button) — same extraction, different delivery to the clipboard.
-pub fn copy_target(item: &Item) -> Option<String> {
-    extract_code(item).or_else(|| extract_link(item))
-}
-
-/// How far past a "code"-ish keyword to look for the value. Templates often
-/// put a sentence of filler ("...to enable your new device — it will expire
-/// in 30 minutes: 122cd3") between the two.
-const CODE_WINDOW: usize = 200;
-
-fn extract_code(item: &Item) -> Option<String> {
-    // Body first: the subject/title routinely says "your verification code"
-    // without the value anywhere near it — only the body has the real one.
-    // Searching title+body concatenated would let a title match "code" and
-    // then scan the *start* of the body (e.g. a date field) for nothing.
-    if let Some(code) = extract_code_from(&item.body) {
-        return Some(code);
-    }
-    if let Some(code) = extract_code_from(&item.title) {
-        return Some(code);
-    }
-    // No keyword nearby: only guess from bare digits when the item was
-    // already flagged as a code/verification email — avoids matching prices,
-    // dates, or invoice numbers on ordinary mail.
-    if item.labels.iter().any(|l| l == "code") {
-        return bare_code_re()
-            .find(&item.body)
-            .or_else(|| bare_code_re().find(&item.title))
-            .map(|m| m.as_str().to_string());
-    }
-    None
-}
-
-fn extract_code_from(text: &str) -> Option<String> {
-    let m = code_keyword_re().find(text)?;
-    let mut end = (m.end() + CODE_WINDOW).min(text.len());
-    while end > m.end() && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let window = &text[m.end()..end];
-    // Codes aren't always all-digit ("122cd3") — a plain contiguous run, no
-    // internal spaces (those would swallow neighboring words too). Skip
-    // plain words (no digit) in the window instead of giving up on the
-    // first one, since the code is often a few words further along.
-    alnum_token_re()
-        .find_iter(window)
-        .find(|m| m.as_str().chars().any(|c| c.is_ascii_digit()))
-        .map(|m| m.as_str().to_string())
-}
-
-fn extract_link(item: &Item) -> Option<String> {
-    let blob = format!("{} {}", item.title, item.body);
-    link_re()
-        .find(&blob)
-        .map(|m| m.as_str().trim_end_matches(['.', ',', ')', ']', '>']).to_string())
-}
-
-fn code_keyword_re() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"(?i)code|otp|passcode|pin|c[oó]digo").expect("valid regex"))
-}
-
-fn alnum_token_re() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\b[A-Za-z0-9]{4,10}\b").expect("valid regex"))
-}
-
-fn bare_code_re() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\b\d{4,8}\b").expect("valid regex"))
-}
-
-fn link_re() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r#"https?://[^\s<>"')\]]+"#).expect("valid regex"))
-}
-
-/// First non-empty line of body, whitespace collapsed.
-pub fn body_snippet(body: &str) -> String {
-    let line = body
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
-    collapse_ws(line)
-}
-
-fn collapse_ws(s: &str) -> String {
-    let mut out = String::new();
-    let mut gap = false;
-    for c in s.chars() {
-        if c.is_whitespace() {
-            gap = true;
+/// Which of the inbox chain's labels the item carries, and which classifiers
+/// on the way down could have stamped them. Best effort: a label can also
+/// come from a source or a hand.
+pub fn why(config: &Config, item: &Item, inbox_path: &[String]) -> String {
+    let refs: Vec<&str> = inbox_path.iter().map(|s| s.as_str()).collect();
+    let chain = config.find_chain(&refs).unwrap_or_default();
+    let has = |l: &str| item.labels.iter().any(|x| x == l);
+    let matched: Vec<&str> = chain
+        .iter()
+        .flat_map(|ib| ib.labels.iter())
+        .map(String::as_str)
+        .filter(|l| has(l))
+        .collect();
+    let fired: Vec<&str> = config
+        .classifier
+        .iter()
+        .chain(chain.iter().flat_map(|ib| ib.classifier.iter()))
+        .filter(|c| c.label.as_deref().is_some_and(has))
+        .map(|c| c.id.as_str())
+        .collect();
+    let dash = |v: Vec<&str>| {
+        if v.is_empty() {
+            "-".to_string()
         } else {
-            if gap && !out.is_empty() {
-                out.push(' ');
-            }
-            gap = false;
-            out.push(c);
+            v.join(" ")
         }
-    }
-    out
-}
-
-fn actor_label(actor: Option<&crate::store::Actor>) -> Option<String> {
-    let a = actor?;
-    let name = a
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    if let Some(n) = name {
-        return Some(n.to_string());
-    }
-    let id = a.id.trim();
-    if id.is_empty() {
-        None
-    } else {
-        Some(id.to_string())
-    }
-}
-
-/// Who + text for a list row (chat: title is the thread name; mail: title is the subject).
-pub fn row_who_text(item: &Item) -> (String, String) {
-    let from = actor_label(item.from.as_ref());
-    let title = item.title.trim();
-    let snippet = body_snippet(&item.body);
-    if let Some(ref from) = from {
-        if !title.is_empty() && title != from.as_str() {
-            let text = if snippet.is_empty() {
-                String::new()
-            } else {
-                format!("{from}: {snippet}")
-            };
-            return (title.to_string(), text);
-        }
-    }
-    let who = from.unwrap_or_else(|| title.to_string());
-    let text = if snippet.is_empty() {
-        title.to_string()
-    } else {
-        snippet
     };
-    (who, text)
+    format!("labels: {}  classifiers: {}", dash(matched), dash(fired))
 }
-
-/// Board / calendar prefix in front of the who/snippet.
-pub fn view_prefix(inbox: Option<&InboxConfig>, item: &Item) -> String {
-    match inbox.map(|ib| ib.view_kind()) {
-        Some("board") => format!(
-            "[{}] ",
-            inbox.and_then(|ib| ib.board_column(item)).unwrap_or("—")
-        ),
-        Some("calendar") => item
-            .start
-            .as_deref()
-            .map(|s| format!("{} ", s.chars().take(10).collect::<String>()))
-            .unwrap_or_default(),
-        _ => String::new(),
-    }
-}
-
-/// Display width: wide glyphs (CJK, emoji) count as 2.
-pub fn display_width(s: &str) -> usize {
-    s.chars().map(char_display_width).sum()
-}
-
-fn char_display_width(c: char) -> usize {
-    match c {
-        '\u{00AD}' => 0,
-        '\u{0300}'..='\u{036F}' | '\u{20D0}'..='\u{20FF}' => 0,
-        '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' => 0,
-        '\u{FE00}'..='\u{FE0F}' | '\u{FE20}'..='\u{FE2F}' => 0,
-        c if c.is_control() => 0,
-        '\u{1100}'..='\u{115F}'
-        | '\u{2329}'..='\u{232A}'
-        | '\u{2E80}'..='\u{A4CF}'
-        | '\u{AC00}'..='\u{D7A3}'
-        | '\u{F900}'..='\u{FAFF}'
-        | '\u{FE10}'..='\u{FE19}'
-        | '\u{FE30}'..='\u{FE6F}'
-        | '\u{FF01}'..='\u{FF60}'
-        | '\u{FFE0}'..='\u{FFE6}'
-        | '\u{2190}'..='\u{21FF}'
-        | '\u{2300}'..='\u{23FF}'
-        | '\u{2460}'..='\u{24FF}'
-        | '\u{25A0}'..='\u{27BF}'
-        | '\u{2900}'..='\u{297F}'
-        | '\u{2B00}'..='\u{2BFF}'
-        | '\u{1F000}'..='\u{1FAFF}' => 2,
-        _ => 1,
-    }
-}
-
-pub fn trunc_width(s: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    if display_width(s) <= max {
-        return s.to_string();
-    }
-    let budget = max.saturating_sub(1);
-    let mut out = String::new();
-    let mut w = 0;
-    for c in s.chars() {
-        let cw = char_display_width(c);
-        if w + cw > budget {
-            break;
-        }
-        w += cw;
-        out.push(c);
-    }
-    out.push('…');
-    out
-}
-
-pub fn pad_width(s: &str, width: usize) -> String {
-    let w = display_width(s);
-    if w >= width {
-        trunc_width(s, width)
-    } else {
-        format!("{s}{}", " ".repeat(width - w))
-    }
-}
-
-/// Show an inbox in the tree: always `all`, always the selected path (and ancestors),
-/// hide empty nodes, and hide children of a hidden parent.
-pub fn inbox_visible(
-    name: &str,
-    path: &[String],
-    total: usize,
-    selected: &[String],
-    parent_hidden: bool,
-) -> bool {
-    if name == "all" {
-        return true;
-    }
-    if !selected.is_empty() && selected.starts_with(path) {
-        return true;
-    }
-    if parent_hidden {
-        return false;
-    }
-    total > 0
-}
-
-pub fn filter_visible_inboxes(
-    nodes: &[crate::config::TreeNode],
-    selected: &[String],
-    total_of: impl Fn(&[String]) -> usize,
-) -> Vec<crate::config::TreeNode> {
-    let mut hidden: Vec<Vec<String>> = Vec::new();
-    let mut out = Vec::new();
-    for n in nodes {
-        let parent_hidden = hidden
-            .iter()
-            .any(|p| n.path.starts_with(p) && n.path.len() > p.len());
-        if inbox_visible(&n.inbox.name, &n.path, total_of(&n.path), selected, parent_hidden)
-        {
-            out.push(n.clone());
-        } else {
-            hidden.push(n.path.clone());
-        }
-    }
-    out
-}
-
-/// Open `todo` when that path exists and has items; else the first inbox (`all`).
-pub fn open_inbox_path(
-    tree: &[crate::config::TreeNode],
-    total_of: impl Fn(&[String]) -> usize,
-) -> Vec<String> {
-    tree.iter()
-        .find(|n| n.inbox.name == "todo" && total_of(&n.path) > 0)
-        .or_else(|| tree.first())
-        .map(|n| n.path.clone())
-        .unwrap_or_else(|| vec!["all".into()])
-}
-
-pub const IDLE_HINT: &str = ":cmd  /search  ?help  q";

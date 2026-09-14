@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::source::NewItem;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PartKind {
     #[default]
     Text,
@@ -43,7 +45,8 @@ impl PartKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ActorKind {
     #[default]
     Person,
@@ -69,14 +72,14 @@ impl ActorKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct Actor {
     pub id: String,
     pub name: Option<String>,
     pub kind: ActorKind,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Part {
     pub id: i64,
     pub seq: i64,
@@ -95,7 +98,7 @@ pub struct NewPart {
     pub src: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Item {
     pub id: i64,
     pub source_id: String,
@@ -165,8 +168,7 @@ impl Store {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
-        let conn = Connection::open(path)
-            .with_context(|| format!("open {}", path.display()))?;
+        let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(
@@ -396,16 +398,6 @@ impl Store {
         Ok((id, created))
     }
 
-    pub fn update_body(&self, source_id: &str, foreign_id: &str, title: &str, body: &str, href: Option<&str>) -> Result<bool> {
-        let conn = self.lock()?;
-        conn.execute(
-            "UPDATE items SET title = ?1, body = ?2, href = ?3
-             WHERE source_id = ?4 AND foreign_id = ?5",
-            params![title, body, href, source_id, foreign_id],
-        )?;
-        Ok(conn.changes() > 0)
-    }
-
     pub fn get(&self, id: i64) -> Result<Item> {
         let conn = self.lock()?;
         let mut item = conn.query_row(
@@ -427,9 +419,7 @@ impl Store {
     /// id + times + labels only. For forget_stale.
     pub fn list_stale_hints(&self) -> Result<Vec<StaleHint>> {
         let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, source_id, created_at, start, end FROM items",
-        )?;
+        let mut stmt = conn.prepare("SELECT id, source_id, created_at, start, end FROM items")?;
         let mut hints: Vec<StaleHint> = stmt
             .query_map([], |row| {
                 Ok(StaleHint {
@@ -444,7 +434,9 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         let mut lab_stmt = conn.prepare("SELECT item_id, label FROM labels")?;
-        let labs = lab_stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+        let labs = lab_stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
         let mut map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
         for row in labs {
             let (id, label) = row?;
@@ -539,13 +531,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn toggle_read(&self, id: i64) -> Result<bool> {
-        let mut item = self.get(id)?;
-        item.read = !item.read;
-        self.set_read(id, item.read)?;
-        Ok(item.read)
-    }
-
     pub fn add_label(&self, id: i64, label: &str) -> Result<()> {
         let label = label.trim();
         if label.is_empty() {
@@ -566,21 +551,6 @@ impl Store {
             params![id, label],
         )?;
         Ok(())
-    }
-
-    pub fn toggle_label(&self, id: i64, label: &str) -> Result<bool> {
-        let label = label.trim();
-        if label.is_empty() {
-            return Ok(false);
-        }
-        let item = self.get(id)?;
-        if item.labels.iter().any(|l| l == label) {
-            self.remove_label(id, label)?;
-            Ok(false)
-        } else {
-            self.add_label(id, label)?;
-            Ok(true)
-        }
     }
 
     /// Has an LLM classifier already run on this item? Re-admit keeps this
@@ -636,32 +606,6 @@ impl Store {
             params![thread, item_id],
         )?;
         Ok(())
-    }
-
-    pub fn set_in_reply_to(&self, item_id: i64, parent: Option<i64>) -> Result<()> {
-        let conn = self.lock()?;
-        conn.execute(
-            "UPDATE items SET in_reply_to = ?1 WHERE id = ?2",
-            params![parent, item_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_to(&self, item_id: i64, to: &[Actor]) -> Result<()> {
-        let conn = self.lock()?;
-        conn.execute("DELETE FROM item_to WHERE item_id = ?1", params![item_id])?;
-        insert_to_rows(&conn, item_id, to)?;
-        Ok(())
-    }
-
-    pub fn get_part(&self, id: i64) -> Result<Part> {
-        let conn = self.lock()?;
-        conn.query_row(
-            "SELECT id, seq, kind, mime, text, path FROM parts WHERE id = ?1",
-            params![id],
-            row_part,
-        )
-        .with_context(|| format!("part {id}"))
     }
 
     pub fn part_abs_path(&self, part: &Part) -> Option<PathBuf> {
@@ -734,7 +678,11 @@ fn actor_cols(actor: Option<&Actor>) -> (Option<String>, Option<String>, Option<
     }
 }
 
-fn actor_from_cols(id: Option<String>, name: Option<String>, kind: Option<String>) -> Option<Actor> {
+fn actor_from_cols(
+    id: Option<String>,
+    name: Option<String>,
+    kind: Option<String>,
+) -> Option<Actor> {
     let id = id.and_then(|s| trim_opt(Some(&s)))?;
     Some(Actor {
         id,
@@ -758,9 +706,8 @@ fn insert_to_rows(conn: &Connection, item_id: i64, to: &[Actor]) -> Result<()> {
 }
 
 fn to_for(conn: &Connection, id: i64) -> Result<Vec<Actor>> {
-    let mut stmt = conn.prepare(
-        "SELECT actor_id, name, kind FROM item_to WHERE item_id = ?1 ORDER BY actor_id",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT actor_id, name, kind FROM item_to WHERE item_id = ?1 ORDER BY actor_id")?;
     let rows = stmt.query_map(params![id], |row| {
         Ok(Actor {
             id: row.get(0)?,
@@ -786,14 +733,7 @@ fn insert_part_row(
     conn.execute(
         "INSERT INTO parts (item_id, seq, kind, mime, text, path)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            item_id,
-            seq,
-            part.kind.as_str(),
-            part.mime,
-            part.text,
-            path
-        ],
+        params![item_id, seq, part.kind.as_str(), part.mime, part.text, path],
     )?;
     Ok(conn.last_insert_rowid())
 }

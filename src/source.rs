@@ -144,8 +144,8 @@ pub fn pull_rss(source_id: &str, url: &str) -> Result<Vec<NewItem>> {
         .with_context(|| format!("fetch {url}"))?
         .bytes()
         .with_context(|| format!("read {url}"))?;
-    let channel = rss::Channel::read_from(&bytes[..])
-        .with_context(|| format!("parse rss {url}"))?;
+    let channel =
+        rss::Channel::read_from(&bytes[..]).with_context(|| format!("parse rss {url}"))?;
     let mut out = Vec::new();
     for it in channel.items() {
         let href = it.link().map(|s| s.to_string());
