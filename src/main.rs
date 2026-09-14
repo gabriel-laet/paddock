@@ -1,11 +1,10 @@
-//! Thin CLI over the paddock kernel. Every command has a `--json` form so
-//! other programs (and agents) can drive it.
+//! Thin CLI over the kernel. Every command has a `--json` form so other
+//! programs and agents can drive it.
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use paddock::{
-    classify_item, filter_for_chain, forget, forget_stale, init, label, load_or_init, pull_all,
-    send_draft, why, Actor, Config, Draft, Item, Paths, Store,
+    init, kernel, load, load_config, Actor, Config, Draft, Item, Kernel, Paths, Question, Store,
 };
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -84,108 +83,112 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = Paths::from_env();
     if !cli.local && !matches!(cli.cmd, Cmd::Init { .. }) {
-        let cfg_remote = Config::load(&paths.config_file).ok().and_then(|c| c.remote);
-        let env = std::env::var("PADDOCK_REMOTE").ok();
-        if let Some(host) =
-            resolve_remote(cli.remote.as_deref(), env.as_deref(), cfg_remote.as_deref())
-        {
-            return run_remote(&host);
+        let from_config = load_config(&paths.config_file).ok().and_then(|c| c.remote);
+        let from_env = std::env::var("PADDOCK_REMOTE").ok();
+        let host = [
+            cli.remote.as_deref(),
+            from_env.as_deref(),
+            from_config.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|h| !h.is_empty());
+        if let Some(host) = host {
+            return run_remote(host);
         }
         if cli.remote.is_some() {
             bail!("no remote host (pass --remote=HOST, set PADDOCK_REMOTE, or config remote)");
         }
     }
-    let json = cli.json;
+    if let Cmd::Init { here } = cli.cmd {
+        let paths = if here {
+            Paths::here(&std::env::current_dir()?)
+        } else {
+            paths
+        };
+        init(&paths)?;
+        println!("config   {}", paths.config_file.display());
+        println!("data     {}", paths.data_dir.display());
+        println!("incoming {}", paths.incoming_dir.display());
+        return Ok(());
+    }
+    let (config, store) = load(&paths)?;
+    let k = kernel(&config, &store);
     let out = std::io::stdout();
     let mut out = out.lock();
-    match cli.cmd {
-        Cmd::Init { here } => {
-            let paths = if here {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-                Paths::here(&cwd)
-            } else {
-                paths
-            };
-            init(&paths)?;
-            writeln!(out, "config   {}", paths.config_file.display())?;
-            writeln!(out, "data     {}", paths.data_dir.display())?;
-            writeln!(out, "incoming {}", paths.incoming_dir.display())?;
+    let mut emit = |id: i64| -> Result<()> {
+        let it = store.get(id)?;
+        if cli.json {
+            writeln!(out, "{}", serde_json::to_string(&it)?)?;
+        } else {
+            writeln!(out, "{}", line(&it))?;
         }
+        Ok(())
+    };
+    match cli.cmd {
+        Cmd::Init { .. } => unreachable!(),
         Cmd::Pull => {
-            let (config, store) = load_or_init(&paths)?;
-            let n = pull_all(&store, &config)?;
-            let f = forget_stale(&store, &config)?;
-            if json {
-                writeln!(out, "{}", serde_json::json!({ "admitted": n, "forgot": f }))?;
+            let admitted = k.pull()?;
+            let forgot = k.forget_stale()?;
+            let warnings = k.take_warnings();
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "admitted": admitted, "forgot": forgot, "warnings": warnings })
+                );
             } else {
-                writeln!(out, "admitted {n}, forgot {f}")?;
+                println!("admitted {admitted}, forgot {forgot}");
+                for w in warnings {
+                    eprintln!("warning: {w}");
+                }
             }
         }
         Cmd::Inboxes => {
-            let (config, store) = load_or_init(&paths)?;
             let rows: Vec<serde_json::Value> = config
-                .flatten()
-                .into_iter()
+                .nodes()
+                .iter()
                 .map(|node| {
                     let (unread, total) = counts(&config, &store, &node.path);
                     serde_json::json!({ "path": node.path.join("/"), "unread": unread, "total": total })
                 })
                 .collect();
-            if json {
-                writeln!(out, "{}", serde_json::Value::Array(rows))?;
+            if cli.json {
+                println!("{}", serde_json::Value::Array(rows));
             } else {
                 for r in rows {
-                    writeln!(
-                        out,
+                    println!(
                         "{:<24} {}/{}",
                         r["path"].as_str().unwrap_or(""),
                         r["unread"],
                         r["total"]
-                    )?;
+                    );
                 }
             }
         }
         Cmd::Ls { inbox, unread } => {
-            let (config, store) = load_or_init(&paths)?;
             let path = split_path(inbox.as_deref());
-            let chain = chain_or_bail(&config, &path)?;
-            let mut filter = filter_for_chain(&chain);
-            filter.unread_only = unread;
-            let items = store.list_filtered(&filter)?;
-            if json {
-                writeln!(out, "{}", serde_json::to_string(&items)?)?;
-            } else {
-                for it in &items {
-                    writeln!(out, "{}", line(it))?;
-                }
-            }
+            let mut q = Question::of(&chain(&config, &path)?);
+            q.unread = unread;
+            list(&store.ask(&q)?, cli.json)?;
         }
         Cmd::Show { id } => {
-            let (_, store) = load_or_init(&paths)?;
             let it = store.get(id)?;
-            if json {
-                writeln!(out, "{}", serde_json::to_string(&it)?)?;
+            if cli.json {
+                println!("{}", serde_json::to_string(&it)?);
             } else {
-                show(&mut out, &it)?;
+                show(&it)?;
             }
         }
         Cmd::Thread { id } => {
-            let (_, store) = load_or_init(&paths)?;
             let it = store.get(id)?;
             let items = match it.thread.as_deref() {
-                Some(t) => store.items_in_thread(t)?,
+                Some(t) => store.thread(t)?,
                 None => vec![it],
             };
-            if json {
-                writeln!(out, "{}", serde_json::to_string(&items)?)?;
-            } else {
-                for it in &items {
-                    writeln!(out, "{}", line(it))?;
-                }
-            }
+            list(&items, cli.json)?;
         }
         Cmd::Label { id, labels } => {
-            let (config, store) = load_or_init(&paths)?;
             let (add, remove): (Vec<String>, Vec<String>) =
                 labels.into_iter().partition(|l| !l.starts_with('-'));
             let add: Vec<String> = add
@@ -193,38 +196,33 @@ fn main() -> Result<()> {
                 .map(|l| l.trim_start_matches('+').to_string())
                 .collect();
             let remove: Vec<String> = remove.iter().map(|l| l[1..].to_string()).collect();
-            label(&store, &config, id, &add, &remove)?;
-            emit_item(&mut out, &store, id, json)?;
+            k.label(id, &add, &remove)?;
+            emit(id)?;
         }
         Cmd::Read { id } => {
-            let (_, store) = load_or_init(&paths)?;
             store.set_read(id, true)?;
-            emit_item(&mut out, &store, id, json)?;
+            emit(id)?;
         }
         Cmd::Unread { id } => {
-            let (_, store) = load_or_init(&paths)?;
             store.set_read(id, false)?;
-            emit_item(&mut out, &store, id, json)?;
+            emit(id)?;
         }
         Cmd::Forget { id } => {
-            let (_, store) = load_or_init(&paths)?;
-            let gone = forget(&store, id)?;
-            if json {
-                writeln!(out, "{}", serde_json::json!({ "id": id, "forgot": gone }))?;
+            let gone = k.forget(id)?;
+            if cli.json {
+                println!("{}", serde_json::json!({ "id": id, "forgot": gone }));
             } else {
-                writeln!(out, "{}", if gone { "forgot" } else { "no item" })?;
+                println!("{}", if gone { "forgot" } else { "no item" });
             }
         }
         Cmd::Classify { id } => {
-            let (config, store) = load_or_init(&paths)?;
-            classify_item(&store, &config, id)?;
-            emit_item(&mut out, &store, id, json)?;
+            k.classify(id)?;
+            emit(id)?;
         }
         Cmd::Why { id, inbox } => {
-            let (config, store) = load_or_init(&paths)?;
             let it = store.get(id)?;
             let path = split_path(inbox.as_deref());
-            writeln!(out, "{}  {}", path.join("/"), why(&config, &it, &path))?;
+            println!("{}  {}", path.join("/"), k.why(&it, &path));
         }
         Cmd::Send {
             title,
@@ -233,7 +231,6 @@ fn main() -> Result<()> {
             to,
             body,
         } => {
-            let (config, store) = load_or_init(&paths)?;
             let body = match body {
                 Some(b) => b,
                 None => {
@@ -242,28 +239,20 @@ fn main() -> Result<()> {
                     s
                 }
             };
-            let mut title = title.unwrap_or_default();
-            let mut source_id = source.unwrap_or_default();
-            if let Some(pid) = reply {
-                let parent = store.get(pid)?;
-                if source_id.is_empty() {
-                    source_id = parent.source_id.clone();
+            let title = title.unwrap_or_else(|| {
+                if reply.is_some() {
+                    String::new()
+                } else {
+                    body.lines()
+                        .next()
+                        .unwrap_or("untitled")
+                        .chars()
+                        .take(80)
+                        .collect()
                 }
-                if title.trim().is_empty() {
-                    title = paddock::reply_title(&parent);
-                }
-            }
-            if title.trim().is_empty() {
-                title = body
-                    .lines()
-                    .next()
-                    .unwrap_or("untitled")
-                    .chars()
-                    .take(80)
-                    .collect();
-            }
+            });
             let draft = Draft {
-                source_id,
+                source_id: source.unwrap_or_default(),
                 title,
                 body,
                 reply_to: reply,
@@ -276,13 +265,10 @@ fn main() -> Result<()> {
                     .collect(),
                 ..Default::default()
             };
-            let id = send_draft(&store, &config, &paths, draft)?;
-            emit_item(&mut out, &store, id, json)?;
+            let id = k.send(draft)?;
+            emit(id)?;
         }
-        Cmd::Context => {
-            let (config, store) = load_or_init(&paths)?;
-            write_context(&paths, &config, &store, &mut out)?;
-        }
+        Cmd::Context => context(&paths, &k)?,
     }
     Ok(())
 }
@@ -295,30 +281,31 @@ fn split_path(s: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-fn chain_or_bail<'a>(config: &'a Config, path: &[String]) -> Result<Vec<&'a paddock::InboxConfig>> {
+fn chain<'a>(config: &'a Config, path: &[String]) -> Result<Vec<&'a paddock::Inbox>> {
     let refs: Vec<&str> = path.iter().map(String::as_str).collect();
     config
-        .find_chain(&refs)
+        .chain(&refs)
         .ok_or_else(|| anyhow::anyhow!("no inbox {}", path.join("/")))
 }
 
-fn counts(config: &Config, store: &Store, path: &[String]) -> (usize, usize) {
-    let Ok(chain) = chain_or_bail(config, path) else {
+fn counts(config: &Config, store: &dyn Store, path: &[String]) -> (usize, usize) {
+    let Ok(chain) = chain(config, path) else {
         return (0, 0);
     };
-    let mut filter = filter_for_chain(&chain);
-    let total = store.count_filtered(&filter).unwrap_or(0);
-    filter.unread_only = true;
-    let unread = store.count_filtered(&filter).unwrap_or(0);
+    let mut q = Question::of(&chain);
+    let total = store.count(&q).unwrap_or(0);
+    q.unread = true;
+    let unread = store.count(&q).unwrap_or(0);
     (unread, total)
 }
 
-fn emit_item(out: &mut impl Write, store: &Store, id: i64, json: bool) -> Result<()> {
-    let it = store.get(id)?;
+fn list(items: &[Item], json: bool) -> Result<()> {
     if json {
-        writeln!(out, "{}", serde_json::to_string(&it)?)?;
+        println!("{}", serde_json::to_string(items)?);
     } else {
-        writeln!(out, "{}", line(&it))?;
+        for it in items {
+            println!("{}", line(it));
+        }
     }
     Ok(())
 }
@@ -326,7 +313,6 @@ fn emit_item(out: &mut impl Write, store: &Store, id: i64, json: bool) -> Result
 /// One line per item: id, unread mark, date, source, from, title, labels.
 fn line(it: &Item) -> String {
     let mark = if it.read { " " } else { "*" };
-    let when = it.start.as_deref().unwrap_or(&it.created_at);
     let from = it
         .from
         .as_ref()
@@ -337,29 +323,34 @@ fn line(it: &Item) -> String {
     } else {
         format!("  [{}]", it.labels.join(" "))
     };
-    let first_line = it.title.lines().next().unwrap_or("");
+    let title = it.title.lines().next().unwrap_or("");
     format!(
-        "{:>5} {mark} {:.10}  {:<10} {:<20} {first_line}{labels}",
-        it.id, when, it.source_id, from
+        "{:>5} {mark} {:.10}  {:<10} {:<20} {title}{labels}",
+        it.id,
+        it.when(),
+        it.source_id,
+        from
     )
 }
 
-fn show(out: &mut impl Write, it: &Item) -> Result<()> {
-    writeln!(out, "id       {}", it.id)?;
-    writeln!(out, "source   {}", it.source_id)?;
-    writeln!(out, "foreign  {}", it.foreign_id)?;
-    writeln!(out, "title    {}", it.title)?;
+fn show(it: &Item) -> Result<()> {
+    let out = std::io::stdout();
+    let mut w = out.lock();
+    writeln!(w, "id       {}", it.id)?;
+    writeln!(w, "source   {}", it.source_id)?;
+    writeln!(w, "foreign  {}", it.foreign_id)?;
+    writeln!(w, "title    {}", it.title)?;
     if let Some(a) = &it.from {
-        writeln!(out, "from     {}", actor(a))?;
+        writeln!(w, "from     {}", actor(a))?;
     }
     if !it.to.is_empty() {
         writeln!(
-            out,
+            w,
             "to       {}",
             it.to.iter().map(actor).collect::<Vec<_>>().join(", ")
         )?;
     }
-    writeln!(out, "created  {}", it.created_at)?;
+    writeln!(w, "created  {}", it.created_at)?;
     for (k, v) in [
         ("start", &it.start),
         ("end", &it.end),
@@ -367,33 +358,30 @@ fn show(out: &mut impl Write, it: &Item) -> Result<()> {
         ("href", &it.href),
     ] {
         if let Some(v) = v {
-            writeln!(out, "{k:<8} {v}")?;
+            writeln!(w, "{k:<8} {v}")?;
         }
     }
     if let Some(p) = it.in_reply_to {
-        writeln!(out, "reply-to #{p}")?;
+        writeln!(w, "reply-to #{p}")?;
     }
     if let Some(p) = it.forward_of {
-        writeln!(out, "forward  #{p}")?;
+        writeln!(w, "forward  #{p}")?;
     }
     if let Some(ex) = &it.cite_excerpt {
-        writeln!(
-            out,
-            "cites    {}{}",
-            it.cite_actor
-                .as_ref()
-                .map(|a| format!("{}: ", actor(a)))
-                .unwrap_or_default(),
-            ex
-        )?;
+        let who = it
+            .cite_actor
+            .as_ref()
+            .map(|a| format!("{}: ", actor(a)))
+            .unwrap_or_default();
+        writeln!(w, "cites    {who}{ex}")?;
     }
-    writeln!(out, "read     {}", it.read)?;
-    writeln!(out, "labels   {}", it.labels.join(" "))?;
-    writeln!(out)?;
+    writeln!(w, "read     {}", it.read)?;
+    writeln!(w, "labels   {}", it.labels.join(" "))?;
+    writeln!(w)?;
     for p in &it.parts {
         match (&p.text, &p.path) {
-            (Some(t), _) => writeln!(out, "{t}")?,
-            (None, Some(path)) => writeln!(out, "[{} {} {path}]", p.kind.as_str(), p.mime)?,
+            (Some(t), _) => writeln!(w, "{t}")?,
+            (None, Some(path)) => writeln!(w, "[{} {} {path}]", p.kind.as_str(), p.mime)?,
             _ => {}
         }
     }
@@ -408,7 +396,11 @@ fn actor(a: &Actor) -> String {
 }
 
 /// Agent-ready dump of this host. No secrets. Safe to pipe.
-fn write_context(paths: &Paths, config: &Config, store: &Store, w: &mut impl Write) -> Result<()> {
+fn context(paths: &Paths, k: &Kernel) -> Result<()> {
+    let config = k.config;
+    let store = k.store;
+    let out = std::io::stdout();
+    let mut w = out.lock();
     writeln!(w, "# paddock\n")?;
     writeln!(
         w,
@@ -421,7 +413,7 @@ fn write_context(paths: &Paths, config: &Config, store: &Store, w: &mut impl Wri
     )?;
     writeln!(w, "A source admits items and may send. kinds: fs, rss, exec. rss cannot send. exec runs `{{cmd}} {{args}} pull|send`.")?;
     writeln!(w, "Inboxes nest. A child is a tighter question over the parent. Match: sources AND labels (all) AND timed (start set) AND age.")?;
-    writeln!(w, "Classifiers are per-inbox, ordered, kinds regex | script | llm. They stamp labels. They are not sources.")?;
+    writeln!(w, "Classifiers are per-inbox, ordered, kinds regex | script (CEL) | llm. They stamp labels. They are not sources.")?;
     writeln!(w, "Actor kind is person | group | list.")?;
     writeln!(w, "Admit upserts on (source_id, foreign_id). Re-admit refreshes the item and keeps read + labels.\n")?;
     writeln!(w, "## this host")?;
@@ -443,18 +435,18 @@ fn write_context(paths: &Paths, config: &Config, store: &Store, w: &mut impl Wri
         writeln!(w, "{}  kind={}  items={n}  {extra}", src.id, src.kind)?;
     }
     for (id, n) in &by_src {
-        if !config.source.iter().any(|s| s.id == *id) {
+        if config.source(id).is_none() {
             writeln!(w, "{id}  items={n}  (not in config)")?;
         }
     }
-    writeln!(
-        w,
-        "total {}  timed {}\n",
-        store.count_all()?,
-        store.count_timed()?
-    )?;
+    let total = store.count(&Question::default())?;
+    let timed = store.count(&Question {
+        timed: true,
+        ..Default::default()
+    })?;
+    writeln!(w, "total {total}  timed {timed}\n")?;
     writeln!(w, "## inboxes")?;
-    for node in config.flatten() {
+    for node in config.nodes() {
         let (unread, total) = counts(config, store, &node.path);
         let ib = &node.inbox;
         write!(w, "{}  unread={unread}  items={total}", node.path.join("/"))?;
@@ -476,17 +468,6 @@ fn write_context(paths: &Paths, config: &Config, store: &Store, w: &mut impl Wri
     writeln!(w, "paddock pull | inboxes | ls [INBOX] [--unread] | show ID | thread ID | label ID [+l|-l]... | read ID | unread ID | forget ID | classify ID | why ID [INBOX] | send [--title T] [--reply ID] [--to A]... [BODY]")?;
     writeln!(w, "Add --json to any command for machine output. Edit config.toml, then `paddock pull`. Do not invent nouns.")?;
     Ok(())
-}
-
-fn resolve_remote(flag: Option<&str>, env: Option<&str>, config: Option<&str>) -> Option<String> {
-    let nonempty = |s: Option<&str>| {
-        s.map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    nonempty(flag)
-        .or_else(|| nonempty(env))
-        .or_else(|| nonempty(config))
 }
 
 /// Re-run this exact command line on `host` over ssh, forcing `--local` there.

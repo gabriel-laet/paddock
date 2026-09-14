@@ -43,7 +43,7 @@ fn nested_config_parses() {
 
 #[test]
 fn inbox_match_empty_is_everything() {
-    let ib = InboxConfig {
+    let ib = Inbox {
         name: "all".into(),
         ..Default::default()
     };
@@ -63,7 +63,7 @@ fn inbox_match_empty_is_everything() {
         parts: vec![],
         ..Default::default()
     };
-    assert!(inbox_matches(&ib, &item));
+    assert!(Question::of(&[&ib]).matches(&item));
 }
 
 #[test]
@@ -89,34 +89,34 @@ fn newer_than_and_older_than_partition_by_effective_date() {
     old.id = 2;
     old.start = Some((now - chrono::Duration::days(30)).to_rfc3339());
 
-    let recent_ib = InboxConfig {
+    let recent_ib = Inbox {
         name: "recent".into(),
         newer_than: Some("14d".into()),
         ..Default::default()
     };
-    assert!(inbox_matches(&recent_ib, &recent));
-    assert!(!inbox_matches(&recent_ib, &old));
+    assert!(Question::of(&[&recent_ib]).matches(&recent));
+    assert!(!Question::of(&[&recent_ib]).matches(&old));
 
-    let dormant_ib = InboxConfig {
+    let dormant_ib = Inbox {
         name: "dormant".into(),
         older_than: Some("14d".into()),
         ..Default::default()
     };
-    assert!(!inbox_matches(&dormant_ib, &recent));
-    assert!(inbox_matches(&dormant_ib, &old));
+    assert!(!Question::of(&[&dormant_ib]).matches(&recent));
+    assert!(Question::of(&[&dormant_ib]).matches(&old));
 
     // No start at all: falls back to created_at, still matches "recent".
     recent.start = None;
-    assert!(inbox_matches(&recent_ib, &recent));
+    assert!(Question::of(&[&recent_ib]).matches(&recent));
 }
 
 #[test]
 fn child_requires_all_listed_labels() {
-    let parent = InboxConfig {
+    let parent = Inbox {
         name: "all".into(),
         ..Default::default()
     };
-    let child = InboxConfig {
+    let child = Inbox {
         name: "later".into(),
         labels: vec!["later".into()],
         ..Default::default()
@@ -137,22 +137,22 @@ fn child_requires_all_listed_labels() {
         parts: vec![],
         ..Default::default()
     };
-    assert!(inbox_matches(&parent, &item));
-    assert!(!inbox_matches(&child, &item));
+    assert!(Question::of(&[&parent]).matches(&item));
+    assert!(!Question::of(&[&child]).matches(&item));
     item.labels.push("later".into());
-    assert!(inbox_matches(&child, &item));
+    assert!(Question::of(&[&child]).matches(&item));
     assert!(items_match_chain(&[&parent, &child], &item));
 }
 
-fn items_match_chain(chain: &[&InboxConfig], item: &Item) -> bool {
-    chain.iter().all(|ib| inbox_matches(ib, item))
+fn items_match_chain(chain: &[&Inbox], item: &Item) -> bool {
+    chain.iter().all(|ib| Question::of(&[&ib]).matches(&item))
 }
 
 #[test]
 fn unique_on_source_and_foreign_id() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
     let n = NewItem {
         source_id: "incoming".into(),
         foreign_id: "note.md".into(),
@@ -165,20 +165,21 @@ fn unique_on_source_and_foreign_id() {
         parts: vec![],
         ..Default::default()
     };
-    let a = store.insert_new(&n).unwrap();
-    let b = store.insert_new(&n).unwrap();
-    assert!(a.is_some());
-    assert!(b.is_none());
-    assert_eq!(store.list_all().unwrap().len(), 1);
+    let a = store.upsert(&n).unwrap();
+    let b = store.upsert(&n).unwrap();
+    assert!(a.1);
+    assert!(!b.1);
+    assert_eq!(a.0, b.0);
+    assert_eq!(store.ask(&Question::default()).unwrap().len(), 1);
 }
 
 #[test]
 fn llm_classified_marks_and_persists() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
     let id = store
-        .insert_new(&NewItem {
+        .upsert(&NewItem {
             source_id: "incoming".into(),
             foreign_id: "x.md".into(),
             title: "note".into(),
@@ -191,19 +192,19 @@ fn llm_classified_marks_and_persists() {
             ..Default::default()
         })
         .unwrap()
-        .unwrap();
-    assert!(!store.llm_classified(id, "important").unwrap());
-    store.mark_llm_classified(id, "important").unwrap();
-    assert!(store.llm_classified(id, "important").unwrap());
+        .0;
+    assert!(!store.classified(id, "important").unwrap());
+    store.mark_classified(id, "important").unwrap();
+    assert!(store.classified(id, "important").unwrap());
     // Distinct classifier id on the same item is tracked separately.
-    assert!(!store.llm_classified(id, "other").unwrap());
+    assert!(!store.classified(id, "other").unwrap());
     // Marking twice does not error (INSERT OR IGNORE).
-    store.mark_llm_classified(id, "important").unwrap();
+    store.mark_classified(id, "important").unwrap();
 }
 
 #[test]
 fn regex_classifier_case_insensitive() {
-    let cfg = ClassifierConfig {
+    let cfg = ClassifierSpec {
         id: "flag-rfc".into(),
         kind: "regex".into(),
         pattern: Some("(?i)rfc".into()),
@@ -238,9 +239,9 @@ fn regex_classifier_case_insensitive() {
 fn classify_todo_regex_enters_todo_inbox() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
     let id = store
-        .insert_new(&NewItem {
+        .upsert(&NewItem {
             source_id: "incoming".into(),
             foreign_id: "t.md".into(),
             title: "note".into(),
@@ -253,13 +254,14 @@ fn classify_todo_regex_enters_todo_inbox() {
             ..Default::default()
         })
         .unwrap()
-        .unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    classify_item(&store, &cfg, id).unwrap();
+        .0;
+    let cfg = load_config(&paths.config_file).unwrap();
+    let k = kernel(&cfg, &store);
+    k.classify(id).unwrap();
     let item = store.get(id).unwrap();
     assert!(item.labels.contains(&"todo".into()), "root flag-todo regex");
-    let chain = cfg.find_chain(&["all", "todo"]).unwrap();
-    let listed = items_in_chain(&store, &chain).unwrap();
+    let chain = cfg.chain(&["all", "todo"]).unwrap();
+    let listed = k.ask(&chain).unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, id);
 }
@@ -291,10 +293,11 @@ path = "/tmp"
 "#,
     )
     .unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
     let id = store
-        .insert_new(&NewItem {
+        .upsert(&NewItem {
             source_id: "incoming".into(),
             foreign_id: "x.md".into(),
             title: "note".into(),
@@ -307,24 +310,21 @@ path = "/tmp"
             ..Default::default()
         })
         .unwrap()
-        .unwrap();
-    classify_item(&store, &cfg, id).unwrap();
+        .0;
+    k.classify(id).unwrap();
     let item = store.get(id).unwrap();
     assert!(!item.labels.contains(&"todo".into()));
     assert!(!item.labels.contains(&"urgent".into()));
 
-    label(&store, &cfg, id, &["todo".into()], &[]).unwrap();
+    k.label(id, &["todo".into()], &[]).unwrap();
     let item = store.get(id).unwrap();
     assert!(item.labels.contains(&"todo".into()));
     assert!(
         item.labels.contains(&"urgent".into()),
         "child classifier after enter"
     );
-    let chain = cfg.find_chain(&["all", "todo"]).unwrap();
-    assert!(items_in_chain(&store, &chain)
-        .unwrap()
-        .iter()
-        .any(|i| i.id == id));
+    let chain = cfg.chain(&["all", "todo"]).unwrap();
+    assert!(k.ask(&chain).unwrap().iter().any(|i| i.id == id));
 }
 
 #[test]
@@ -333,12 +333,13 @@ fn admit_file_reclassifies_on_update() {
     init(&paths).unwrap();
     let p = paths.incoming_dir.join("note.md");
     fs::write(&p, "hello").unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    let id = admit_file(&store, &cfg, "incoming", &p).unwrap().unwrap();
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    let id = k.admit(item_from_file("incoming", &p).unwrap()).unwrap();
     assert!(!store.get(id).unwrap().labels.contains(&"todo".into()));
     fs::write(&p, "hello todo").unwrap();
-    let id2 = admit_file(&store, &cfg, "incoming", &p).unwrap().unwrap();
+    let id2 = k.admit(item_from_file("incoming", &p).unwrap()).unwrap();
     assert_eq!(id, id2);
     assert!(store.get(id).unwrap().labels.contains(&"todo".into()));
 }
@@ -352,20 +353,21 @@ fn fs_pull_and_chain_query() {
     fs::create_dir_all(paths.incoming_dir.join("subdir")).unwrap();
     fs::write(paths.incoming_dir.join("subdir").join("nested.md"), "no").unwrap();
 
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    let n = pull_all(&store, &cfg).unwrap();
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    let n = k.pull().unwrap();
     assert_eq!(n, 1);
-    let items = store.list_all().unwrap();
+    let items = store.ask(&Question::default()).unwrap();
     assert_eq!(items[0].foreign_id, "hello.md");
     assert_eq!(items[0].title, "hello");
     assert_eq!(items[0].body, "hello body");
 
-    let all = cfg.find_chain(&["all"]).unwrap();
-    let listed = items_in_chain(&store, &all).unwrap();
+    let all = cfg.chain(&["all"]).unwrap();
+    let listed = k.ask(&all).unwrap();
     assert_eq!(listed.len(), 1);
-    let later = cfg.find_chain(&["all", "later"]).unwrap();
-    assert!(items_in_chain(&store, &later).unwrap().is_empty());
+    let later = cfg.chain(&["all", "later"]).unwrap();
+    assert!(k.ask(&later).unwrap().is_empty());
 }
 
 #[test]
@@ -374,16 +376,17 @@ fn admit_file_classifies() {
     init(&paths).unwrap();
     let p = paths.incoming_dir.join("rfc-note.md");
     fs::write(&p, "see the rfc please").unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    let id = admit_file(&store, &cfg, "incoming", &p).unwrap().unwrap();
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    let id = k.admit(item_from_file("incoming", &p).unwrap()).unwrap();
     let item = store.get(id).unwrap();
     assert!(item.labels.contains(&"rfc".into()));
 }
 
 #[test]
 fn source_filter_and_label_and() {
-    let ib = InboxConfig {
+    let ib = Inbox {
         name: "mail".into(),
         sources: vec!["a".into()],
         labels: vec!["x".into(), "y".into()],
@@ -405,11 +408,11 @@ fn source_filter_and_label_and() {
         parts: vec![],
         ..Default::default()
     };
-    assert!(!inbox_matches(&ib, &item));
+    assert!(!Question::of(&[&ib]).matches(&item));
     item.source_id = "a".into();
-    assert!(inbox_matches(&ib, &item));
+    assert!(Question::of(&[&ib]).matches(&item));
     item.labels = vec!["x".into()];
-    assert!(!inbox_matches(&ib, &item));
+    assert!(!Question::of(&[&ib]).matches(&item));
 }
 
 #[test]
@@ -444,8 +447,8 @@ fn opens_legacy_db_without_thread_column() {
         )
         .unwrap();
     }
-    let store = Store::open(&db).unwrap();
-    let items = store.list_all().unwrap();
+    let store = Sqlite::open(&db).unwrap();
+    let items = store.ask(&Question::default()).unwrap();
     assert_eq!(items.len(), 1);
     assert!(items[0].thread.is_none());
     assert_eq!(items[0].body, "hello");
@@ -455,9 +458,9 @@ fn opens_legacy_db_without_thread_column() {
 fn store_roundtrip_start_end() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
     let id = store
-        .insert_new(&NewItem {
+        .upsert(&NewItem {
             source_id: "incoming".into(),
             foreign_id: "meet.md".into(),
             title: "meet".into(),
@@ -470,7 +473,7 @@ fn store_roundtrip_start_end() {
             ..Default::default()
         })
         .unwrap()
-        .unwrap();
+        .0;
     let item = store.get(id).unwrap();
     assert_eq!(item.start.as_deref(), Some("2026-08-18T15:00:00Z"));
     assert_eq!(item.end.as_deref(), Some("2026-08-18T16:00:00Z"));
@@ -561,9 +564,9 @@ fn init_here_creates_dot_paddock() {
 fn insert_body_only_synthesizes_text_part() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
     let id = store
-        .insert_new(&NewItem {
+        .upsert(&NewItem {
             source_id: "incoming".into(),
             foreign_id: "n.md".into(),
             title: "note".into(),
@@ -576,7 +579,7 @@ fn insert_body_only_synthesizes_text_part() {
             ..Default::default()
         })
         .unwrap()
-        .unwrap();
+        .0;
     let item = store.get(id).unwrap();
     assert_eq!(item.body, "hello body");
     assert_eq!(item.parts.len(), 1);
@@ -591,9 +594,9 @@ fn insert_body_only_synthesizes_text_part() {
 fn insert_image_and_text_parts() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
     let id = store
-        .insert_new(&NewItem {
+        .upsert(&NewItem {
             source_id: "incoming".into(),
             foreign_id: "pic.md".into(),
             title: "pic".into(),
@@ -621,7 +624,7 @@ fn insert_image_and_text_parts() {
             ..Default::default()
         })
         .unwrap()
-        .unwrap();
+        .0;
     let item = store.get(id).unwrap();
     assert_eq!(item.body, "caption");
     assert_eq!(item.parts.len(), 2);
@@ -634,35 +637,18 @@ fn insert_image_and_text_parts() {
         .starts_with("parts/"));
     assert_eq!(item.parts[1].kind, PartKind::Text);
     assert_eq!(item.parts[1].text.as_deref(), Some("caption"));
-    let listed = store.list_all().unwrap();
+    let listed = store.ask(&Question::default()).unwrap();
     assert_eq!(listed[0].parts.len(), 2);
     assert_eq!(listed[0].body, "caption");
-    let extra = store
-        .add_part(
-            id,
-            &NewPart {
-                kind: PartKind::File,
-                mime: "application/pdf".into(),
-                text: None,
-                bytes: Some(b"%PDF".to_vec()),
-                src: None,
-            },
-        )
-        .unwrap();
-    assert!(extra > 0);
-    let item = store.get(id).unwrap();
-    assert_eq!(item.parts.len(), 3);
-    assert_eq!(item.parts[2].kind, PartKind::File);
-    assert_eq!(item.body, "caption");
 }
 
 #[test]
 fn set_thread_and_items_in_thread() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
     let a = store
-        .insert_new(&NewItem {
+        .upsert(&NewItem {
             source_id: "incoming".into(),
             foreign_id: "a.md".into(),
             title: "a".into(),
@@ -675,9 +661,9 @@ fn set_thread_and_items_in_thread() {
             ..Default::default()
         })
         .unwrap()
-        .unwrap();
+        .0;
     let b = store
-        .insert_new(&NewItem {
+        .upsert(&NewItem {
             source_id: "incoming".into(),
             foreign_id: "b.md".into(),
             title: "b".into(),
@@ -690,10 +676,10 @@ fn set_thread_and_items_in_thread() {
             ..Default::default()
         })
         .unwrap()
-        .unwrap();
+        .0;
     store.set_thread(b, Some("conv-1")).unwrap();
     let c = store
-        .insert_new(&NewItem {
+        .upsert(&NewItem {
             source_id: "incoming".into(),
             foreign_id: "c.md".into(),
             title: "c".into(),
@@ -706,8 +692,8 @@ fn set_thread_and_items_in_thread() {
             ..Default::default()
         })
         .unwrap()
-        .unwrap();
-    let got = store.items_in_thread("conv-1").unwrap();
+        .0;
+    let got = store.thread("conv-1").unwrap();
     let ids: Vec<i64> = got.iter().map(|i| i.id).collect();
     assert_eq!(got.len(), 2);
     assert!(ids.contains(&a));
@@ -716,14 +702,14 @@ fn set_thread_and_items_in_thread() {
     assert_eq!(store.get(b).unwrap().thread.as_deref(), Some("conv-1"));
     store.set_thread(b, None).unwrap();
     assert!(store.get(b).unwrap().thread.is_none());
-    assert_eq!(store.items_in_thread("conv-1").unwrap().len(), 1);
+    assert_eq!(store.thread("conv-1").unwrap().len(), 1);
 }
 
 #[test]
 fn backfill_parts_from_body() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let _ = Store::open(&paths.db_path).unwrap();
+    let _ = Sqlite::open(&paths.db_path).unwrap();
     {
         let conn = rusqlite::Connection::open(&paths.db_path).unwrap();
         conn.execute(
@@ -733,8 +719,8 @@ fn backfill_parts_from_body() {
         )
         .unwrap();
     }
-    let store = Store::open(&paths.db_path).unwrap();
-    let items = store.list_all().unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let items = store.ask(&Question::default()).unwrap();
     let item = items.iter().find(|i| i.foreign_id == "old.md").unwrap();
     assert_eq!(item.body, "legacy body");
     assert_eq!(item.parts.len(), 1);
@@ -748,20 +734,17 @@ fn backfill_parts_from_body() {
 fn send_draft_fs_writes_file_and_text_part() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    let id = send_draft(
-        &store,
-        &cfg,
-        &paths,
-        Draft {
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    let id = k
+        .send(Draft {
             source_id: "incoming".into(),
             title: "Hello World".into(),
             body: "the body".into(),
             ..Default::default()
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     let dest = paths.incoming_dir.join("Hello-World.md");
     assert!(dest.exists(), "{}", dest.display());
     assert_eq!(std::fs::read_to_string(&dest).unwrap(), "the body");
@@ -778,10 +761,11 @@ fn send_draft_fs_writes_file_and_text_part() {
 fn reply_shares_thread_and_sets_in_reply_to() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
     let parent = store
-        .insert_new(&NewItem {
+        .upsert(&NewItem {
             source_id: "incoming".into(),
             foreign_id: "p.md".into(),
             title: "parent".into(),
@@ -789,28 +773,24 @@ fn reply_shares_thread_and_sets_in_reply_to() {
             ..Default::default()
         })
         .unwrap()
-        .unwrap();
+        .0;
     assert!(store.get(parent).unwrap().thread.is_none());
-    let id = send_draft(
-        &store,
-        &cfg,
-        &paths,
-        Draft {
+    let id = k
+        .send(Draft {
             source_id: "incoming".into(),
             title: "re: parent".into(),
             body: "second".into(),
             reply_to: Some(parent),
             ..Default::default()
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     let parent_item = store.get(parent).unwrap();
     let child = store.get(id).unwrap();
     let th = parent_item.thread.clone().expect("parent thread");
     assert_eq!(child.thread.as_deref(), Some(th.as_str()));
     assert_eq!(th, "incoming:p.md");
     assert_eq!(child.in_reply_to, Some(parent));
-    let in_th = store.items_in_thread(&th).unwrap();
+    let in_th = store.thread(&th).unwrap();
     let ids: Vec<i64> = in_th.iter().map(|i| i.id).collect();
     assert_eq!(in_th.len(), 2);
     assert!(ids.contains(&parent));
@@ -834,20 +814,17 @@ url = "https://example.com/feed.xml"
 "#,
     )
     .unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    let err = send_draft(
-        &store,
-        &cfg,
-        &paths,
-        Draft {
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    let err = k
+        .send(Draft {
             source_id: "feed".into(),
             title: "nope".into(),
             body: "x".into(),
             ..Default::default()
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
     assert!(err.to_string().contains("source cannot send"), "{err}");
 }
 
@@ -855,9 +832,9 @@ url = "https://example.com/feed.xml"
 fn insert_from_to_actors() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
     let id = store
-        .insert_new(&NewItem {
+        .upsert(&NewItem {
             source_id: "incoming".into(),
             foreign_id: "m.md".into(),
             title: "note".into(),
@@ -882,7 +859,7 @@ fn insert_from_to_actors() {
             ..Default::default()
         })
         .unwrap()
-        .unwrap();
+        .0;
     let item = store.get(id).unwrap();
     let from = item.from.expect("from");
     assert_eq!(from.id, "ann@x");
@@ -893,7 +870,7 @@ fn insert_from_to_actors() {
     assert_eq!(item.to[0].kind, ActorKind::List);
     assert_eq!(item.to[1].id, "g1");
     assert_eq!(item.to[1].kind, ActorKind::Group);
-    let listed = store.list_all().unwrap();
+    let listed = store.ask(&Question::default()).unwrap();
     assert_eq!(listed[0].to.len(), 2);
     assert!(listed[0].from.is_some());
 }
@@ -904,9 +881,10 @@ fn fs_video_part() {
     init(&paths).unwrap();
     let p = paths.incoming_dir.join("clip.mp4");
     std::fs::write(&p, b"ftyp").unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    let id = admit_file(&store, &cfg, "incoming", &p).unwrap().unwrap();
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    let id = k.admit(item_from_file("incoming", &p).unwrap()).unwrap();
     let item = store.get(id).unwrap();
     assert_eq!(item.body, "clip.mp4");
     assert_eq!(item.parts.len(), 1);
@@ -919,7 +897,7 @@ fn fs_video_part() {
         .starts_with("parts/"));
     let part = item.parts[0].clone();
     assert_eq!(part.kind, PartKind::Video);
-    let abs = store.part_abs_path(&part).unwrap();
+    let abs = store.part_path(&part).unwrap();
     assert!(abs.exists());
 }
 
@@ -927,33 +905,28 @@ fn fs_video_part() {
 fn admit_reply_resolves_parent() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    let parent = admit(
-        &store,
-        &cfg,
-        NewItem {
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    let parent = k
+        .admit(NewItem {
             source_id: "incoming".into(),
             foreign_id: "p.md".into(),
             title: "parent".into(),
             body: "first".into(),
             ..Default::default()
-        },
-    )
-    .unwrap();
-    let child = admit(
-        &store,
-        &cfg,
-        NewItem {
+        })
+        .unwrap();
+    let child = k
+        .admit(NewItem {
             source_id: "incoming".into(),
             foreign_id: "c.md".into(),
             title: "re: parent".into(),
             body: "second".into(),
             in_reply_to: Some("p.md".into()),
             ..Default::default()
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert_eq!(store.get(child).unwrap().in_reply_to, Some(parent));
 }
 
@@ -961,12 +934,11 @@ fn admit_reply_resolves_parent() {
 fn admit_reply_before_parent_stitches() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    let child = admit(
-        &store,
-        &cfg,
-        NewItem {
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    let child = k
+        .admit(NewItem {
             source_id: "incoming".into(),
             foreign_id: "c.md".into(),
             title: "re: parent".into(),
@@ -974,26 +946,22 @@ fn admit_reply_before_parent_stitches() {
             in_reply_to: Some("p.md".into()),
             cite_excerpt: Some("first".into()),
             ..Default::default()
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert!(store.get(child).unwrap().in_reply_to.is_none());
     assert_eq!(
         store.get(child).unwrap().cite_excerpt.as_deref(),
         Some("first")
     );
-    let parent = admit(
-        &store,
-        &cfg,
-        NewItem {
+    let parent = k
+        .admit(NewItem {
             source_id: "incoming".into(),
             foreign_id: "p.md".into(),
             title: "parent".into(),
             body: "first".into(),
             ..Default::default()
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert_eq!(store.get(child).unwrap().in_reply_to, Some(parent));
 }
 
@@ -1001,33 +969,28 @@ fn admit_reply_before_parent_stitches() {
 fn admit_forward_resolves() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    let src = admit(
-        &store,
-        &cfg,
-        NewItem {
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    let src = k
+        .admit(NewItem {
             source_id: "incoming".into(),
             foreign_id: "orig.md".into(),
             title: "orig".into(),
             body: "hello".into(),
             ..Default::default()
-        },
-    )
-    .unwrap();
-    let fwd = admit(
-        &store,
-        &cfg,
-        NewItem {
+        })
+        .unwrap();
+    let fwd = k
+        .admit(NewItem {
             source_id: "incoming".into(),
             foreign_id: "fwd.md".into(),
             title: "fwd".into(),
             body: "hello".into(),
             forward_of: Some("orig.md".into()),
             ..Default::default()
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert_eq!(store.get(fwd).unwrap().forward_of, Some(src));
 }
 
@@ -1035,26 +998,22 @@ fn admit_forward_resolves() {
 fn readmit_updates_item_keeps_labels_and_read() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    let id = admit(
-        &store,
-        &cfg,
-        NewItem {
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    let id = k
+        .admit(NewItem {
             source_id: "incoming".into(),
             foreign_id: "n.md".into(),
             title: "old".into(),
             body: "hello".into(),
             ..Default::default()
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     store.add_label(id, "keep").unwrap();
     store.set_read(id, true).unwrap();
-    let id2 = admit(
-        &store,
-        &cfg,
-        NewItem {
+    let id2 = k
+        .admit(NewItem {
             source_id: "incoming".into(),
             foreign_id: "n.md".into(),
             title: "new".into(),
@@ -1073,9 +1032,8 @@ fn readmit_updates_item_keeps_labels_and_read() {
                 kind: ActorKind::List,
             }],
             ..Default::default()
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert_eq!(id, id2);
     let item = store.get(id).unwrap();
     assert_eq!(item.title, "new");
@@ -1095,21 +1053,18 @@ fn readmit_updates_item_keeps_labels_and_read() {
 fn send_draft_keeps_source_foreign_id() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    let id = send_draft(
-        &store,
-        &cfg,
-        &paths,
-        Draft {
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    let id = k
+        .send(Draft {
             source_id: String::new(),
             title: "note".into(),
             body: "x".into(),
             foreign_id: Some("mid-1".into()),
             ..Default::default()
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert_eq!(store.get(id).unwrap().foreign_id, "mid-1");
 }
 
@@ -1176,11 +1131,12 @@ fn exec_pull_admits_items_including_timed() {
     init(&paths).unwrap();
     let helper = write_exec_helper(tmp.path());
     fs::write(&paths.config_file, exec_source_toml(&helper)).unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    let n = pull_all(&store, &cfg).unwrap();
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    let n = k.pull().unwrap();
     assert_eq!(n, 2);
-    let items = store.list_all().unwrap();
+    let items = store.ask(&Question::default()).unwrap();
     assert_eq!(items.len(), 2);
     let note = items.iter().find(|i| i.foreign_id == "note-1").unwrap();
     assert_eq!(note.source_id, "plug");
@@ -1192,10 +1148,10 @@ fn exec_pull_admits_items_including_timed() {
     assert_eq!(meet.start.as_deref(), Some("2026-08-18T15:00:00Z"));
     assert_eq!(meet.end.as_deref(), Some("2026-08-18T16:00:00Z"));
 
-    let all = cfg.find_chain(&["all"]).unwrap();
-    assert_eq!(items_in_chain(&store, &all).unwrap().len(), 2);
-    let cal = cfg.find_chain(&["all", "cal"]).unwrap();
-    let timed = items_in_chain(&store, &cal).unwrap();
+    let all = cfg.chain(&["all"]).unwrap();
+    assert_eq!(k.ask(&all).unwrap().len(), 2);
+    let cal = cfg.chain(&["all", "cal"]).unwrap();
+    let timed = k.ask(&cal).unwrap();
     assert_eq!(timed.len(), 1);
     assert_eq!(timed[0].foreign_id, "meet-1");
 }
@@ -1206,20 +1162,17 @@ fn exec_send_uses_returned_foreign_id() {
     init(&paths).unwrap();
     let helper = write_exec_helper(tmp.path());
     fs::write(&paths.config_file, exec_source_toml(&helper)).unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    let id = send_draft(
-        &store,
-        &cfg,
-        &paths,
-        Draft {
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    let id = k
+        .send(Draft {
             source_id: "plug".into(),
             title: "hello".into(),
             body: "out".into(),
             ..Default::default()
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     let item = store.get(id).unwrap();
     assert_eq!(item.foreign_id, "sent-1");
     assert_eq!(item.title, "hello");
@@ -1246,9 +1199,10 @@ cmd = "paddock-no-such-exec-cmd"
 "#,
     )
     .unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    let err = pull_all(&store, &cfg).unwrap_err();
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    let err = k.pull().unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("cannot run")
@@ -1256,18 +1210,14 @@ cmd = "paddock-no-such-exec-cmd"
             || msg.contains("paddock-no-such-exec-cmd"),
         "{msg}"
     );
-    let err = send_draft(
-        &store,
-        &cfg,
-        &paths,
-        Draft {
+    let err = k
+        .send(Draft {
             source_id: "gone".into(),
             title: "x".into(),
             body: "y".into(),
             ..Default::default()
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("cannot run")
@@ -1280,7 +1230,7 @@ cmd = "paddock-no-such-exec-cmd"
 
 #[test]
 fn timed_inbox_requires_start() {
-    let ib = InboxConfig {
+    let ib = Inbox {
         name: "cal".into(),
         timed: true,
         ..Default::default()
@@ -1301,13 +1251,13 @@ fn timed_inbox_requires_start() {
         parts: vec![],
         ..Default::default()
     };
-    assert!(!inbox_matches(&ib, &item));
+    assert!(!Question::of(&[&ib]).matches(&item));
     item.start = Some("2026-08-18T15:00:00Z".into());
-    assert!(inbox_matches(&ib, &item));
+    assert!(Question::of(&[&ib]).matches(&item));
 }
 
 #[test]
-fn calendar_view_sorts_by_start() {
+fn timed_inbox_sorts_by_start() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
     fs::write(
@@ -1327,36 +1277,29 @@ path = "/tmp"
 "#,
     )
     .unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    admit(
-        &store,
-        &cfg,
-        NewItem {
-            source_id: "incoming".into(),
-            foreign_id: "late".into(),
-            title: "late".into(),
-            body: "b".into(),
-            start: Some("2026-08-19T18:00:00Z".into()),
-            ..Default::default()
-        },
-    )
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    k.admit(NewItem {
+        source_id: "incoming".into(),
+        foreign_id: "late".into(),
+        title: "late".into(),
+        body: "b".into(),
+        start: Some("2026-08-19T18:00:00Z".into()),
+        ..Default::default()
+    })
     .unwrap();
-    admit(
-        &store,
-        &cfg,
-        NewItem {
-            source_id: "incoming".into(),
-            foreign_id: "early".into(),
-            title: "early".into(),
-            body: "a".into(),
-            start: Some("2026-08-19T09:00:00Z".into()),
-            ..Default::default()
-        },
-    )
+    k.admit(NewItem {
+        source_id: "incoming".into(),
+        foreign_id: "early".into(),
+        title: "early".into(),
+        body: "a".into(),
+        start: Some("2026-08-19T09:00:00Z".into()),
+        ..Default::default()
+    })
     .unwrap();
-    let cal = cfg.find_chain(&["all", "cal"]).unwrap();
-    let listed = items_in_chain(&store, &cal).unwrap();
+    let cal = cfg.chain(&["all", "cal"]).unwrap();
+    let listed = k.ask(&cal).unwrap();
     assert_eq!(listed.len(), 2);
     assert_eq!(listed[0].foreign_id, "early");
     assert_eq!(listed[1].foreign_id, "late");
@@ -1383,9 +1326,9 @@ fn default_init_has_no_brand_exec_sources() {
 fn forget_deletes_the_row() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
     let id = store
-        .insert_new(&NewItem {
+        .upsert(&NewItem {
             source_id: "incoming".into(),
             foreign_id: "gone.md".into(),
             title: "gone".into(),
@@ -1393,10 +1336,10 @@ fn forget_deletes_the_row() {
             ..Default::default()
         })
         .unwrap()
-        .unwrap();
-    assert!(forget(&store, id).unwrap());
-    assert!(store.list_all().unwrap().is_empty());
-    assert!(!forget(&store, id).unwrap());
+        .0;
+    assert!(store.delete(id).unwrap());
+    assert!(store.ask(&Question::default()).unwrap().is_empty());
+    assert!(!store.delete(id).unwrap());
 }
 
 fn yesterday() -> String {
@@ -1409,26 +1352,23 @@ fn yesterday() -> String {
 fn forget_stale_drops_past_timed() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
     let y = yesterday();
-    admit(
-        &store,
-        &cfg,
-        NewItem {
-            source_id: "incoming".into(),
-            foreign_id: "old-meet".into(),
-            title: "old meet".into(),
-            body: "done".into(),
-            start: Some(y.clone()),
-            end: Some(y),
-            ..Default::default()
-        },
-    )
+    k.admit(NewItem {
+        source_id: "incoming".into(),
+        foreign_id: "old-meet".into(),
+        title: "old meet".into(),
+        body: "done".into(),
+        start: Some(y.clone()),
+        end: Some(y),
+        ..Default::default()
+    })
     .unwrap();
-    let n = forget_stale(&store, &cfg).unwrap();
+    let n = k.forget_stale().unwrap();
     assert_eq!(n, 1);
-    assert!(store.list_all().unwrap().is_empty());
+    assert!(store.ask(&Question::default()).unwrap().is_empty());
 }
 
 #[test]
@@ -1437,37 +1377,33 @@ fn forget_stale_keeps_start_only_past_item() {
     // time), not a deadline — it must not trip the "past timed" forget path.
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    admit(
-        &store,
-        &cfg,
-        NewItem {
-            source_id: "incoming".into(),
-            foreign_id: "old-msg".into(),
-            title: "old msg".into(),
-            body: "hi".into(),
-            start: Some(yesterday()),
-            ..Default::default()
-        },
-    )
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    k.admit(NewItem {
+        source_id: "incoming".into(),
+        foreign_id: "old-msg".into(),
+        title: "old msg".into(),
+        body: "hi".into(),
+        start: Some(yesterday()),
+        ..Default::default()
+    })
     .unwrap();
-    let n = forget_stale(&store, &cfg).unwrap();
+    let n = k.forget_stale().unwrap();
     assert_eq!(n, 0);
-    assert_eq!(store.list_all().unwrap().len(), 1);
+    assert_eq!(store.ask(&Question::default()).unwrap().len(), 1);
 }
 
 #[test]
 fn forget_stale_keeps_past_timed_todo() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
     let y = yesterday();
-    let id = admit(
-        &store,
-        &cfg,
-        NewItem {
+    let id = k
+        .admit(NewItem {
             source_id: "incoming".into(),
             foreign_id: "keep-meet".into(),
             title: "keep meet".into(),
@@ -1475,36 +1411,32 @@ fn forget_stale_keeps_past_timed_todo() {
             start: Some(y.clone()),
             end: Some(y),
             ..Default::default()
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     store.add_label(id, "todo").unwrap();
-    let n = forget_stale(&store, &cfg).unwrap();
+    let n = k.forget_stale().unwrap();
     assert_eq!(n, 0);
-    assert_eq!(store.list_all().unwrap().len(), 1);
+    assert_eq!(store.ask(&Question::default()).unwrap().len(), 1);
 }
 
 #[test]
 fn forget_stale_keeps_untimed_when_forget_after_unset() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    admit(
-        &store,
-        &cfg,
-        NewItem {
-            source_id: "incoming".into(),
-            foreign_id: "note.md".into(),
-            title: "note".into(),
-            body: "stay".into(),
-            ..Default::default()
-        },
-    )
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    k.admit(NewItem {
+        source_id: "incoming".into(),
+        foreign_id: "note.md".into(),
+        title: "note".into(),
+        body: "stay".into(),
+        ..Default::default()
+    })
     .unwrap();
-    let n = forget_stale(&store, &cfg).unwrap();
+    let n = k.forget_stale().unwrap();
     assert_eq!(n, 0);
-    assert_eq!(store.list_all().unwrap().len(), 1);
+    assert_eq!(store.ask(&Question::default()).unwrap().len(), 1);
 }
 
 #[test]
@@ -1527,10 +1459,11 @@ path = "/tmp"
 "#,
     )
     .unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
     let id = store
-        .insert_new(&NewItem {
+        .upsert(&NewItem {
             source_id: "incoming".into(),
             foreign_id: "old.md".into(),
             title: "old".into(),
@@ -1538,7 +1471,7 @@ path = "/tmp"
             ..Default::default()
         })
         .unwrap()
-        .unwrap();
+        .0;
     let old = (chrono::Utc::now() - chrono::Duration::days(3))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     {
@@ -1549,9 +1482,9 @@ path = "/tmp"
         )
         .unwrap();
     }
-    let n = forget_stale(&store, &cfg).unwrap();
+    let n = k.forget_stale().unwrap();
     assert_eq!(n, 1);
-    assert!(store.list_all().unwrap().is_empty());
+    assert!(store.ask(&Question::default()).unwrap().is_empty());
 }
 
 #[test]
@@ -1575,10 +1508,11 @@ forget_after = "30d"
 "#,
     )
     .unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
     let id = store
-        .insert_new(&NewItem {
+        .upsert(&NewItem {
             source_id: "incoming".into(),
             foreign_id: "mid.md".into(),
             title: "mid".into(),
@@ -1586,7 +1520,7 @@ forget_after = "30d"
             ..Default::default()
         })
         .unwrap()
-        .unwrap();
+        .0;
     let old = (chrono::Utc::now() - chrono::Duration::days(3))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     {
@@ -1597,69 +1531,70 @@ forget_after = "30d"
         )
         .unwrap();
     }
-    let n = forget_stale(&store, &cfg).unwrap();
+    let n = k.forget_stale().unwrap();
     assert_eq!(n, 0);
-    assert_eq!(store.list_all().unwrap().len(), 1);
+    assert_eq!(store.ask(&Question::default()).unwrap().len(), 1);
 }
 
 #[test]
 fn items_in_chain_cal_still_only_timed() {
     let (_tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    let cfg = Config::load(&paths.config_file).unwrap();
-    let store = Store::open(&paths.db_path).unwrap();
-    admit(
-        &store,
-        &cfg,
-        NewItem {
-            source_id: "incoming".into(),
-            foreign_id: "note".into(),
-            title: "note".into(),
-            body: "plain".into(),
-            ..Default::default()
-        },
-    )
+    let cfg = load_config(&paths.config_file).unwrap();
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let k = kernel(&cfg, &store);
+    k.admit(NewItem {
+        source_id: "incoming".into(),
+        foreign_id: "note".into(),
+        title: "note".into(),
+        body: "plain".into(),
+        ..Default::default()
+    })
     .unwrap();
-    admit(
-        &store,
-        &cfg,
-        NewItem {
-            source_id: "incoming".into(),
-            foreign_id: "meet".into(),
-            title: "meet".into(),
-            body: "sync".into(),
-            start: Some("2026-08-19T12:00:00Z".into()),
-            ..Default::default()
-        },
-    )
+    k.admit(NewItem {
+        source_id: "incoming".into(),
+        foreign_id: "meet".into(),
+        title: "meet".into(),
+        body: "sync".into(),
+        start: Some("2026-08-19T12:00:00Z".into()),
+        ..Default::default()
+    })
     .unwrap();
-    let all = cfg.find_chain(&["all"]).unwrap();
-    assert_eq!(items_in_chain(&store, &all).unwrap().len(), 2);
-    let cal = cfg.find_chain(&["all", "cal"]).unwrap();
-    let timed = items_in_chain(&store, &cal).unwrap();
+    let all = cfg.chain(&["all"]).unwrap();
+    assert_eq!(k.ask(&all).unwrap().len(), 2);
+    let cal = cfg.chain(&["all", "cal"]).unwrap();
+    let timed = k.ask(&cal).unwrap();
     assert_eq!(timed.len(), 1);
     assert_eq!(timed[0].foreign_id, "meet");
-    assert_eq!(store.count_timed().unwrap(), 1);
-    assert_eq!(store.count_all().unwrap(), 2);
+    assert_eq!(
+        store
+            .count(&Question {
+                timed: true,
+                ..Default::default()
+            })
+            .unwrap(),
+        1
+    );
+    assert_eq!(store.count(&Question::default()).unwrap(), 2);
 }
 
 #[test]
 fn source_label_falls_back_to_id() {
     let cfg = Config {
         source: vec![
-            SourceConfig {
+            SourceSpec {
                 id: "chat".into(),
                 kind: "exec".into(),
                 name: Some("Messages".into()),
                 ..Default::default()
             },
-            SourceConfig {
+            SourceSpec {
                 id: "incoming".into(),
                 kind: "fs".into(),
                 name: None,
                 ..Default::default()
             },
-            SourceConfig {
+            SourceSpec {
                 id: "blank".into(),
                 kind: "fs".into(),
                 name: Some("   ".into()),
@@ -1668,10 +1603,10 @@ fn source_label_falls_back_to_id() {
         ],
         ..Default::default()
     };
-    assert_eq!(source_label(&cfg, "chat"), "Messages");
-    assert_eq!(source_label(&cfg, "incoming"), "incoming");
-    assert_eq!(source_label(&cfg, "blank"), "blank");
-    assert_eq!(source_label(&cfg, "missing"), "missing");
+    assert_eq!(cfg.source_name("chat"), "Messages");
+    assert_eq!(cfg.source_name("incoming"), "incoming");
+    assert_eq!(cfg.source_name("blank"), "blank");
+    assert_eq!(cfg.source_name("missing"), "missing");
 }
 
 static PATH_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());

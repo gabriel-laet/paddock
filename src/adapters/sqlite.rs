@@ -1,165 +1,25 @@
+//! SQLite behind the `Store` port. Part bytes live under `data_dir/parts`.
+
 use anyhow::{Context, Result};
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
-use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::source::NewItem;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PartKind {
-    #[default]
-    Text,
-    File,
-    Image,
-    Audio,
-    Video,
-}
-
-impl PartKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::File => "file",
-            Self::Image => "image",
-            Self::Audio => "audio",
-            Self::Video => "video",
-        }
-    }
-
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "text" => Self::Text,
-            "file" => Self::File,
-            "image" => Self::Image,
-            "audio" => Self::Audio,
-            "video" => Self::Video,
-            _ => Self::File,
-        }
-    }
-
-    pub fn is_media(self) -> bool {
-        matches!(self, Self::Image | Self::Audio | Self::Video)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ActorKind {
-    #[default]
-    Person,
-    Group,
-    List,
-}
-
-impl ActorKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Person => "person",
-            Self::Group => "group",
-            Self::List => "list",
-        }
-    }
-
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "group" => Self::Group,
-            "list" => Self::List,
-            _ => Self::Person,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
-pub struct Actor {
-    pub id: String,
-    pub name: Option<String>,
-    pub kind: ActorKind,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Part {
-    pub id: i64,
-    pub seq: i64,
-    pub kind: PartKind,
-    pub mime: String,
-    pub text: Option<String>,
-    pub path: Option<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct NewPart {
-    pub kind: PartKind,
-    pub mime: String,
-    pub text: Option<String>,
-    pub bytes: Option<Vec<u8>>,
-    pub src: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct Item {
-    pub id: i64,
-    pub source_id: String,
-    pub foreign_id: String,
-    pub title: String,
-    pub body: String,
-    pub href: Option<String>,
-    pub start: Option<String>,
-    pub end: Option<String>,
-    pub thread: Option<String>,
-    pub created_at: String,
-    pub read: bool,
-    pub labels: Vec<String>,
-    pub parts: Vec<Part>,
-    pub from: Option<Actor>,
-    pub to: Vec<Actor>,
-    pub in_reply_to: Option<i64>,
-    pub forward_of: Option<i64>,
-    pub cite_excerpt: Option<String>,
-    pub cite_actor: Option<Actor>,
-}
+use crate::kernel::{
+    Actor, ActorKind, Item, NewItem, NewPart, Part, PartKind, Question, StaleHint, Store,
+};
 
 const ITEM_COLS: &str =
     "id, source_id, foreign_id, title, body, href, start, end, created_at, read, thread,      from_id, from_name, from_kind, in_reply_to, forward_of, cite_excerpt,      cite_actor_id, cite_actor_name, cite_actor_kind";
 
-/// SQL filter for inbox queries. Do not import InboxConfig here.
-#[derive(Debug, Clone, Default)]
-pub struct ItemFilter {
-    /// None = any source; Some(empty) = match nothing.
-    pub sources: Option<Vec<String>>,
-    /// Item must have ALL of these labels.
-    pub labels: Vec<String>,
-    /// start IS NOT NULL AND start != ''
-    pub timed: bool,
-    pub unread_only: bool,
-    /// RFC3339 cutoff: effective date (start, else created_at) must be >= this.
-    pub newer_than: Option<String>,
-    /// RFC3339 cutoff: effective date must be < this.
-    pub older_than: Option<String>,
-    /// Else created_at DESC, id DESC.
-    pub order_by_start: bool,
-}
-
-/// Thin row for stale cleanup (no body, parts, or actors).
-#[derive(Debug, Clone)]
-pub struct StaleHint {
-    pub id: i64,
-    pub source_id: String,
-    pub created_at: String,
-    pub start: Option<String>,
-    pub end: Option<String>,
-    pub labels: Vec<String>,
-}
-
 #[derive(Clone)]
-pub struct Store {
+pub struct Sqlite {
     conn: Arc<Mutex<Connection>>,
     data_dir: PathBuf,
 }
 
-impl Store {
+impl Sqlite {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -255,18 +115,19 @@ impl Store {
             .map_err(|e| anyhow::anyhow!("store lock: {e}"))
     }
 
-    /// Insert if new. Returns Some(id) when a row was created.
-    pub fn insert_new(&self, item: &NewItem) -> Result<Option<i64>> {
-        let (id, created) = self.upsert(item)?;
-        if created {
-            Ok(Some(id))
+    pub fn part_path(&self, part: &Part) -> Option<PathBuf> {
+        let p = part.path.as_ref()?;
+        let path = Path::new(p);
+        if path.is_absolute() {
+            Some(path.to_path_buf())
         } else {
-            Ok(None)
+            Some(self.data_dir.join(path))
         }
     }
+}
 
-    /// Insert or refresh on `(source_id, foreign_id)`. The bool is true when created.
-    pub fn upsert(&self, item: &NewItem) -> Result<(i64, bool)> {
+impl Store for Sqlite {
+    fn upsert(&self, item: &NewItem) -> Result<(i64, bool)> {
         let body = preview_body(item);
         let thread = trim_thread(item.thread.as_deref());
         let to_write = parts_to_insert(item);
@@ -398,7 +259,7 @@ impl Store {
         Ok((id, created))
     }
 
-    pub fn get(&self, id: i64) -> Result<Item> {
+    fn get(&self, id: i64) -> Result<Item> {
         let conn = self.lock()?;
         let mut item = conn.query_row(
             &format!("SELECT {ITEM_COLS} FROM items WHERE id = ?1"),
@@ -412,12 +273,7 @@ impl Store {
         Ok(item)
     }
 
-    pub fn list_all(&self) -> Result<Vec<Item>> {
-        self.list_filtered(&ItemFilter::default())
-    }
-
-    /// id + times + labels only. For forget_stale.
-    pub fn list_stale_hints(&self) -> Result<Vec<StaleHint>> {
+    fn stale(&self) -> Result<Vec<StaleHint>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare("SELECT id, source_id, created_at, start, end FROM items")?;
         let mut hints: Vec<StaleHint> = stmt
@@ -448,7 +304,7 @@ impl Store {
         Ok(hints)
     }
 
-    pub fn list_filtered(&self, filter: &ItemFilter) -> Result<Vec<Item>> {
+    fn ask(&self, filter: &Question) -> Result<Vec<Item>> {
         let (where_sql, params) = filter_where(filter);
         let order = filter_order(filter);
         let conn = self.lock()?;
@@ -462,7 +318,7 @@ impl Store {
         Ok(items)
     }
 
-    pub fn count_filtered(&self, filter: &ItemFilter) -> Result<usize> {
+    fn count(&self, filter: &Question) -> Result<usize> {
         let (where_sql, params) = filter_where(filter);
         let conn = self.lock()?;
         let sql = format!("SELECT COUNT(*) FROM items {where_sql}");
@@ -470,7 +326,7 @@ impl Store {
         Ok(n as usize)
     }
 
-    pub fn counts_by_source(&self) -> Result<Vec<(String, i64)>> {
+    fn counts_by_source(&self) -> Result<Vec<(String, i64)>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT source_id, COUNT(*) FROM items GROUP BY source_id ORDER BY source_id",
@@ -483,24 +339,7 @@ impl Store {
         Ok(out)
     }
 
-    pub fn count_timed(&self) -> Result<i64> {
-        let conn = self.lock()?;
-        let n = conn.query_row(
-            "SELECT COUNT(*) FROM items WHERE start IS NOT NULL AND start != ''",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(n)
-    }
-
-    pub fn count_all(&self) -> Result<i64> {
-        let conn = self.lock()?;
-        let n = conn.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))?;
-        Ok(n)
-    }
-
-    /// Delete the item and its files under data_dir. FK cascade labels/parts/item_to.
-    pub fn delete(&self, id: i64) -> Result<bool> {
+    fn delete(&self, id: i64) -> Result<bool> {
         let conn = self.lock()?;
         let exists: Option<i64> = conn
             .query_row("SELECT id FROM items WHERE id = ?1", params![id], |row| {
@@ -512,7 +351,7 @@ impl Store {
         }
         let parts = parts_for(&conn, id)?;
         for part in &parts {
-            if let Some(abs) = self.part_abs_path(part) {
+            if let Some(abs) = self.part_path(part) {
                 if path_under_dir(&abs, &self.data_dir) {
                     let _ = std::fs::remove_file(&abs);
                 }
@@ -522,7 +361,7 @@ impl Store {
         Ok(conn.changes() > 0)
     }
 
-    pub fn set_read(&self, id: i64, read: bool) -> Result<()> {
+    fn set_read(&self, id: i64, read: bool) -> Result<()> {
         let conn = self.lock()?;
         conn.execute(
             "UPDATE items SET read = ?1 WHERE id = ?2",
@@ -531,7 +370,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn add_label(&self, id: i64, label: &str) -> Result<()> {
+    fn add_label(&self, id: i64, label: &str) -> Result<()> {
         let label = label.trim();
         if label.is_empty() {
             return Ok(());
@@ -544,7 +383,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn remove_label(&self, id: i64, label: &str) -> Result<()> {
+    fn remove_label(&self, id: i64, label: &str) -> Result<()> {
         let conn = self.lock()?;
         conn.execute(
             "DELETE FROM labels WHERE item_id = ?1 AND label = ?2",
@@ -553,9 +392,7 @@ impl Store {
         Ok(())
     }
 
-    /// Has an LLM classifier already run on this item? Re-admit keeps this
-    /// forever, so a classifier's per-item cost is paid once, not every pull.
-    pub fn llm_classified(&self, id: i64, classifier_id: &str) -> Result<bool> {
+    fn classified(&self, id: i64, classifier_id: &str) -> Result<bool> {
         let conn = self.lock()?;
         let hit: Option<i64> = conn
             .query_row(
@@ -567,7 +404,7 @@ impl Store {
         Ok(hit.is_some())
     }
 
-    pub fn mark_llm_classified(&self, id: i64, classifier_id: &str) -> Result<()> {
+    fn mark_classified(&self, id: i64, classifier_id: &str) -> Result<()> {
         let conn = self.lock()?;
         conn.execute(
             "INSERT OR IGNORE INTO llm_classified (item_id, classifier_id) VALUES (?1, ?2)",
@@ -576,7 +413,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn id_by_foreign(&self, source_id: &str, foreign_id: &str) -> Result<Option<i64>> {
+    fn find(&self, source_id: &str, foreign_id: &str) -> Result<Option<i64>> {
         let conn = self.lock()?;
         let id = conn
             .query_row(
@@ -588,17 +425,7 @@ impl Store {
         Ok(id)
     }
 
-    pub fn add_part(&self, item_id: i64, part: &NewPart) -> Result<i64> {
-        let conn = self.lock()?;
-        let seq: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(seq), -1) + 1 FROM parts WHERE item_id = ?1",
-            params![item_id],
-            |row| row.get(0),
-        )?;
-        insert_part_row(&conn, &self.data_dir, item_id, seq, part)
-    }
-
-    pub fn set_thread(&self, item_id: i64, thread: Option<&str>) -> Result<()> {
+    fn set_thread(&self, item_id: i64, thread: Option<&str>) -> Result<()> {
         let thread = trim_thread(thread);
         let conn = self.lock()?;
         conn.execute(
@@ -608,17 +435,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn part_abs_path(&self, part: &Part) -> Option<PathBuf> {
-        let p = part.path.as_ref()?;
-        let path = Path::new(p);
-        if path.is_absolute() {
-            Some(path.to_path_buf())
-        } else {
-            Some(self.data_dir.join(path))
-        }
-    }
-
-    pub fn items_in_thread(&self, thread: &str) -> Result<Vec<Item>> {
+    fn thread(&self, thread: &str) -> Result<Vec<Item>> {
         if thread.is_empty() {
             return Ok(Vec::new());
         }
@@ -870,7 +687,7 @@ fn row_part(row: &rusqlite::Row<'_>) -> rusqlite::Result<Part> {
     })
 }
 
-fn filter_where(filter: &ItemFilter) -> (String, Vec<Value>) {
+fn filter_where(filter: &Question) -> (String, Vec<Value>) {
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<Value> = Vec::new();
     match &filter.sources {
@@ -896,7 +713,7 @@ fn filter_where(filter: &ItemFilter) -> (String, Vec<Value>) {
     if filter.timed {
         clauses.push("start IS NOT NULL AND start != ''".into());
     }
-    if filter.unread_only {
+    if filter.unread {
         clauses.push("read = 0".into());
     }
     if let Some(cutoff) = &filter.newer_than {
@@ -915,8 +732,8 @@ fn filter_where(filter: &ItemFilter) -> (String, Vec<Value>) {
     (where_sql, params)
 }
 
-fn filter_order(filter: &ItemFilter) -> &'static str {
-    if filter.order_by_start {
+fn filter_order(filter: &Question) -> &'static str {
+    if filter.by_start {
         "ORDER BY CASE WHEN start IS NULL OR start = '' THEN 1 ELSE 0 END, start ASC, id DESC"
     } else {
         "ORDER BY created_at DESC, id DESC"

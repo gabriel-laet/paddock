@@ -2,6 +2,14 @@
 
 An inbox kernel with a CLI. No UI. Meant to be driven by hand, by scripts, and by agents.
 
+The kernel is pure: four nouns, the questions inboxes ask, and the verbs. Everything that touches the world (SQLite, files, feeds, programs, chat models, the TOML config) is an adapter behind a port.
+
+```
+src/kernel/     item, inbox + question, classify (regex), verbs, ports
+src/adapters/   sqlite, sources (fs, rss, exec), script (CEL), llm, host (paths, toml)
+src/main.rs     the CLI
+```
+
 ## nouns
 
 - **item** — one thing that arrived, stripped of its source's shape
@@ -100,8 +108,8 @@ path = "~/.local/share/paddock/incoming"
 
 # [[inbox.classifier]]
 # id = "by-script"
-# kind = "script"               # Rhai: return a label, (), or true with `label =`
-# script = '''if item.title.contains("invoice") { "money" } else { () }'''
+# kind = "script"               # CEL over `item`: a label, or true with `label =`
+# script = 'item.title.contains("invoice") ? "money" : ""'
 
 # [[inbox.classifier]]
 # id = "by-llm"
@@ -112,6 +120,8 @@ path = "~/.local/share/paddock/incoming"
 ```
 
 An item matches an inbox when `(sources empty OR item.source in sources)` and `(labels empty OR item has ALL listed labels)` and (`timed` unset OR the item has `start`) and the age bounds hold, and it matches every ancestor. `keep` labels survive stale cleanup. Lists are queried in SQL, not loaded whole.
+
+A script sees `item.title`, `body`, `source`, `href`, `start`, `end`, `thread`, `read`, `labels`, `parts` (kinds), `from`, `to`. Absent strings are `""`. CEL cannot loop or do IO.
 
 LLM classifiers run on `pull`, once per item (the result is cached). Env: `PADDOCK_LLM_URL`, `PADDOCK_LLM_MODEL`, `PADDOCK_LLM_KEY` or `OPENAI_API_KEY`. Do not put keys in the config.
 
