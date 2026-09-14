@@ -4,16 +4,37 @@ An inbox kernel with a CLI. No UI. Meant to be driven by hand, by scripts, and b
 
 The kernel is pure: four nouns, the questions inboxes ask, and the verbs. It reads no clock, no file, no network, and no config format; the host resolves every adapter up front and hands the kernel a config, a store, sources, classifiers, an embedder, a model, and the time. Every verb returns what happened, warnings included.
 
-One repository, three crates and the plugins, with the dependency graph enforcing the lines:
+One repository, a cargo workspace, and the dependency graph enforces the lines:
 
 ```
-crates/kernel/      paddock-kernel: nouns, questions, verbs, ports. Its Cargo.toml is the purity
-                    test: no store, no file format, no network, no clock.
-crates/protocol/    paddock-protocol: the exec protocol's types and the Message shape.
-                    Plugins depend on this and nothing else of paddock's. See PROTOCOL.md.
-crates/paddock/     the `paddock` binary: adapters (sqlite store; fs and exec sources;
-                    script, exec, http, llm classifiers; models; embedders; host) and the CLI
-plugins/rss/        paddock-rss. Formats of the world live here, not in the kernel crate.
+Cargo.toml            the workspace: shared versions, the release profile
+PROTOCOL.md           the contract between the host and a plugin
+crates/
+  kernel/             paddock-kernel   the pure core: nouns, questions, verbs, ports.
+                                       Its Cargo.toml is the purity test: no store, no
+                                       file format, no network, no clock.
+  protocol/           paddock-protocol the exec protocol's types and the Message shape.
+                                       Plugins depend on this and on nothing else here.
+  paddock/            paddock          the binary: adapters (sqlite store; fs and exec
+                                       sources; classifiers; models; embedders; host)
+                                       and the CLI. Integration tests live here too.
+plugins/
+  rss/                paddock-rss      a feed
+  mail/               paddock-mail     a library: RFC 822 bytes as a Message (maildir and imap share it)
+  maildir/            paddock-maildir  a Maildir, or a folder of .eml files
+  imap/               paddock-imap     any mailbox over IMAP, sending over SMTP
+  wacli/              paddock-wacli    WhatsApp, through the wacli CLI
+  gog/                paddock-gog      Gmail, through the gog CLI
+  hey/                paddock-hey      HEY, through the hey CLI
+```
+
+Rules the layout keeps checkable: the kernel crate names no world (grep its manifest); a plugin never depends on the kernel crate (`cargo tree -p paddock-rss` never shows `paddock-kernel`); kernel tests never run a plugin (`paddock check` is the only thing that does). Anything that knows a format of the world, mail, a feed, a chat, is a plugin, not an adapter.
+
+```
+cargo build --workspace                        # everything
+cargo test --workspace                         # every crate's tests
+cargo install --path crates/paddock            # the `paddock` binary
+cargo install --path plugins/maildir           # `paddock-maildir`, for `kind = "maildir"`; same for imap, wacli, gog, hey, rss
 ```
 
 ## nouns
@@ -38,6 +59,11 @@ Personas are top-level inboxes with `sources`: `work/` and `personal/` see only 
 ```
 cargo install --path crates/paddock              # the `paddock` binary
 cargo install --path plugins/rss                 # `paddock-rss`, for `kind = "rss"`
+cargo install --path plugins/maildir             # `paddock-maildir`, for `kind = "maildir"`
+cargo install --path plugins/imap                # `paddock-imap`, for `kind = "imap"`
+cargo install --path plugins/wacli               # `paddock-wacli`, for `kind = "wacli"` (needs the wacli CLI)
+cargo install --path plugins/gog                 # `paddock-gog`, for `kind = "gog"` (needs the gog CLI)
+cargo install --path plugins/hey                 # `paddock-hey`, for `kind = "hey"` (needs the hey CLI)
 ```
 
 ## commands
@@ -61,6 +87,7 @@ paddock answer QUESTION [--in INBOX]   # the model answers from the items and ci
 paddock embed                      # embed items that have no vector yet
 paddock check CMD [--set k=v]... [--send]   # speak the protocol to a plugin and validate what it says
 paddock context                    # dump this host for an agent
+paddock mirror [--restore [--force]]   # push a snapshot of the store to [store.mirror], or pull it back
 ```
 
 `--json` on any command prints machine output. `--dir DIR` names the host directory. `--remote[=HOST]` re-runs the same command over ssh (host from the flag, else `remote` in config); `--local` forces this machine.
@@ -151,12 +178,43 @@ url = "https://example.com/feed.xml"
 
 [[source]]
 id = "mail"
+kind = "maildir"                # a plugin: `paddock-maildir` on PATH; keep it synced with mbsync
+path = "~/Mail/work"            # a Maildir (cur/ new/), or any folder of .eml files
+
+[[source]]
+id = "fastmail"
+kind = "imap"                   # a plugin: IMAP in, SMTP out; any provider
+host = "imap.fastmail.com"
+user = "me@example.com"
+password_cmd = "pass show fastmail"   # run by the host; the plugin sees `password`
+# smtp_host = "smtp.fastmail.com", smtp_port = 465, folder = "INBOX", since = "30d", limit = 200
+
+[[source]]
+id = "wa"
+kind = "wacli"                  # a plugin over the wacli CLI (WhatsApp)
+# account = "work", chat = "...@g.us", limit = 200, sync = true, media = true
+
+[[source]]
+id = "gmail"
+kind = "gog"                    # a plugin over the gog CLI (Gmail)
+account = "me@gmail.com"
+query = "newer_than:7d"         # Gmail search syntax; attachments = true downloads them
+
+[[source]]
+id = "hey"
+kind = "hey"                    # a plugin over the hey CLI (HEY)
+box = "imbox"                   # bodies = false lists threads without reading them
+
+[[source]]
+id = "custom"
 kind = "exec"                   # an explicit program that speaks the exec protocol
-cmd = "~/bin/mail-source"
+cmd = "~/bin/my-source"
 args = ["--account", "work"]
 dir = "~/mail"                  # working directory, optional
 forget_after = "14d"
 ```
+
+The three CLI plugins wrap tools that already hold a login and a synced store of their own: [wacli](https://github.com/openclaw/wacli), [gogcli](https://github.com/openclaw/gogcli), and [hey-cli](https://github.com/basecamp/hey-cli). Each takes `cmd = "..."` when the tool is not on `PATH` by its usual name, and `cache = "..."` for where attachments and media are written before the host reads them into the store. Every plugin's own settings are listed at the top of its `main.rs`.
 
 ### classifiers
 
@@ -210,7 +268,7 @@ A label reply is its first token; `NONE` or nothing means no label; a JSON reply
 
 ### secrets
 
-Any `key` can instead be `key_cmd`: a shell command whose stdout is the secret, so the config file never holds it.
+Any `key` can instead be `key_cmd`: a shell command whose stdout is the secret, so the config file never holds it. On a source block the same holds for every setting: a plugin that wants `password` gets it from `password_cmd`, run by the host, and never learns where it came from.
 
 ```toml
 [store]
@@ -221,6 +279,13 @@ id = "by-service"
 kind = "http"
 url = "https://example.com/label"
 key_cmd = "security find-generic-password -s example -w"
+
+[[source]]
+id = "mail"
+kind = "imap"
+host = "imap.example.com"
+user = "me@example.com"
+password_cmd = "pass show mail"
 ```
 
 ### store
@@ -232,6 +297,29 @@ Where items live. Missing means sqlite, unencrypted. With a `key` (or `key_cmd`)
 kind = "sqlite"
 key_cmd = "pass show paddock"
 ```
+
+#### mirror
+
+A copy of the store somewhere else: an S3 bucket (Cloudflare R2, AWS, anything S3-shaped), or wherever a command puts it (scp to a box, rsync, rclone). `paddock mirror` snapshots the store into one consistent file and pushes it; `paddock mirror --restore` pulls it back onto a host that has no store yet (`--force` replaces one). With `after_pull = true` every `paddock pull` pushes when it is done. An encrypted store is mirrored as it is, so the bucket holds ciphertext and the key stays with you.
+
+```toml
+[store.mirror]
+kind = "s3"
+url = "https://<account>.r2.cloudflarestorage.com"   # the endpoint; omit for AWS
+bucket = "paddock"
+path = "laptop/paddock.db"      # the object key
+region = "auto"                 # R2 says auto; AWS wants a region
+key_id = "..."
+secret_cmd = "pass show r2"
+after_pull = true
+
+# [store.mirror]
+# kind = "exec"
+# push = "scp {file} box:paddock.db"    # {file} is the snapshot
+# pull = "scp box:paddock.db {file}"    # {file} is where the store goes
+```
+
+This is a copy, not a shared store: two hosts pushing to the same key overwrite each other. For one store worked from several machines, keep it on one of them and use `--remote` (ssh) from the others.
 
 ### embedder and model
 
@@ -270,6 +358,14 @@ Models never run inside matching. An inbox is deterministic and `why` stays true
 ## plugins
 
 The exec protocol is the plugin interface: `{cmd} {args...} pull|send` with a JSON request on stdin (the source's id and settings, plus the draft for `send`), items or a `{foreign_id}` on stdout. It is written down in [PROTOCOL.md](PROTOCOL.md), typed in the `paddock-protocol` crate, and checked with `paddock check`. Write a plugin in Rust against that crate, or in anything that can read and print JSON.
+
+The plugins here come in three shapes, and a new one is usually one of them:
+
+- **a format on disk or on the wire** (`rss`, `maildir`, `imap`): the plugin parses it itself. Mail plugins share `paddock-mail`, so a Message-ID, a list, a reply, and an attachment mean the same thing whichever way the mail arrived.
+- **a CLI that already holds the login** (`wacli`, `gog`, `hey`): the plugin runs it with `--json`, maps its records onto `Message`, and sends through it. About 200 lines each, most of it the mapping and a test with a fake CLI on disk.
+- **send-only services** (a transactional mail API, a webhook): `pull` prints `[]` and `send` posts the draft. Not here yet; the shape is the same.
+
+`paddock check ./target/debug/paddock-gog --set account=me@gmail.com` runs any of them against the real tool and lists what the host would reject.
 
 Admit upserts on `(source_id, foreign_id)`. Re-admit refreshes what the source sent and keeps read state and labels. A cite to an item not here yet resolves when it arrives.
 

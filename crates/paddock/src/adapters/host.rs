@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use super::source::{Exec, Fs};
 use super::store::Sqlite;
-use super::transport::secret;
+use super::transport::{resolve_cmds, secret};
 use super::{classifier, embedder, model};
 use crate::kernel::{setting, setting_list, Config, Kernel, Source, SourceSpec, Store};
 
@@ -125,8 +125,13 @@ pub fn open_store(paths: &Paths, config: &Config) -> Result<Sqlite> {
         "" | "sqlite" => {}
         other => bail!("unknown store kind `{other}` (sqlite)"),
     }
-    let key = secret(&spec.settings, "key")?;
+    let key = store_key(&spec.settings)?;
     Sqlite::open(&paths.db_path, key.as_deref())
+}
+
+/// The store's encryption key from `[store]`: `key`, or `key_cmd` run.
+pub fn store_key(settings: &crate::kernel::Settings) -> Result<Option<String>> {
+    secret(settings, "key")
 }
 
 /// Read the config and open the store, initializing the host first if needed.
@@ -184,13 +189,15 @@ pub fn kernel_at<'a>(
 }
 
 /// fs, exec, or a plugin: any other kind is `paddock-<kind>` on PATH,
-/// spoken to over the exec protocol with the spec's settings.
+/// spoken to over the exec protocol with the spec's settings. A program
+/// gets every `NAME_cmd` setting already run, as `NAME`.
 fn source(spec: &SourceSpec) -> Result<Box<dyn Source>> {
     let s = &spec.settings;
     let need = |key: &str| {
         setting(s, key)
             .ok_or_else(|| anyhow::anyhow!("source {} {} needs {key}", spec.id, spec.kind))
     };
+    let settings = || resolve_cmds(s).with_context(|| format!("source {}", spec.id));
     Ok(match spec.kind.as_str() {
         "fs" => Box::new(Fs {
             id: spec.id.clone(),
@@ -201,7 +208,7 @@ fn source(spec: &SourceSpec) -> Result<Box<dyn Source>> {
             cmd: expand_path(&need("cmd")?),
             args: setting_list(s, "args"),
             dir: setting(s, "dir").map(|d| expand_path(&d)),
-            settings: s.clone(),
+            settings: settings()?,
         }),
         "" => bail!("source {} has no kind", spec.id),
         plugin => Box::new(Exec {
@@ -209,9 +216,23 @@ fn source(spec: &SourceSpec) -> Result<Box<dyn Source>> {
             cmd: PathBuf::from(format!("paddock-{plugin}")),
             args: Vec::new(),
             dir: None,
-            settings: s.clone(),
+            settings: settings()?,
         }),
     })
+}
+
+/// The store's mirror, if `[store.mirror]` names one.
+pub fn mirror(config: &Config) -> Result<Option<super::mirror::Mirror>> {
+    let spec = config.store.clone().unwrap_or_default();
+    super::mirror::build(&spec.settings)
+}
+
+/// Whether `pull` should push the store to its mirror when done.
+pub fn mirror_after_pull(config: &Config) -> bool {
+    config
+        .store
+        .as_ref()
+        .is_some_and(|s| super::mirror::after_pull(&s.settings))
 }
 
 pub fn default_config_toml(incoming: &str) -> String {

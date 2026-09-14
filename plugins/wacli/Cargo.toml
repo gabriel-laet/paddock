@@ -1,0 +1,19 @@
+# `paddock-wacli`: the `wacli` CLI as a source. Depends on paddock-protocol and
+# nothing else of paddock's.
+
+[package]
+name = "paddock-wacli"
+description = "The wacli CLI as a paddock source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+paddock-protocol = { path = "../../crates/protocol" }
+anyhow.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3.15"

@@ -22,6 +22,18 @@ pub struct Sqlite {
 }
 
 impl Sqlite {
+    /// A consistent copy of the whole store in one file at `dest`, WAL
+    /// folded in, encrypted the same way. What a mirror pushes.
+    pub fn snapshot(&self, dest: &Path) -> Result<()> {
+        if dest.exists() {
+            std::fs::remove_file(dest)?;
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute("VACUUM INTO ?1", [dest.display().to_string()])
+            .with_context(|| format!("snapshot into {}", dest.display()))?;
+        Ok(())
+    }
+
     /// Open (or create) the store. With a key the file is encrypted; an
     /// existing plaintext store opened with a key fails as "not a database".
     pub fn open(path: &Path, key: Option<&str>) -> Result<Self> {

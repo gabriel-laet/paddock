@@ -42,15 +42,175 @@ impl Request {
         serde_json::from_str(&text)
     }
 
-    /// A string setting, trimmed; missing or empty is `None`.
+    /// A string setting, trimmed; missing or empty is `None`. A number or a
+    /// bool reads as its text.
     pub fn setting(&self, key: &str) -> Option<String> {
-        self.settings
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
+        let v = self.settings.get(key)?;
+        let text = match v {
+            serde_json::Value::String(s) => s.trim().to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            _ => return None,
+        };
+        (!text.is_empty()).then_some(text)
     }
+
+    /// A yes-or-no setting: `true`, `"true"`, `"yes"`, `1`. Missing is no.
+    pub fn flag(&self, key: &str) -> bool {
+        matches!(
+            self.setting(key).as_deref(),
+            Some("true") | Some("yes") | Some("1") | Some("on")
+        )
+    }
+
+    /// A whole-number setting.
+    pub fn number(&self, key: &str) -> Option<u64> {
+        self.setting(key)?.parse().ok()
+    }
+}
+
+impl Actor {
+    /// One mailbox: `Ana <ana@example.com>`, `"Ana" <ana@example.com>`, or
+    /// a bare address. A name that is the address is no name.
+    pub fn mailbox(text: &str) -> Option<Actor> {
+        let text = text.trim();
+        let (name, id) = match (text.rfind('<'), text.ends_with('>')) {
+            (Some(i), true) => (
+                text[..i].trim().trim_matches('"').trim(),
+                text[i + 1..text.len() - 1].trim(),
+            ),
+            _ => ("", text),
+        };
+        let id = if id.is_empty() { name } else { id };
+        if id.is_empty() {
+            return None;
+        }
+        Some(Actor {
+            id: id.to_string(),
+            name: (!name.is_empty() && name != id).then(|| name.to_string()),
+            kind: None,
+        })
+    }
+
+    /// A header's worth of mailboxes, comma-separated, commas inside quotes
+    /// and angle brackets left alone.
+    pub fn mailboxes(text: &str) -> Vec<Actor> {
+        let mut out = Vec::new();
+        let (mut quoted, mut depth, mut start) = (false, 0usize, 0usize);
+        for (i, c) in text.char_indices() {
+            match c {
+                '"' => quoted = !quoted,
+                '<' if !quoted => depth += 1,
+                '>' if !quoted => depth = depth.saturating_sub(1),
+                ',' if !quoted && depth == 0 => {
+                    out.extend(Actor::mailbox(&text[start..i]));
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        out.extend(Actor::mailbox(&text[start..]));
+        out
+    }
+}
+
+/// Run `{cmd} {args...}` with no stdin; stdout as text. A non-zero exit is
+/// an error carrying stderr. For plugins over another program.
+pub fn run(cmd: &str, args: &[String]) -> std::io::Result<String> {
+    let out = std::process::Command::new(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| std::io::Error::new(e.kind(), format!("cannot run `{cmd}`: {e}")))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(std::io::Error::other(format!(
+            "`{cmd} {}` exited {}: {}",
+            args.join(" "),
+            out.status.code().unwrap_or(-1),
+            err.trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// [`run`], then parse stdout as JSON.
+pub fn run_json(cmd: &str, args: &[String]) -> std::io::Result<serde_json::Value> {
+    let text = run(cmd, args)?;
+    serde_json::from_str(text.trim())
+        .map_err(|e| std::io::Error::other(format!("`{cmd}` printed invalid JSON: {e}")))
+}
+
+/// Where a plugin puts files it fetched (attachments, media) for the host to
+/// read into its store on admit: the `cache` setting, else a directory per
+/// source under the system temp dir.
+pub fn cache_dir(request: &Request) -> std::io::Result<std::path::PathBuf> {
+    let dir = match request.setting("cache") {
+        Some(c) => expand_home(&c),
+        None => std::env::temp_dir()
+            .join("paddock")
+            .join(safe_name(&request.id)),
+    };
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// `~/x` under the home directory.
+pub fn expand_home(path: &str) -> std::path::PathBuf {
+    let home = || {
+        std::env::var("HOME")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    };
+    match path.strip_prefix("~/") {
+        Some(rest) => home().join(rest),
+        None if path == "~" => home(),
+        None => std::path::PathBuf::from(path),
+    }
+}
+
+/// A file name from anything: letters, digits, `-`, `_`, `.`; else `_`.
+pub fn safe_name(text: &str) -> String {
+    let name: String = text
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-_.".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let name = name.trim_matches('.').to_string();
+    if name.is_empty() {
+        "item".into()
+    } else {
+        name
+    }
+}
+
+/// The RFC3339 time now, to the second, in UTC.
+pub fn now_rfc3339() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Civil-from-days (Howard Hinnant), enough for a timestamp.
+    let days = (secs / 86_400) as i64;
+    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 /// `person`, `group`, `list`, or `agent`. Anything else reads as person.
@@ -253,7 +413,7 @@ pub fn first_line(text: &str) -> String {
 
 /// The verb the host asked for: the last argument.
 pub fn verb() -> String {
-    std::env::args().last().unwrap_or_default()
+    std::env::args().next_back().unwrap_or_default()
 }
 
 /// Print items for `pull`.
@@ -326,6 +486,56 @@ mod tests {
         assert_eq!(it.foreign_id, "x");
         assert!(it.cites.is_empty());
         assert!(serde_json::from_str::<Item>(r#"{"title":"no id"}"#).is_err());
+    }
+
+    #[test]
+    fn a_mailbox_is_an_actor_and_a_header_is_many() {
+        let a = Actor::mailbox("Ana <ana@example.com>").unwrap();
+        assert_eq!(
+            (a.id.as_str(), a.name.as_deref()),
+            ("ana@example.com", Some("Ana"))
+        );
+        let bare = Actor::mailbox("  bo@example.com ").unwrap();
+        assert_eq!((bare.id.as_str(), bare.name), ("bo@example.com", None));
+        let quoted = Actor::mailbox(r#""Cy, Jr." <cy@example.com>"#).unwrap();
+        assert_eq!(quoted.name.as_deref(), Some("Cy, Jr."));
+        assert!(Actor::mailbox("  ").is_none());
+        let many = Actor::mailboxes(r#""Cy, Jr." <cy@example.com>, di@example.com,, Ed <ed@x>"#);
+        assert_eq!(
+            many.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["cy@example.com", "di@example.com", "ed@x"]
+        );
+    }
+
+    #[test]
+    fn settings_read_as_text_flags_and_numbers() {
+        let r: Request = serde_json::from_str(
+            r#"{"settings":{"limit":20,"media":true,"sync":"yes","name":" x ","list":[1]}}"#,
+        )
+        .unwrap();
+        assert_eq!(r.number("limit"), Some(20));
+        assert!(r.flag("media") && r.flag("sync") && !r.flag("name") && !r.flag("gone"));
+        assert_eq!(r.setting("name").as_deref(), Some("x"));
+        assert_eq!(r.setting("list"), None);
+    }
+
+    #[test]
+    fn helpers_run_a_program_name_files_safely_and_tell_the_time() {
+        assert_eq!(
+            run("sh", &["-c".into(), "echo hi".into()]).unwrap().trim(),
+            "hi"
+        );
+        let err = run("sh", &["-c".into(), "echo bad >&2; exit 3".into()]).unwrap_err();
+        assert!(err.to_string().contains("exited 3") && err.to_string().contains("bad"));
+        assert_eq!(
+            run_json("sh", &["-c".into(), "echo '{\"a\":1}'".into()]).unwrap()["a"],
+            1
+        );
+        assert_eq!(safe_name("a b/c<d>.pdf"), "a_b_c_d_.pdf");
+        assert_eq!(safe_name("..."), "item");
+        let now = now_rfc3339();
+        assert_eq!(now.len(), 20, "{now}");
+        assert!(now.starts_with("20") && now.ends_with('Z'));
     }
 
     #[test]

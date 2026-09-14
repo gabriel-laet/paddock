@@ -1,0 +1,19 @@
+# `paddock-imap`: any mailbox over IMAP, sending over SMTP. Depends on
+# paddock-protocol (through paddock-mail) and nothing else of paddock's.
+
+[package]
+name = "paddock-imap"
+description = "An IMAP mailbox as a paddock source, sending over SMTP"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+paddock-protocol = { path = "../../crates/protocol" }
+paddock-mail = { path = "../mail" }
+anyhow.workspace = true
+chrono.workspace = true
+imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }

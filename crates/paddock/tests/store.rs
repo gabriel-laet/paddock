@@ -394,3 +394,32 @@ fn a_plaintext_store_opened_with_a_key_says_so() {
     };
     assert!(err.to_string().contains("wrong key"), "{err}");
 }
+
+#[test]
+fn a_snapshot_is_a_whole_store_in_one_file_with_the_same_key() {
+    let (tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    fs::write(
+        &paths.config_file,
+        store_toml(&paths.incoming_dir, r#"key = "hunter2""#),
+    )
+    .unwrap();
+    fs::remove_file(&paths.db_path).unwrap();
+    let (cfg, store) = load(&paths).unwrap();
+    let k = kernel(&cfg, &store).unwrap();
+    k.admit(NewItem {
+        source_id: "incoming".into(),
+        foreign_id: "a".into(),
+        title: "kept".into(),
+        body: "x".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let snap = tmp.path().join("snap.db");
+    store.snapshot(&snap).unwrap();
+    assert!(Sqlite::open(&snap, None).is_err(), "still encrypted");
+    let copy = Sqlite::open(&snap, Some("hunter2")).unwrap();
+    assert_eq!(copy.ask(&Question::default()).unwrap()[0].title, "kept");
+    store.snapshot(&snap).unwrap();
+    assert!(snap.exists(), "a second snapshot replaces the first");
+}

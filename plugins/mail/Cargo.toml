@@ -1,0 +1,16 @@
+# `paddock-mail`: an RFC 822 message as a protocol `Message`. Shared by the
+# maildir and imap plugins. Depends on paddock-protocol and nothing else of
+# paddock's.
+
+[package]
+name = "paddock-mail"
+description = "RFC 822 mail as a paddock Message"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+paddock-protocol = { path = "../../crates/protocol" }
+mail-parser = "0.11"

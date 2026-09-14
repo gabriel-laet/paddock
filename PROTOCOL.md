@@ -40,6 +40,16 @@ and `forget_after` is handed to the plugin as its settings.
 
 `draft` is present only for `send`. A plugin that reads no stdin is fine.
 
+Secrets: a setting `NAME_cmd` on the source block is run by the host and
+handed to the plugin as `NAME`, so `password_cmd = "pass show mail"`
+reaches a plugin as `password`, and no plugin runs a secret command itself.
+
+Two settings every plugin here honours: `cmd`, the program a plugin wraps
+when it is not on `PATH` by its usual name, and `cache`, the directory where
+a plugin writes attachments and media for the host to read (default: a
+directory per source under the system temp dir). The host copies part bytes
+into its store on admit; the cache is not kept.
+
 ## item
 
 Only `foreign_id` is required. Unknown fields are ignored.
@@ -106,6 +116,13 @@ thread and a `to` actor of that kind; `reply_to` is a reply cite; mentions
 are mention cites carrying the actor; attachments are file parts; `at` is
 `start`; `seen` is `read`.
 
+The crate also has what a plugin over another program needs and nothing
+more: `run` and `run_json` (a program's stdout, as text or JSON, a non-zero
+exit an error), `Actor::mailbox` and `Actor::mailboxes` (`Ana <ana@x>` and
+a header's worth of them), `cache_dir`, `expand_home`, `safe_name`, and
+`now_rfc3339`. `Request::flag` and `Request::number` read a setting as a
+yes-or-no or a count.
+
 ## checking a plugin
 
 ```
@@ -115,4 +132,6 @@ paddock check paddock-mine --send
 
 Runs `pull` (and `send` with `--send`), parses what comes back, and lists
 anything the host would reject. This is the only thing in the paddock
-repository that runs a plugin; the kernel's tests never do.
+repository that runs a plugin; the kernel's tests never do. A plugin's own
+tests run it against a fake of the program it wraps, a shell script on
+disk that answers the same JSON.

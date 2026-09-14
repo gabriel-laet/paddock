@@ -19,6 +19,8 @@ serde_json.workspace = true
 cel-interpreter = "0.10.0"
 clap = { version = "=4.5.28", features = ["derive"] }
 dirs = "5.0"
+hmac = "0.12"
+sha2 = "0.10"
 model2vec-rs = { version = "0.2.1", optional = true }
 reqwest = { version = "=0.12.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 rusqlite = { version = "0.32.1", features = ["bundled-sqlcipher"] }

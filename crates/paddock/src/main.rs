@@ -5,7 +5,8 @@ use anyhow::Context as _;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use paddock::{
-    init, kernel, load, load_config, Actor, Config, Draft, Item, Kernel, Paths, Question, Store,
+    init, kernel, load, load_config, mirror, mirror_after_pull, Actor, Config, Draft, Item, Kernel,
+    Paths, Question, Sqlite, Store,
 };
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -123,6 +124,15 @@ enum Cmd {
     },
     /// Dump this host for an agent (pipeable)
     Context,
+    /// Push a snapshot of the store to its mirror ([store.mirror]); --restore pulls it back
+    Mirror {
+        /// Pull the mirrored store into this host (refuses to overwrite one that holds items without --force)
+        #[arg(long)]
+        restore: bool,
+        /// With --restore: replace the store that is here
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -165,6 +175,9 @@ fn main() -> Result<()> {
         println!("incoming {}", paths.incoming_dir.display());
         return Ok(());
     }
+    if let Cmd::Mirror { restore, force } = cli.cmd {
+        return mirror_cmd(&paths, restore, force, cli.json);
+    }
     let (config, store) = load(&paths)?;
     let k = kernel(&config, &store)?;
     let out = std::io::stdout();
@@ -183,14 +196,20 @@ fn main() -> Result<()> {
         Cmd::Pull => {
             let pulled = k.pull()?;
             let forgot = k.forget_stale()?;
+            let mut warnings = pulled.warnings.clone();
+            if mirror_after_pull(&config) {
+                if let Err(e) = push_mirror(&paths, &config, &store) {
+                    warnings.push(format!("mirror: {e:#}"));
+                }
+            }
             if cli.json {
                 println!(
                     "{}",
-                    serde_json::json!({ "admitted": pulled.count, "forgot": forgot, "warnings": pulled.warnings })
+                    serde_json::json!({ "admitted": pulled.count, "forgot": forgot, "warnings": warnings })
                 );
             } else {
                 println!("admitted {}, forgot {forgot}", pulled.count);
-                warn(&pulled.warnings);
+                warn(&warnings);
             }
         }
         Cmd::Inboxes => {
@@ -387,8 +406,65 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Context => context(&paths, &k)?,
+        Cmd::Mirror { .. } => unreachable!(),
     }
     Ok(())
+}
+
+/// Snapshot the store beside itself and hand the snapshot to the mirror.
+fn push_mirror(paths: &Paths, config: &Config, store: &Sqlite) -> Result<String> {
+    let m = mirror(config)?.ok_or_else(|| anyhow::anyhow!("no [store.mirror] in config"))?;
+    let snapshot = paths.db_path.with_extension("db.snapshot");
+    store.snapshot(&snapshot)?;
+    let pushed = m.push(&snapshot);
+    let _ = std::fs::remove_file(&snapshot);
+    pushed?;
+    Ok(m.describe())
+}
+
+/// `paddock mirror`: push. `--restore`: pull the copy into this host's
+/// store path, which must hold nothing yet unless `--force`. Runs before the
+/// store is opened, so a restore replaces a closed file.
+fn mirror_cmd(paths: &Paths, restore: bool, force: bool, json: bool) -> Result<()> {
+    let config = load_config(&paths.config_file)?;
+    let m = mirror(&config)?.ok_or_else(|| anyhow::anyhow!("no [store.mirror] in config"))?;
+    let (verb, place) = if restore {
+        if paths.db_path.exists() && !force && !store_is_empty(paths, &config)? {
+            bail!(
+                "{} holds items; --force replaces it with the mirror",
+                paths.db_path.display()
+            );
+        }
+        let incoming = paths.db_path.with_extension("db.incoming");
+        m.pull(&incoming)?;
+        Sqlite::open(&incoming, secret_key(&config)?.as_deref())
+            .context("the mirrored file is not a store")?;
+        for suffix in ["db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(paths.db_path.with_extension(suffix));
+        }
+        std::fs::rename(&incoming, &paths.db_path)?;
+        ("restored", paths.db_path.display().to_string())
+    } else {
+        let (config, store) = load(paths)?;
+        ("pushed", push_mirror(paths, &config, &store)?)
+    };
+    if json {
+        println!("{}", serde_json::json!({ verb: place }));
+    } else {
+        println!("{verb} {place}");
+    }
+    Ok(())
+}
+
+/// A store `init` made and nothing has entered: a restore may replace it.
+fn store_is_empty(paths: &Paths, config: &Config) -> Result<bool> {
+    let store = Sqlite::open(&paths.db_path, secret_key(config)?.as_deref())?;
+    Ok(store.ask(&Question::default())?.is_empty())
+}
+
+fn secret_key(config: &Config) -> Result<Option<String>> {
+    let spec = config.store.clone().unwrap_or_default();
+    paddock::adapters::store_key(&spec.settings)
 }
 
 fn warn(warnings: &[String]) {

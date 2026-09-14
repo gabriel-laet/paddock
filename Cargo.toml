@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/kernel", "crates/protocol", "crates/paddock", "plugins/rss"]
+members = ["crates/kernel", "crates/protocol", "crates/paddock", "plugins/rss", "plugins/mail", "plugins/maildir", "plugins/imap", "plugins/wacli", "plugins/gog", "plugins/hey"]
 
 [workspace.package]
 version = "0.1.0"

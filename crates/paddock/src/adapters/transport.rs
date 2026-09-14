@@ -81,6 +81,24 @@ pub(crate) fn secret(settings: &crate::kernel::Settings, name: &str) -> Result<O
     Ok(Some(out.to_string()))
 }
 
+/// Every `NAME_cmd` in the settings run and handed on as `NAME`, so a plugin
+/// gets its secrets and never learns where they came from.
+pub(crate) fn resolve_cmds(settings: &crate::kernel::Settings) -> Result<crate::kernel::Settings> {
+    let mut out = settings.clone();
+    for key in settings.keys() {
+        let Some(name) = key.strip_suffix("_cmd") else {
+            continue;
+        };
+        out.remove(key);
+        if !out.contains_key(name) {
+            if let Some(value) = secret(settings, name)? {
+                out.insert(name.to_string(), serde_json::Value::String(value));
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn join(base: &str, path: &str) -> String {
     format!(
         "{}/{}",
@@ -109,6 +127,25 @@ mod tests {
             .collect();
         assert!(secret(&empty, "key").is_err());
         assert_eq!(secret(&Default::default(), "key").unwrap(), None);
+    }
+
+    #[test]
+    fn every_name_cmd_setting_becomes_name() {
+        let settings: crate::kernel::Settings = serde_json::from_str(
+            r#"{"host": "h", "password_cmd": "printf secret", "token": "given", "token_cmd": "printf no"}"#,
+        )
+        .unwrap();
+        let out = resolve_cmds(&settings).unwrap();
+        assert_eq!(out["host"], "h");
+        assert_eq!(out["password"], "secret");
+        assert_eq!(
+            out["token"], "given",
+            "an inline value wins over its command"
+        );
+        assert!(!out.contains_key("password_cmd") && !out.contains_key("token_cmd"));
+        let bad: crate::kernel::Settings =
+            serde_json::from_str(r#"{"password_cmd": "exit 1"}"#).unwrap();
+        assert!(resolve_cmds(&bad).is_err());
     }
 
     #[test]
