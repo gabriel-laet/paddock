@@ -1610,3 +1610,82 @@ fn source_label_falls_back_to_id() {
 }
 
 static PATH_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn text_term_searches_title_and_text_by_prefix() {
+    let (_tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    let (cfg, store) = load(&paths).unwrap();
+    let k = kernel(&cfg, &store);
+    let a = k
+        .admit(NewItem {
+            source_id: "incoming".into(),
+            foreign_id: "a".into(),
+            title: "Invoice from Ana".into(),
+            body: "please pay by friday".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = k
+        .admit(NewItem {
+            source_id: "incoming".into(),
+            foreign_id: "b".into(),
+            title: "lunch".into(),
+            body: "ana says friday works".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let ask = |text: &str| -> Vec<i64> {
+        let q = Question {
+            text: Some(text.into()),
+            ..Default::default()
+        };
+        let ids: Vec<i64> = store.ask(&q).unwrap().iter().map(|i| i.id).collect();
+        // the in-memory rule agrees with the store on every item
+        for it in store.ask(&Question::default()).unwrap() {
+            assert_eq!(q.matches(&it), ids.contains(&it.id), "{text} on #{}", it.id);
+        }
+        ids
+    };
+    assert_eq!(ask("invoice"), vec![a]);
+    assert_eq!(ask("ana friday"), vec![b, a]);
+    assert_eq!(ask("lunch ana"), vec![b]);
+    assert_eq!(ask("nothing"), Vec::<i64>::new());
+    assert_eq!(
+        store
+            .count(&Question {
+                text: Some("inv".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+        1
+    );
+    assert!(k.forget(a).unwrap());
+    assert_eq!(ask("invoice"), Vec::<i64>::new());
+}
+
+#[test]
+fn text_index_is_rebuilt_for_an_old_store() {
+    let (_tmp, paths) = temp_paths();
+    init(&paths).unwrap();
+    let (cfg, store) = load(&paths).unwrap();
+    let k = kernel(&cfg, &store);
+    k.admit(NewItem {
+        source_id: "incoming".into(),
+        foreign_id: "a".into(),
+        title: "Invoice".into(),
+        body: "x".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    drop(store);
+    let conn = rusqlite::Connection::open(&paths.db_path).unwrap();
+    conn.execute_batch("DROP TABLE items_fts;").unwrap();
+    drop(conn);
+    let store = Sqlite::open(&paths.db_path).unwrap();
+    let q = Question {
+        text: Some("invoice".into()),
+        ..Default::default()
+    };
+    assert_eq!(store.count(&q).unwrap(), 1);
+}

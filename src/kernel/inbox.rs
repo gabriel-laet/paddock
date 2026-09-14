@@ -201,6 +201,9 @@ pub struct Question {
     pub newer_than: Option<String>,
     /// RFC3339 cutoff: the item's moment must be < this.
     pub older_than: Option<String>,
+    /// Words that must all appear in the title or text. A store may match
+    /// by prefix; `matches` is a plain case-insensitive contains.
+    pub text: Option<String>,
     /// List in `start` order instead of newest first.
     pub by_start: bool,
 }
@@ -262,7 +265,20 @@ impl Question {
             (Some(c), Some(w)) => parse_when(c).is_none_or(|c| w < c),
             _ => true,
         };
-        source_ok && labels_ok && timed_ok && read_ok && newer_ok && older_ok
+        let text_ok = match self
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            None => true,
+            Some(t) => {
+                let hay = item.text().to_lowercase();
+                t.split_whitespace()
+                    .all(|w| hay.contains(&w.to_lowercase()))
+            }
+        };
+        source_ok && labels_ok && timed_ok && read_ok && newer_ok && older_ok && text_ok
     }
 }
 

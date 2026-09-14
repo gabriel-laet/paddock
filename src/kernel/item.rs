@@ -118,6 +118,21 @@ pub struct Item {
 }
 
 impl Item {
+    /// Everything searchable: title, then every text part (or the body).
+    pub fn text(&self) -> String {
+        let parts: Vec<&str> = self
+            .parts
+            .iter()
+            .filter_map(|p| p.text.as_deref())
+            .collect();
+        let body = if parts.is_empty() {
+            self.body.clone()
+        } else {
+            parts.join("\n")
+        };
+        format!("{}\n{}", self.title, body)
+    }
+
     /// The item's own moment: `start` when set, else when it was admitted.
     pub fn when(&self) -> &str {
         self.start

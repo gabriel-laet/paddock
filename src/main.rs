@@ -42,6 +42,9 @@ enum Cmd {
         inbox: Option<String>,
         #[arg(long)]
         unread: bool,
+        /// Words that must all appear in the title or text (prefix match)
+        #[arg(long)]
+        text: Option<String>,
     },
     /// One item in full
     Show { id: i64 },
@@ -166,10 +169,15 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Ls { inbox, unread } => {
+        Cmd::Ls {
+            inbox,
+            unread,
+            text,
+        } => {
             let path = split_path(inbox.as_deref());
             let mut q = Question::of(&chain(&config, &path)?);
             q.unread = unread;
+            q.text = text;
             list(&store.ask(&q)?, cli.json)?;
         }
         Cmd::Show { id } => {
@@ -465,7 +473,7 @@ fn context(paths: &Paths, k: &Kernel) -> Result<()> {
         writeln!(w)?;
     }
     writeln!(w, "\n## use")?;
-    writeln!(w, "paddock pull | inboxes | ls [INBOX] [--unread] | show ID | thread ID | label ID [+l|-l]... | read ID | unread ID | forget ID | classify ID | why ID [INBOX] | send [--title T] [--reply ID] [--to A]... [BODY]")?;
+    writeln!(w, "paddock pull | inboxes | ls [INBOX] [--unread] [--text WORDS] | show ID | thread ID | label ID [+l|-l]... | read ID | unread ID | forget ID | classify ID | why ID [INBOX] | send [--title T] [--reply ID] [--to A]... [BODY]")?;
     writeln!(w, "Add --json to any command for machine output. Edit config.toml, then `paddock pull`. Do not invent nouns.")?;
     Ok(())
 }

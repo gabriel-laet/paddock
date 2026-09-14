@@ -103,6 +103,17 @@ impl Sqlite {
              CREATE INDEX IF NOT EXISTS idx_items_created ON items(created_at);",
         )?;
         backfill_parts(&conn)?;
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(item_id UNINDEXED, title, text);",
+        )?;
+        let indexed: i64 = conn.query_row("SELECT COUNT(*) FROM items_fts", [], |r| r.get(0))?;
+        if indexed == 0 {
+            conn.execute_batch("DELETE FROM items_fts;")?;
+            conn.execute(
+                &format!("INSERT INTO items_fts(item_id, title, text) {FTS_ROWS}"),
+                [],
+            )?;
+        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             data_dir,
@@ -255,6 +266,7 @@ impl Store for Sqlite {
             (id, true)
         };
         stitch_cites(&tx, &item.source_id, &item.foreign_id, id)?;
+        index_text(&tx, id)?;
         tx.commit()?;
         Ok((id, created))
     }
@@ -357,6 +369,7 @@ impl Store for Sqlite {
                 }
             }
         }
+        conn.execute("DELETE FROM items_fts WHERE item_id = ?1", params![id])?;
         conn.execute("DELETE FROM items WHERE id = ?1", params![id])?;
         Ok(conn.changes() > 0)
     }
@@ -724,12 +737,39 @@ fn filter_where(filter: &Question) -> (String, Vec<Value>) {
         clauses.push("COALESCE(NULLIF(start, ''), created_at) < ?".into());
         params.push(Value::Text(cutoff.clone()));
     }
+    if let Some(query) = filter.text.as_deref().and_then(fts_query) {
+        clauses.push("id IN (SELECT item_id FROM items_fts WHERE items_fts MATCH ?)".into());
+        params.push(Value::Text(query));
+    }
     let where_sql = if clauses.is_empty() {
         String::new()
     } else {
         format!("WHERE {}", clauses.join(" AND "))
     };
     (where_sql, params)
+}
+
+/// One FTS row per item: the title, and every text part (else the body).
+const FTS_ROWS: &str = "SELECT i.id, i.title, COALESCE(
+        (SELECT group_concat(p.text, ' ') FROM parts p WHERE p.item_id = i.id AND p.text IS NOT NULL),
+        i.body) FROM items i";
+
+fn index_text(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM items_fts WHERE item_id = ?1", params![id])?;
+    conn.execute(
+        &format!("INSERT INTO items_fts(item_id, title, text) {FTS_ROWS} WHERE i.id = ?1"),
+        params![id],
+    )?;
+    Ok(())
+}
+
+/// Every word as a quoted prefix term, ANDed: `inv ana` becomes `"inv"* "ana"*`.
+fn fts_query(text: &str) -> Option<String> {
+    let terms: Vec<String> = text
+        .split_whitespace()
+        .map(|w| format!("\"{}\"*", w.replace('"', "\"\"")))
+        .collect();
+    (!terms.is_empty()).then(|| terms.join(" "))
 }
 
 fn filter_order(filter: &Question) -> &'static str {
