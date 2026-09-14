@@ -1,4 +1,4 @@
-//! Sources: fs, rss, and the exec protocol, for pull and for send.
+//! Sources: fs, the exec protocol, and plugins found on PATH, for pull and for send.
 
 mod common;
 
@@ -61,34 +61,64 @@ fn send_draft_fs_writes_file_and_text_part() {
 }
 
 #[test]
-fn rss_source_cannot_send() {
-    let (_tmp, paths) = temp_paths();
+fn an_unknown_kind_is_a_plugin_named_paddock_kind_on_path() {
+    let _g = PATH_ENV.lock().unwrap();
+    let (tmp, paths) = temp_paths();
     init(&paths).unwrap();
-    std::fs::write(
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    // A plugin that reports whether its settings reached it on stdin.
+    let plugin = bin.join("paddock-echo");
+    fs::write(
+        &plugin,
+        r#"#!/bin/sh
+case "$1" in
+  pull)
+    req=$(cat)
+    case "$req" in *'"greeting":"hi there"'*) t=got-it ;; *) t=missed ;; esac
+    printf '[{"foreign_id":"from-plugin","title":"%s"}]\n' "$t" ;;
+  send) echo "source cannot send" >&2; exit 2 ;;
+esac
+"#,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&plugin, fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!("{}:{old_path}", bin.display()));
+    fs::write(
         &paths.config_file,
         r#"
 [[inbox]]
 name = "all"
 
 [[source]]
-id = "feed"
-kind = "rss"
-url = "https://example.com/feed.xml"
+id = "e"
+kind = "echo"
+greeting = "hi there"
 "#,
     )
     .unwrap();
-    let cfg = load_config(&paths.config_file).unwrap();
-    let store = Sqlite::open(&paths.db_path, None).unwrap();
+    let (cfg, store) = load(&paths).unwrap();
     let k = kernel(&cfg, &store).unwrap();
+    let pulled = k.pull().unwrap();
+    assert_eq!(pulled.count, 1);
+    let items = store.ask(&Question::default()).unwrap();
+    assert_eq!(items[0].foreign_id, "from-plugin");
+    assert_eq!(
+        items[0].title, "got-it",
+        "settings reached the plugin on stdin"
+    );
     let err = k
         .send(Draft {
-            source_id: "feed".into(),
-            title: "nope".into(),
-            body: "x".into(),
+            source_id: "e".into(),
+            title: "x".into(),
+            body: "y".into(),
             ..Default::default()
         })
         .unwrap_err();
-    assert!(err.to_string().contains("source cannot send"), "{err}");
+    std::env::set_var("PATH", old_path);
+    assert!(err.to_string().contains("cannot send"), "{err}");
 }
 
 #[test]

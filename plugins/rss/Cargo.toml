@@ -1,0 +1,18 @@
+# `paddock-rss`: a feed as a source. Depends on paddock-protocol and
+# nothing else of paddock's.
+
+[package]
+name = "paddock-rss"
+description = "An RSS/Atom feed as a paddock source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+paddock-protocol = { path = "../../crates/protocol" }
+anyhow.workspace = true
+chrono.workspace = true
+reqwest = { version = "=0.12.12", default-features = false, features = ["blocking", "rustls-tls"] }
+rss = "=2.0.12"

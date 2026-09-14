@@ -1,0 +1,19 @@
+# The pure core. This manifest is the purity test: no store, no file
+# format, no network, no clock. If a dependency for one of those shows up
+# here, it belongs in an adapter.
+
+[package]
+name = "paddock-kernel"
+description = "An inbox kernel: four nouns, the questions inboxes ask, and the verbs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true

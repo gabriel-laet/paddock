@@ -1,0 +1,32 @@
+[package]
+name = "paddock"
+description = "An inbox kernel with a CLI"
+homepage = "https://github.com/gabriel-laet/paddock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+paddock-kernel = { path = "../kernel" }
+paddock-protocol = { path = "../protocol" }
+anyhow.workspace = true
+chrono.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+cel-interpreter = "0.10.0"
+clap = { version = "=4.5.28", features = ["derive"] }
+dirs = "5.0"
+model2vec-rs = { version = "0.2.1", optional = true }
+reqwest = { version = "=0.12.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+rusqlite = { version = "0.32.1", features = ["bundled-sqlcipher"] }
+toml = "0.8.19"
+
+[dev-dependencies]
+tempfile = "3.15"
+
+[features]
+# `kind = "local"` embedder: Model2Vec static embeddings, no network, no ONNX.
+local = ["dep:model2vec-rs"]

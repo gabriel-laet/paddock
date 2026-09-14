@@ -1,0 +1,15 @@
+# What a plugin and the host say to each other. Plugins depend on this
+# crate and nothing else of paddock's.
+
+[package]
+name = "paddock-protocol"
+description = "The exec protocol between paddock and its plugins"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

@@ -1,6 +1,7 @@
 //! Thin CLI over the kernel. Every command has a `--json` form so other
 //! programs and agents can drive it.
 
+use anyhow::Context as _;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use paddock::{
@@ -103,6 +104,17 @@ enum Cmd {
         #[arg(long = "in")]
         inbox: Option<String>,
     },
+    /// Run a plugin's `pull` (and `send`, with --send) and validate what it says
+    Check {
+        /// The program: ./target/debug/paddock-rss, or a `paddock-x` on PATH
+        cmd: String,
+        /// Settings to hand it, as key=value
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        settings: Vec<String>,
+        /// Also try `send` with a sample draft
+        #[arg(long)]
+        send: bool,
+    },
     /// Dump this host for an agent (pipeable)
     Context,
 }
@@ -126,6 +138,14 @@ fn main() -> Result<()> {
         if cli.remote.is_some() {
             bail!("no remote host (pass --remote=HOST or set `remote` in config)");
         }
+    }
+    if let Cmd::Check {
+        cmd,
+        settings,
+        send,
+    } = &cli.cmd
+    {
+        return check(cmd, settings, *send, cli.json);
     }
     if let Cmd::Init { here } = cli.cmd {
         let paths = if here {
@@ -153,7 +173,7 @@ fn main() -> Result<()> {
         Ok(())
     };
     match cli.cmd {
-        Cmd::Init { .. } => unreachable!(),
+        Cmd::Init { .. } | Cmd::Check { .. } => unreachable!(),
         Cmd::Pull => {
             let pulled = k.pull()?;
             let forgot = k.forget_stale()?;
@@ -583,6 +603,132 @@ fn context(paths: &Paths, k: &Kernel) -> Result<()> {
     writeln!(w, "paddock pull | inboxes | ls [INBOX] [--unread] [--text WORDS] [--like TEXT] | answer QUESTION [--in INBOX] | embed | show ID | thread ID | cited ID | part ID | label ID [+l|-l]... | read ID | unread ID | forget ID | classify ID | why ID [INBOX] | send [--title T] [--reply ID] [--to A]... [--in INBOX] [BODY]")?;
     writeln!(w, "Add --json to any command for machine output. Edit config.toml, then `paddock pull`. Do not invent nouns.")?;
     Ok(())
+}
+
+/// Speak the protocol to a plugin and say what came back. This is the only
+/// thing in this repository that runs a plugin; the kernel's tests never do.
+fn check(cmd: &str, settings: &[String], try_send: bool, json: bool) -> Result<()> {
+    use paddock::adapters::source::exec::parse_wire_items;
+    let mut map = serde_json::Map::new();
+    for kv in settings {
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--set wants KEY=VALUE, got `{kv}`"))?;
+        map.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+    }
+    let request = paddock::protocol::Request {
+        id: "check".into(),
+        settings: map,
+        draft: None,
+    };
+    let run = |verb: &str, req: &paddock::protocol::Request| -> Result<(i32, String, String)> {
+        let mut child = Command::new(cmd)
+            .arg(verb)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("cannot run `{cmd}`"))?;
+        if let Some(mut pipe) = child.stdin.take() {
+            let _ = pipe.write_all(&serde_json::to_vec(req)?);
+        }
+        let out = child.wait_with_output()?;
+        Ok((
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
+    };
+    let mut problems: Vec<String> = Vec::new();
+    let (code, stdout, stderr) = run("pull", &request)?;
+    let mut count = 0;
+    if code != 0 {
+        problems.push(format!("pull exited {code}: {}", stderr.trim()));
+    } else {
+        match parse_wire_items(&stdout) {
+            Ok(items) => {
+                count = items.len();
+                for (i, it) in items.iter().enumerate() {
+                    if it.foreign_id.trim().is_empty() {
+                        problems.push(format!("item {i}: empty foreign_id"));
+                    }
+                    for c in &it.cites {
+                        if !["reply", "forward", "quote", "mention", "attach"]
+                            .contains(&c.kind.as_str())
+                        {
+                            problems.push(format!("item {i}: cite kind `{}`", c.kind));
+                        }
+                        if c.foreign_id.is_none() && c.href.is_none() && c.actor.is_none() {
+                            problems.push(format!(
+                                "item {i}: a cite with no foreign_id, href, or actor"
+                            ));
+                        }
+                    }
+                    for p in &it.parts {
+                        if !["text", "file", "image", "audio", "video"].contains(&p.kind.as_str()) {
+                            problems.push(format!("item {i}: part kind `{}`", p.kind));
+                        }
+                    }
+                    for a in it.from.iter().chain(it.to.iter()) {
+                        if a.id.trim().is_empty() {
+                            problems.push(format!("item {i}: an actor with no id"));
+                        }
+                    }
+                    for t in [&it.start, &it.end].into_iter().flatten() {
+                        if paddock::parse_when(t).is_none() {
+                            problems.push(format!("item {i}: time `{t}` is not RFC3339 or a date"));
+                        }
+                    }
+                }
+            }
+            Err(e) => problems.push(format!("pull output: {e:#}")),
+        }
+    }
+    let mut sent = None;
+    if try_send {
+        let mut req = request.clone();
+        req.draft = Some(paddock::protocol::Draft {
+            title: "paddock check".into(),
+            body: "a draft from paddock check".into(),
+            ..Default::default()
+        });
+        let (code, stdout, stderr) = run("send", &req)?;
+        if code == 2 || stderr.contains("source cannot send") {
+            sent = Some("refused (cannot send)".to_string());
+        } else if code != 0 {
+            problems.push(format!("send exited {code}: {}", stderr.trim()));
+        } else {
+            match serde_json::from_str::<paddock::protocol::Sent>(stdout.trim()) {
+                Ok(s) if !s.foreign_id.trim().is_empty() => {
+                    sent = Some(format!("ok, foreign_id {}", s.foreign_id))
+                }
+                Ok(_) => problems.push("send: empty foreign_id".into()),
+                Err(e) => problems.push(format!("send output: {e}")),
+            }
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "cmd": cmd, "items": count, "send": sent, "problems": problems })
+        );
+    } else {
+        println!("{cmd}: pull gave {count} item(s)");
+        if let Some(s) = &sent {
+            println!("send: {s}");
+        }
+        for p in &problems {
+            println!("problem: {p}");
+        }
+        if problems.is_empty() {
+            println!("ok");
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        std::process::exit(1)
+    }
 }
 
 /// Re-run this exact command line on `host` over ssh, forcing `--local` there.

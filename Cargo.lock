@@ -1322,14 +1322,45 @@ dependencies = [
  "clap",
  "dirs 5.0.1",
  "model2vec-rs",
+ "paddock-kernel",
+ "paddock-protocol",
  "regex",
  "reqwest",
- "rss",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "paddock-kernel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "paddock-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "paddock-rss"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "paddock-protocol",
+ "reqwest",
+ "rss",
 ]
 
 [[package]]

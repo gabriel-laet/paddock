@@ -4,21 +4,22 @@ An inbox kernel with a CLI. No UI. Meant to be driven by hand, by scripts, and b
 
 The kernel is pure: four nouns, the questions inboxes ask, and the verbs. It reads no clock, no file, no network, and no config format; the host resolves every adapter up front and hands the kernel a config, a store, sources, classifiers, an embedder, a model, and the time. Every verb returns what happened, warnings included.
 
+One repository, three crates and the plugins, with the dependency graph enforcing the lines:
+
 ```
-src/kernel/               item, inbox + question, classify (regex), verbs, ports
-src/adapters/store/       where items live: sqlite
-src/adapters/source/      where items come from: fs, rss, exec
-src/adapters/classifier/  what stamps labels: script (CEL), exec, http, llm
-src/adapters/model.rs     a chat model: exec, ollama, openai
-src/adapters/embedder.rs  text to vector: exec, http, ollama, openai
-src/adapters/host.rs      the machine: paths, the TOML config, the wiring
-src/main.rs               the CLI
+crates/kernel/      paddock-kernel: nouns, questions, verbs, ports. Its Cargo.toml is the purity
+                    test: no store, no file format, no network, no clock.
+crates/protocol/    paddock-protocol: the exec protocol's types and the Message shape.
+                    Plugins depend on this and nothing else of paddock's. See PROTOCOL.md.
+crates/paddock/     the `paddock` binary: adapters (sqlite store; fs and exec sources;
+                    script, exec, http, llm classifiers; models; embedders; host) and the CLI
+plugins/rss/        paddock-rss. Formats of the world live here, not in the kernel crate.
 ```
 
 ## nouns
 
 - **item** — one thing that arrived, stripped of its source's shape
-- **source** — a program that admits items (and may send)
+- **source** — a program that admits items (and may send); anything that knows a format of the world is a plugin over the exec protocol
 - **label** — a mark a classifier or a hand put on an item; it remembers which, and a hand outranks a classifier
 - **inbox** — a named question over the pile (sources, labels, `without`, time, words), not an account and not a folder; it may do something to what enters it
 
@@ -35,7 +36,8 @@ Personas are top-level inboxes with `sources`: `work/` and `personal/` see only 
 ## install
 
 ```
-cargo install --path .
+cargo install --path crates/paddock              # the `paddock` binary
+cargo install --path plugins/rss                 # `paddock-rss`, for `kind = "rss"`
 ```
 
 ## commands
@@ -57,6 +59,7 @@ paddock why ID [INBOX]             # the chain's labels it carries, who stamped 
 paddock send [--title T] [--reply ID] [--to A]... [--source S | --in INBOX] [BODY]   # body from arg or stdin
 paddock answer QUESTION [--in INBOX]   # the model answers from the items and cites them
 paddock embed                      # embed items that have no vector yet
+paddock check CMD [--set k=v]... [--send]   # speak the protocol to a plugin and validate what it says
 paddock context                    # dump this host for an agent
 ```
 
@@ -133,7 +136,7 @@ An item matches an inbox when `(sources empty OR item.source in sources)` and `(
 
 ### sources
 
-Where items come from. Every source has an `id` (which items carry as `source_id`) and a `kind`; `name` is an optional display name and `forget_after` a per-source stale window.
+Where items come from. Every source has an `id` (which items carry as `source_id`) and a `kind`; `name` is an optional display name and `forget_after` a per-source stale window. Built-in kinds are `fs` and `exec`; any other kind names a plugin, `paddock-<kind>` on `PATH`, and every other key on the block reaches it as settings.
 
 ```toml
 [[source]]
@@ -143,12 +146,12 @@ path = "~/.local/share/paddock/incoming"
 
 [[source]]
 id = "feed"
-kind = "rss"                    # a feed; cannot send
+kind = "rss"                    # a plugin: `paddock-rss` on PATH; cannot send
 url = "https://example.com/feed.xml"
 
 [[source]]
 id = "mail"
-kind = "exec"                   # any program that speaks the exec protocol (below)
+kind = "exec"                   # an explicit program that speaks the exec protocol
 cmd = "~/bin/mail-source"
 args = ["--account", "work"]
 dir = "~/mail"                  # working directory, optional
@@ -264,12 +267,9 @@ Words and meaning are both terms of a Question, so they compose with the inbox c
 
 Models never run inside matching. An inbox is deterministic and `why` stays true.
 
-## exec sources
+## plugins
 
-`kind = "exec"` is the plugin interface. The host runs:
-
-- `{cmd} {args...} pull` — stdout is a JSON array (or NDJSON) of items: `foreign_id` (required), `title`, `body`, `href`, `start`, `end`, `thread`, `from`, `to[]`, `cites[]`, `parts[]`, `read`. Actors are `{id, name?, kind?}`; parts are `{kind, mime, text?, path?}`; cites are `{kind, foreign_id?, source_id?, href?, excerpt?, actor?}` with kind `reply | forward | quote | mention | attach`.
-- `{cmd} {args...} send` — stdin is a JSON draft `{title, body, thread?, reply_to_foreign?, to[], parts[]}`; stdout is `{foreign_id, start?, end?}`. Exit 2 (or print `source cannot send`) if the source is read-only.
+The exec protocol is the plugin interface: `{cmd} {args...} pull|send` with a JSON request on stdin (the source's id and settings, plus the draft for `send`), items or a `{foreign_id}` on stdout. It is written down in [PROTOCOL.md](PROTOCOL.md), typed in the `paddock-protocol` crate, and checked with `paddock check`. Write a plugin in Rust against that crate, or in anything that can read and print JSON.
 
 Admit upserts on `(source_id, foreign_id)`. Re-admit refreshes what the source sent and keeps read state and labels. A cite to an item not here yet resolves when it arrives.
 

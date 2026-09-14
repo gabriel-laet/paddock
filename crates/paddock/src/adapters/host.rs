@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::source::{Exec, Fs, Rss};
+use super::source::{Exec, Fs};
 use super::store::Sqlite;
 use super::transport::secret;
 use super::{classifier, embedder, model};
@@ -183,7 +183,8 @@ pub fn kernel_at<'a>(
     })
 }
 
-/// fs, rss, or exec.
+/// fs, exec, or a plugin: any other kind is `paddock-<kind>` on PATH,
+/// spoken to over the exec protocol with the spec's settings.
 fn source(spec: &SourceSpec) -> Result<Box<dyn Source>> {
     let s = &spec.settings;
     let need = |key: &str| {
@@ -195,17 +196,21 @@ fn source(spec: &SourceSpec) -> Result<Box<dyn Source>> {
             id: spec.id.clone(),
             dir: expand_path(&need("path")?),
         }),
-        "rss" => Box::new(Rss {
-            id: spec.id.clone(),
-            url: need("url")?,
-        }),
         "exec" => Box::new(Exec {
             id: spec.id.clone(),
             cmd: expand_path(&need("cmd")?),
             args: setting_list(s, "args"),
             dir: setting(s, "dir").map(|d| expand_path(&d)),
+            settings: s.clone(),
         }),
-        other => bail!("unknown source kind `{other}` on {}", spec.id),
+        "" => bail!("source {} has no kind", spec.id),
+        plugin => Box::new(Exec {
+            id: spec.id.clone(),
+            cmd: PathBuf::from(format!("paddock-{plugin}")),
+            args: Vec::new(),
+            dir: None,
+            settings: s.clone(),
+        }),
     })
 }
 

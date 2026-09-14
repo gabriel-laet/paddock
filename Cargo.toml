@@ -1,37 +1,23 @@
-[package]
-name = "paddock"
+[workspace]
+resolver = "2"
+members = ["crates/kernel", "crates/protocol", "crates/paddock", "plugins/rss"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
-description = "An inbox kernel with a CLI"
 repository = "https://github.com/gabriel-laet/paddock"
-homepage = "https://github.com/gabriel-laet/paddock"
 
-[dependencies]
+[workspace.dependencies]
 anyhow = "1.0.95"
-cel-interpreter = "0.10.0"
 chrono = { version = "0.4.39", default-features = false, features = ["clock", "std"] }
-clap = { version = "=4.5.28", features = ["derive"] }
-dirs = "5.0"
-model2vec-rs = { version = "0.2.1", optional = true }
 regex = "1.11"
-reqwest = { version = "=0.12.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
-rss = "=2.0.12"
-rusqlite = { version = "0.32.1", features = ["bundled-sqlcipher"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "=1.0.151"
-toml = "0.8.19"
-
-[dev-dependencies]
-tempfile = "3.15"
 
 [profile.release]
 lto = true
 codegen-units = 1
 opt-level = "z"
 strip = true
-
-[features]
-# `kind = "local"` embedder: Model2Vec static embeddings, no network, no ONNX.
-local = ["dep:model2vec-rs"]
