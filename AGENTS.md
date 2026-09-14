@@ -61,7 +61,7 @@ Rules, all checkable:
 ## commands
 
 ```
-cargo build --workspace && cargo test --workspace     # 124 tests at handover
+cargo build --workspace && cargo test --workspace     # 128 tests at handover
 cargo build --release                                  # paddock 6.3 MB, plugins 0.5-2.7 MB
 ./target/release/paddock check ./target/release/paddock-maildir --set path=/some/Maildir
 PADDOCK_DIR=/tmp/h ./target/release/paddock init && $EDITOR /tmp/h/config.toml && paddock pull
@@ -82,7 +82,7 @@ Done and pushed on `main`:
   classifiers regex/script(CEL)/exec/http/llm, model exec/ollama/openai, embedder
   exec/http/ollama/openai/local(Model2Vec, feature `local`), mirror s3/exec, agent setup,
   notify_cmd, `--remote` over ssh, `--json` on every command.
-- Plugins: rss, maildir, imap (+SMTP), wacli (WhatsApp), gog (Gmail), hey (HEY).
+- Plugins: rss, maildir, imap (+SMTP), wacli (WhatsApp), gog (Gmail), hey (HEY), slack (via slackcli).
 - Façade: `paddock-app` with `Session`, `Listing`, `InboxCount`, `Event`, `Watcher`.
 
 Next, in the order agreed with the owner:
@@ -100,6 +100,11 @@ Next, in the order agreed with the owner:
    is the first real test. Known gaps: gog's search output has no `to` and no
    In-Reply-To (a `gog gmail get` per message would); `hey compose` returns no id, so a
    fresh compose is named `sent-<time>`; wacli media is fetched only with `media = true`.
+   slack rides slackcli's browser session (unsanctioned by Slack; the tool throttles to
+   dodge `unexpected_api_call_volume`, see its issue #147); `conversations unread` costs
+   one call per unread channel, `unread = false` skips it. The sanctioned fallback is the
+   same mapping over the Web API with a user token from your own app (manifest in the
+   session notes: user scopes for history, Socket Mode for live).
 3. **Send-only plugins** (a transactional mail API, a webhook): `pull` prints `[]`,
    `send` posts the draft. The shape is documented in README "plugins"; none exist yet.
 4. **`send` from the app for a persona**: `Session::source_in(inbox)` gives the source;
@@ -110,6 +115,9 @@ Next, in the order agreed with the owner:
 - Tests that write a script and then exec it can hit "text file busy" when another test
   thread forks at the same moment. The plugin test helpers retry the exec; keep that.
 - `mail-parser` parses `List-Id` as an address (`as_address()`), not text.
+- `slackcli` passes Slack's own message objects through (`ts`, `thread_ts`, `user`, `text`,
+  `files[]`) with a resolved `users[]` beside them; a `ts` repeats across channels, so the
+  foreign id is `channel:ts`.
 - `wacli --json messages list` keys are Go field names (`MsgID`, `ChatJID`, `FromMe`,
   `Text`, `LocalPath`, `quoted_msg_id`). `gog` search gives `messages[].{id, threadId,
   from, subject, labels, body, internalDateIso, attachments}`. `hey` wraps everything in

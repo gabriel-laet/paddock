@@ -28,6 +28,7 @@ plugins/
   wacli/              paddock-wacli    WhatsApp, through the wacli CLI
   gog/                paddock-gog      Gmail, through the gog CLI
   hey/                paddock-hey      HEY, through the hey CLI
+  slack/              paddock-slack    Slack, through the slackcli CLI (no Slack app to register)
 ```
 
 Rules the layout keeps checkable: the kernel crate names no world (grep its manifest); a plugin never depends on the kernel crate (`cargo tree -p paddock-rss` never shows `paddock-kernel`); kernel tests never run a plugin (`paddock check` is the only thing that does). Anything that knows a format of the world, mail, a feed, a chat, is a plugin, not an adapter.
@@ -66,6 +67,7 @@ cargo install --path plugins/imap                # `paddock-imap`, for `kind = "
 cargo install --path plugins/wacli               # `paddock-wacli`, for `kind = "wacli"` (needs the wacli CLI)
 cargo install --path plugins/gog                 # `paddock-gog`, for `kind = "gog"` (needs the gog CLI)
 cargo install --path plugins/hey                 # `paddock-hey`, for `kind = "hey"` (needs the hey CLI)
+cargo install --path plugins/slack               # `paddock-slack`, for `kind = "slack"` (needs slackcli)
 ```
 
 ## commands
@@ -220,6 +222,12 @@ kind = "hey"                    # a plugin over the hey CLI (HEY)
 box = "imbox"                   # bodies = false lists threads without reading them
 
 [[source]]
+id = "slack"
+kind = "slack"                  # a plugin over slackcli (slackcli.dev): your browser session, no Slack app
+channels = ["incidents", "dev"] # by name or id; default: everything you are in
+# workspace = "acme", since = "7d", files = true, url = "https://acme.slack.com"
+
+[[source]]
 id = "custom"
 kind = "exec"                   # an explicit program that speaks the exec protocol
 cmd = "~/bin/my-source"
@@ -228,7 +236,7 @@ dir = "~/mail"                  # working directory, optional
 forget_after = "14d"
 ```
 
-The three CLI plugins wrap tools that already hold a login and a synced store of their own: [wacli](https://github.com/openclaw/wacli), [gogcli](https://github.com/openclaw/gogcli), and [hey-cli](https://github.com/basecamp/hey-cli). Each takes `cmd = "..."` when the tool is not on `PATH` by its usual name, and `cache = "..."` for where attachments and media are written before the host reads them into the store. Every plugin's own settings are listed at the top of its `main.rs`.
+The CLI plugins wrap tools that already hold a login: [wacli](https://github.com/openclaw/wacli), [gogcli](https://github.com/openclaw/gogcli), [hey-cli](https://github.com/basecamp/hey-cli), and [slackcli](https://slackcli.dev). slackcli signs in with your browser session, so Slack needs no app and no admin; the cost is that Slack does not sanction that session, and a busy pull can get it logged out (`slackcli auth login-auto` again). The sanctioned route, a user token from your own Slack app, would be the same plugin over the Web API and is not built. Each takes `cmd = "..."` when the tool is not on `PATH` by its usual name, and `cache = "..."` for where attachments and media are written before the host reads them into the store. Every plugin's own settings are listed at the top of its `main.rs`.
 
 ### classifiers
 
